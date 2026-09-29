@@ -137,14 +137,16 @@ func fixTime(t, now time.Time) time.Time {
 func sharedFileToDirEntry(sf smb.SharedFile) server.DirEntry {
 	now := time.Now()
 	return server.DirEntry{
-		Name:           sf.Name,
-		Size:           int64(sf.Size),
-		AllocationSize: allocSize(int64(sf.Size)),
-		Attributes:     sharedFileAttrs(sf),
-		CreationTime:   fixTime(filetimeToTime(sf.CreationTime), now),
-		LastAccessTime: fixTime(filetimeToTime(sf.LastAccessTime), now),
-		LastWriteTime:  fixTime(filetimeToTime(sf.LastWriteTime), now),
-		ChangeTime:     fixTime(filetimeToTime(sf.ChangeTime), now),
+		FileInfo: server.FileInfo{
+			Name:           sf.Name,
+			Size:           int64(sf.Size),
+			AllocationSize: allocSize(int64(sf.Size)),
+			Attributes:     sharedFileAttrs(sf),
+			CreationTime:   fixTime(filetimeToTime(sf.CreationTime), now),
+			LastAccessTime: fixTime(filetimeToTime(sf.LastAccessTime), now),
+			LastWriteTime:  fixTime(filetimeToTime(sf.LastWriteTime), now),
+			ChangeTime:     fixTime(filetimeToTime(sf.ChangeTime), now),
+		},
 	}
 }
 
@@ -430,10 +432,12 @@ func (v *proxyVFS) QueryDirectory(_ context.Context, h server.Handle, pattern st
 	return result, 0, nil
 }
 
-// QueryFileInfo defers to the server's Stat()-driven default.
-// (Same approach as filevfs: "defers to the server's default Stat()-driven path".)
+// QueryFileInfo returns StatusNotSupported so the server falls back to its own
+// Stat()-driven serialization (serializeFileInfo). Returning StatusOk with a
+// nil value causes "unrecognized info type <nil>" — the server only accepts
+// []byte from the VFS, so nil with StatusOk is always wrong.
 func (v *proxyVFS) QueryFileInfo(_ context.Context, _ server.Handle, _ byte) (any, uint32, error) {
-	return nil, 0, nil
+	return nil, smb.StatusNotSupported, nil
 }
 
 // SetFileInfo: read-only proxy; reject all mutations.
@@ -441,14 +445,16 @@ func (v *proxyVFS) SetFileInfo(_ context.Context, _ server.Handle, _ byte, _ []b
 	return smb.StatusAccessDenied, nil
 }
 
-// QueryFSInfo defers to the server's synthetic default (same as filevfs).
+// QueryFSInfo returns StatusNotSupported so the server uses its own defaultFsInfo
+// (synthetic 16TB NTFS volume with half free). Same reasoning as QueryFileInfo.
 func (v *proxyVFS) QueryFSInfo(_ context.Context, _ byte) (any, uint32, error) {
-	return nil, 0, nil
+	return nil, smb.StatusNotSupported, nil
 }
 
-// QuerySecurity defers to the server's world-readable default (same as filevfs).
+// QuerySecurity returns StatusNotSupported so the server substitutes its own
+// world-readable security descriptor (Owner=Group=Everyone, no DACL/SACL).
 func (v *proxyVFS) QuerySecurity(_ context.Context, _ server.Handle, _ uint32) ([]byte, uint32, error) {
-	return nil, 0, nil
+	return nil, smb.StatusNotSupported, nil
 }
 
 // Ioctl: not implemented; the server returns STATUS_NOT_SUPPORTED.
