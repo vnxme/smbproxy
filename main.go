@@ -41,6 +41,7 @@ import (
 
 	srvsvc "github.com/jfjallid/go-smb/dcerpc/mssrvs/server"
 	dcesrv "github.com/jfjallid/go-smb/dcerpc/server"
+	"github.com/jfjallid/go-smb/ntlmssp"
 	"github.com/jfjallid/go-smb/smb"
 	"github.com/jfjallid/go-smb/smb/server"
 	"github.com/jfjallid/go-smb/spnego"
@@ -519,6 +520,8 @@ func main() {
 	share := flag.String("s", "C$", "remote share to proxy (default: C$)")
 	listen := flag.String("l", "0.0.0.0:445", "local listen addr:port (port 445 needs root)")
 	localShare := flag.String("share-name", "share", "share name exposed locally (\\\\host\\<this>)")
+	localUser := flag.String("local-user", "guest", "username clients connect with (Windows Explorer will prompt for this)")
+	localPass := flag.String("local-pass", "guest", "password clients connect with")
 	flag.Parse()
 
 	if *target == "" || *user == "" || *hashArg == "" {
@@ -541,20 +544,37 @@ func main() {
 	// ---- Wire the proxy VFS ----
 	vfs := &proxyVFS{up: up, share: *share}
 
+	// MapAuthenticator accepts one local account (configurable via flags).
+	// This is critical for Windows Explorer: AllowGuest sets SessionFlagIsGuest
+	// in the SESSION_SETUP response, and Windows 10/11 silently refuses any
+	// connection that returns that flag ("Block insecure guest logons" policy,
+	// enabled by default). A MapAuthenticator produces a normal authenticated
+	// session with no guest flag, which Windows accepts.
+	//
+	// ntlmssp.Ntowfv1 computes MD4(UTF-16LE(password)) — the NT hash that
+	// MapAuthenticator uses to verify NTLMv2 responses.
+	auth := &server.MapAuthenticator{
+		// Domain: "" accepts any domain the client sends (workgroup, machine
+		// name, or AD domain). Set to a specific string to restrict.
+		Accounts: map[string]*server.Account{
+			strings.ToLower(*localUser): {NTHash: ntlmssp.Ntowfv1(*localPass)},
+		},
+	}
+
 	cfg := &server.ServerConfig{
 		NetBIOSName: "SMBPROXY",
 		// Pin to SMB 2.1 on both the upstream and downstream legs.
 		// This eliminates SMB 3.x features (signing contexts, encryption,
 		// FSCTL_VALIDATE_NEGOTIATE_INFO, leases) that the Linux kernel CIFS
 		// client triggers and that we don't fully implement.
-		// The Linux mount client should be told the same: -o vers=2.1
-		MinDialect: smb.DialectSmb_2_1,
-		MaxDialect: smb.DialectSmb_2_1,
-		// Accept any downstream connection without credentials so Explorer /
-		// mount.cifs connects without a password prompt.
-		// To require a local password, replace these with a MapAuthenticator.
+		// Linux mount: add -o vers=2.1
+		MinDialect:    smb.DialectSmb_2_1,
+		MaxDialect:    smb.DialectSmb_2_1,
+		Authenticator: auth,
+		// AllowAnonymous lets the Linux kernel CIFS client mount without
+		// specifying credentials (null/anonymous session). Windows Explorer
+		// always sends credentials so it goes through MapAuthenticator above.
 		AllowAnonymous: true,
-		AllowGuest:     true,
 	}
 
 	srv := &server.Server{Config: cfg}
@@ -583,8 +603,9 @@ func main() {
 	}
 
 	log.Printf("[*] SMB proxy listening on %s", *listen)
-	log.Printf("[*] Connect from Explorer:  \\\\<this-host>\\%s", *localShare)
-	log.Printf("[*] Or map a drive:         net use Z: \\\\<this-host>\\%s", *localShare)
+	log.Printf("[*] Local credentials:      user=%s  pass=%s", *localUser, *localPass)
+	log.Printf("[*] Connect from Explorer:  \\\\<this-host>\\%s  (enter the local credentials above)", *localShare)
+	log.Printf("[*] Or map a drive:         net use Z: \\\\<this-host>\\%s /user:%s %s", *localShare, *localUser, *localPass)
 
 	// ---- Graceful shutdown on Ctrl-C / SIGTERM ----
 	go func() {
