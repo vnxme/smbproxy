@@ -532,8 +532,15 @@ func main() {
 
 	cfg := &server.ServerConfig{
 		NetBIOSName: "SMBPROXY",
-		// Accept any downstream connection without credentials so Explorer
-		// connects without a password prompt.
+		// Pin to SMB 2.1 on both the upstream and downstream legs.
+		// This eliminates SMB 3.x features (signing contexts, encryption,
+		// FSCTL_VALIDATE_NEGOTIATE_INFO, leases) that the Linux kernel CIFS
+		// client triggers and that we don't fully implement.
+		// The Linux mount client should be told the same: -o vers=2.1
+		MinDialect: smb.DialectSmb_2_1,
+		MaxDialect: smb.DialectSmb_2_1,
+		// Accept any downstream connection without credentials so Explorer /
+		// mount.cifs connects without a password prompt.
 		// To require a local password, replace these with a MapAuthenticator.
 		AllowAnonymous: true,
 		AllowGuest:     true,
