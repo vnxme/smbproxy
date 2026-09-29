@@ -176,6 +176,14 @@ type proxyHandle struct {
 	// isRoot is true for the share-root synthetic handle.
 	isRoot bool
 
+	// fileMu serialises Read and Close. It is held for the ENTIRE duration
+	// of each ReadFile call so that a concurrent Close cannot nil ph.file
+	// underneath an in-flight upstream read. A panic inside ReadFile (e.g.
+	// if the upstream TCP connection drops and Connection.Session is set to
+	// nil mid-read) is caught by the recover() in VFS.Read, and the deferred
+	// Unlock still runs because defer always executes on the way out.
+	fileMu sync.Mutex
+
 	// Directory listing cursor (populated lazily; protected by mu).
 	mu          sync.Mutex
 	entries     []server.DirEntry
@@ -326,36 +334,63 @@ func (v *proxyVFS) Create(ctx context.Context, _ *server.Session, req server.Cre
 }
 
 // Close releases the upstream file handle.
+// Close releases the upstream file handle. fileMu ensures we wait for any
+// in-flight Read to finish before nilling ph.file and closing upstream.
 func (v *proxyVFS) Close(_ context.Context, h server.Handle) error {
 	ph := h.(*proxyHandle)
-	if ph.file != nil {
-		_ = ph.file.CloseFile()
-		ph.file = nil
+	ph.fileMu.Lock()
+	file := ph.file
+	ph.file = nil
+	ph.fileMu.Unlock()
+	if file != nil {
+		_ = file.CloseFile()
 	}
 	return nil
 }
 
 // Read forwards a positional read to the upstream file.
-func (v *proxyVFS) Read(_ context.Context, h server.Handle, offset int64, buf []byte) (int, uint32, error) {
+//
+// fileMu is held for the entire ReadFile call so a concurrent Close cannot
+// nil ph.file underneath an in-flight read.
+//
+// ReadFile can panic when the upstream TCP connection is torn down mid-read
+// (go-smb's Connection embeds *Session; if Session becomes nil during teardown
+// the promoted field access f.supportsMultiCredit panics before any network
+// I/O starts). The recover() converts that into a clean STATUS_PIPE_BROKEN so
+// Windows Explorer gets "The pipe has been ended" rather than a dropped
+// connection (which it would show as a much more confusing access-denied).
+func (v *proxyVFS) Read(_ context.Context, h server.Handle, offset int64, buf []byte) (n int, status uint32, err error) {
 	ph := h.(*proxyHandle)
+
+	ph.fileMu.Lock()
+	defer ph.fileMu.Unlock()
+
+	// Recover from upstream panics (nil Session field after TCP teardown).
+	// Named return values let the defer update them before the function exits.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[proxy] Read offset=%d panicked (upstream connection died?): %v", offset, r)
+			n, status = 0, smb.FsctlStatusPipeBroken
+		}
+	}()
+
 	if ph.file == nil {
 		if ph.isRoot {
 			return 0, smb.StatusAccessDenied, nil
 		}
 		return 0, smb.StatusFileClosed, nil
 	}
-	n, err := ph.file.ReadFile(buf, uint64(offset))
-	if err != nil {
+
+	readN, readErr := ph.file.ReadFile(buf, uint64(offset))
+	if readErr != nil {
 		// ReadFile returns io.EOF (not an NTStatus error) when the upstream
 		// server sends STATUS_END_OF_FILE. Treat both forms as end-of-file.
-		// Returning n=0 with StatusOk is equivalent — the server's read
-		// handler sends STATUS_END_OF_FILE to the client when n==0.
-		if errors.Is(err, io.EOF) || errors.Is(err, smb.StatusMap[smb.StatusEndOfFile]) {
+		if errors.Is(readErr, io.EOF) || errors.Is(readErr, smb.StatusMap[smb.StatusEndOfFile]) {
 			return 0, smb.StatusEndOfFile, nil
 		}
-		return 0, errToStatus(err), nil
+		return 0, errToStatus(readErr), nil
 	}
-	return n, 0, nil
+	return readN, 0, nil
 }
 
 // Write: read-only proxy; all mutations are rejected.
