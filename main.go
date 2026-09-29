@@ -388,6 +388,12 @@ func (v *proxyVFS) QueryDirectory(_ context.Context, h server.Handle, pattern st
 		var err error
 
 		if ph.isRoot {
+			// ListDirectory requires the tree to be already connected —
+			// it does NOT call TreeConnect internally (unlike OpenFileExt).
+			// Call it here; it's idempotent when the tree is already up.
+			if tcErr := v.up.TreeConnect(v.share); tcErr != nil {
+				return nil, errToStatus(tcErr), nil
+			}
 			// Root: list the top level of the share.
 			raw, err = v.up.ListDirectory(v.share, "", pattern)
 		} else {
