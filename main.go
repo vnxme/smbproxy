@@ -30,6 +30,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"flag"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -344,7 +345,11 @@ func (v *proxyVFS) Read(_ context.Context, h server.Handle, offset int64, buf []
 	}
 	n, err := ph.file.ReadFile(buf, uint64(offset))
 	if err != nil {
-		if errors.Is(err, smb.StatusMap[smb.StatusEndOfFile]) {
+		// ReadFile returns io.EOF (not an NTStatus error) when the upstream
+		// server sends STATUS_END_OF_FILE. Treat both forms as end-of-file.
+		// Returning n=0 with StatusOk is equivalent — the server's read
+		// handler sends STATUS_END_OF_FILE to the client when n==0.
+		if errors.Is(err, io.EOF) || errors.Is(err, smb.StatusMap[smb.StatusEndOfFile]) {
 			return 0, smb.StatusEndOfFile, nil
 		}
 		return 0, errToStatus(err), nil
