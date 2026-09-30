@@ -34,6 +34,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"syscall"
@@ -203,6 +204,14 @@ func (h *proxyHandle) IsDir() bool                    { return h.isDir }
 type proxyVFS struct {
 	up    *smb.Connection
 	share string
+	// upMu serialises all calls to v.up.* methods. go-smb's Connection is
+	// designed for concurrent use internally (credit tracking, pending-request
+	// table), but concurrent TreeConnect / OpenFileExt / ListDirectory from
+	// multiple server goroutines can race on the trees map. Holding upMu for
+	// each upstream call makes the proxy safe at the cost of serialising
+	// upstream I/O, which is fine: a single TCP connection to the target is
+	// already serialised at the network level anyway.
+	upMu sync.Mutex
 }
 
 // openOpts builds CreateReqOpts for opening a file or directory read-only.
@@ -280,12 +289,17 @@ func handleFromFile(req server.CreateRequest, f *smb.File, shareName string) *pr
 }
 
 // Create opens the requested path on the upstream target and returns a handle.
-func (v *proxyVFS) Create(ctx context.Context, _ *server.Session, req server.CreateRequest) (server.CreateResult, uint32, error) {
+func (v *proxyVFS) Create(ctx context.Context, _ *server.Session, req server.CreateRequest) (result server.CreateResult, status uint32, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[proxy] Create %q panic: %v\n%s", req.Path, r, debug.Stack())
+			result, status = server.CreateResult{}, smb.StatusObjectNameNotFound
+		}
+	}()
+
 	remote := remotePath(req.Path) // share-relative, no leading "\"
 
 	// ---- Root directory ----
-	// The share root ("\") is special: some targets reject a bare-path CREATE
-	// with FILE_DIRECTORY_FILE, so we always return a synthetic handle for it.
 	if remote == "" {
 		h := syntheticRootHandle(v.share)
 		return server.CreateResult{
@@ -295,20 +309,17 @@ func (v *proxyVFS) Create(ctx context.Context, _ *server.Session, req server.Cre
 		}, 0, nil
 	}
 
-	// ---- Determine whether Explorer wants a dir or a file ----
 	wantsDir := (req.CreateOptions&smb.FileDirectoryFile) != 0 ||
 		(req.FileAttributes&smb.FileAttrDirectory) != 0
 
-	// ---- Try to open upstream ----
-	var (
-		upFile *smb.File
-		err    error
-	)
+	// upMu serialises all v.up.* calls — see proxyVFS comment.
+	v.upMu.Lock()
+	defer v.upMu.Unlock()
+
+	var upFile *smb.File
 	if wantsDir {
-		// First attempt: with FILE_DIRECTORY_FILE.
 		upFile, err = v.up.OpenFileExt(v.share, remote, openDirOpts())
 		if err != nil {
-			// Retry without that flag (some servers dislike it).
 			o := openDirOpts()
 			o.CreateOpts = 0
 			upFile, err = v.up.OpenFileExt(v.share, remote, o)
@@ -316,8 +327,6 @@ func (v *proxyVFS) Create(ctx context.Context, _ *server.Session, req server.Cre
 	} else {
 		upFile, err = v.up.OpenFileExt(v.share, remote, openFileOpts())
 		if err != nil {
-			// Explorer sometimes opens files with directory opts first; try
-			// the other way around as a fallback.
 			upFile, err = v.up.OpenFileExt(v.share, remote, openDirOpts())
 		}
 	}
@@ -336,14 +345,21 @@ func (v *proxyVFS) Create(ctx context.Context, _ *server.Session, req server.Cre
 // Close releases the upstream file handle.
 // Close releases the upstream file handle. fileMu ensures we wait for any
 // in-flight Read to finish before nilling ph.file and closing upstream.
-func (v *proxyVFS) Close(_ context.Context, h server.Handle) error {
+func (v *proxyVFS) Close(_ context.Context, h server.Handle) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[proxy] Close panic: %v\n%s", r, debug.Stack())
+		}
+	}()
 	ph := h.(*proxyHandle)
 	ph.fileMu.Lock()
 	file := ph.file
 	ph.file = nil
 	ph.fileMu.Unlock()
 	if file != nil {
+		v.upMu.Lock()
 		_ = file.CloseFile()
+		v.upMu.Unlock()
 	}
 	return nil
 }
@@ -365,11 +381,9 @@ func (v *proxyVFS) Read(_ context.Context, h server.Handle, offset int64, buf []
 	ph.fileMu.Lock()
 	defer ph.fileMu.Unlock()
 
-	// Recover from upstream panics (nil Session field after TCP teardown).
-	// Named return values let the defer update them before the function exits.
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[proxy] Read offset=%d panicked (upstream connection died?): %v", offset, r)
+			log.Printf("[proxy] Read offset=%d panic: %v\n%s", offset, r, debug.Stack())
 			n, status = 0, smb.FsctlStatusPipeBroken
 		}
 	}()
@@ -381,10 +395,13 @@ func (v *proxyVFS) Read(_ context.Context, h server.Handle, offset int64, buf []
 		return 0, smb.StatusFileClosed, nil
 	}
 
+	// upMu serialises this ReadFile against concurrent Create / QueryDirectory
+	// calls on the same upstream connection.
+	v.upMu.Lock()
 	readN, readErr := ph.file.ReadFile(buf, uint64(offset))
+	v.upMu.Unlock()
+
 	if readErr != nil {
-		// ReadFile returns io.EOF (not an NTStatus error) when the upstream
-		// server sends STATUS_END_OF_FILE. Treat both forms as end-of-file.
 		if errors.Is(readErr, io.EOF) || errors.Is(readErr, smb.StatusMap[smb.StatusEndOfFile]) {
 			return 0, smb.StatusEndOfFile, nil
 		}
@@ -414,7 +431,14 @@ func (v *proxyVFS) Flush(_ context.Context, _ server.Handle) (uint32, error) {
 // Root handle: uses conn.ListDirectory because there is no upstream File to
 // call QueryDirectory on.
 // Non-root handle: uses file.QueryDirectory directly on the open upstream file.
-func (v *proxyVFS) QueryDirectory(_ context.Context, h server.Handle, pattern string, restart bool) ([]server.DirEntry, uint32, error) {
+func (v *proxyVFS) QueryDirectory(_ context.Context, h server.Handle, pattern string, restart bool) (entries []server.DirEntry, status uint32, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[proxy] QueryDirectory %q panic: %v\n%s", pattern, r, debug.Stack())
+			entries, status = nil, smb.StatusObjectNameNotFound
+		}
+	}()
+
 	ph := h.(*proxyHandle)
 	ph.mu.Lock()
 	defer ph.mu.Unlock()
@@ -423,20 +447,18 @@ func (v *proxyVFS) QueryDirectory(_ context.Context, h server.Handle, pattern st
 		pattern = "*"
 	}
 
-	// Reset cursor when the server requests a fresh scan or the pattern changed.
 	if restart || !ph.listed || pattern != ph.lastPattern {
 		var raw []smb.SharedFile
-		var err error
 
 		if ph.isRoot {
-			// ListDirectory requires the tree to be already connected —
-			// it does NOT call TreeConnect internally (unlike OpenFileExt).
-			// Call it here; it's idempotent when the tree is already up.
-			if tcErr := v.up.TreeConnect(v.share); tcErr != nil {
-				return nil, errToStatus(tcErr), nil
+			v.upMu.Lock()
+			tcErr := v.up.TreeConnect(v.share)
+			if tcErr == nil {
+				raw, err = v.up.ListDirectory(v.share, "", pattern)
+			} else {
+				err = tcErr
 			}
-			// Root: list the top level of the share.
-			raw, err = v.up.ListDirectory(v.share, "", pattern)
+			v.upMu.Unlock()
 		} else {
 			if ph.file == nil {
 				return nil, smb.StatusFileClosed, nil
@@ -445,35 +467,31 @@ func (v *proxyVFS) QueryDirectory(_ context.Context, h server.Handle, pattern st
 			if restart {
 				flags = smb.RestartScans
 			}
+			// ph.file.QueryDirectory goes over the upstream connection —
+			// hold upMu so it doesn't race with concurrent Create/Read calls.
+			v.upMu.Lock()
 			raw, err = ph.file.QueryDirectory(pattern, flags, 0, 65536)
+			v.upMu.Unlock()
 		}
 
 		if err != nil {
 			if errors.Is(err, smb.StatusMap[smb.StatusNoMoreFiles]) {
-				ph.listed = true
-				ph.lastPattern = pattern
-				ph.entries = nil
-				ph.pos = 0
+				ph.listed, ph.lastPattern, ph.entries, ph.pos = true, pattern, nil, 0
 				return nil, smb.StatusNoMoreFiles, nil
 			}
 			return nil, errToStatus(err), nil
 		}
 
-		entries := make([]server.DirEntry, len(raw))
+		converted := make([]server.DirEntry, len(raw))
 		for i, sf := range raw {
-			entries[i] = sharedFileToDirEntry(sf)
+			converted[i] = sharedFileToDirEntry(sf)
 		}
-		ph.entries = entries
-		ph.pos = 0
-		ph.listed = true
-		ph.lastPattern = pattern
+		ph.entries, ph.pos, ph.listed, ph.lastPattern = converted, 0, true, pattern
 	}
 
 	if ph.pos >= len(ph.entries) {
 		return nil, smb.StatusNoMoreFiles, nil
 	}
-
-	// Return all remaining entries; the server handles buffer-splitting.
 	result := ph.entries[ph.pos:]
 	ph.pos = len(ph.entries)
 	return result, 0, nil
