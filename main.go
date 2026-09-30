@@ -357,9 +357,11 @@ func (v *proxyVFS) Close(_ context.Context, h server.Handle) (err error) {
 	ph.file = nil
 	ph.fileMu.Unlock()
 	if file != nil {
-		v.upMu.Lock()
-		_ = file.CloseFile()
-		v.upMu.Unlock()
+		func() {
+			v.upMu.Lock()
+			defer v.upMu.Unlock()
+			_ = file.CloseFile()
+		}()
 	}
 	return nil
 }
@@ -396,10 +398,12 @@ func (v *proxyVFS) Read(_ context.Context, h server.Handle, offset int64, buf []
 	}
 
 	// upMu serialises this ReadFile against concurrent Create / QueryDirectory
-	// calls on the same upstream connection.
+	// calls on the same upstream connection. Use defer so the lock is released
+	// even if ReadFile panics (the recover() above catches the panic, but a
+	// raw Unlock() call after the panic site would never run).
 	v.upMu.Lock()
+	defer v.upMu.Unlock()
 	readN, readErr := ph.file.ReadFile(buf, uint64(offset))
-	v.upMu.Unlock()
 
 	if readErr != nil {
 		if errors.Is(readErr, io.EOF) || errors.Is(readErr, smb.StatusMap[smb.StatusEndOfFile]) {
@@ -451,14 +455,16 @@ func (v *proxyVFS) QueryDirectory(_ context.Context, h server.Handle, pattern st
 		var raw []smb.SharedFile
 
 		if ph.isRoot {
-			v.upMu.Lock()
-			tcErr := v.up.TreeConnect(v.share)
-			if tcErr == nil {
-				raw, err = v.up.ListDirectory(v.share, "", pattern)
-			} else {
-				err = tcErr
-			}
-			v.upMu.Unlock()
+			func() {
+				v.upMu.Lock()
+				defer v.upMu.Unlock()
+				tcErr := v.up.TreeConnect(v.share)
+				if tcErr == nil {
+					raw, err = v.up.ListDirectory(v.share, "", pattern)
+				} else {
+					err = tcErr
+				}
+			}()
 		} else {
 			if ph.file == nil {
 				return nil, smb.StatusFileClosed, nil
@@ -467,11 +473,11 @@ func (v *proxyVFS) QueryDirectory(_ context.Context, h server.Handle, pattern st
 			if restart {
 				flags = smb.RestartScans
 			}
-			// ph.file.QueryDirectory goes over the upstream connection —
-			// hold upMu so it doesn't race with concurrent Create/Read calls.
-			v.upMu.Lock()
-			raw, err = ph.file.QueryDirectory(pattern, flags, 0, 65536)
-			v.upMu.Unlock()
+			func() {
+				v.upMu.Lock()
+				defer v.upMu.Unlock()
+				raw, err = ph.file.QueryDirectory(pattern, flags, 0, 65536)
+			}()
 		}
 
 		if err != nil {
