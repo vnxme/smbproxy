@@ -153,14 +153,15 @@ func sharedFileToDirEntry(sf smb.SharedFile) server.DirEntry {
 	}
 }
 
-// readAheadSize is how many bytes we fetch from the upstream server per cache
-// miss, regardless of how many bytes the client actually requested. Fetching
-// in large chunks amortises the per-round-trip cost: a 1 MiB upstream fetch
-// satisfies ~16 consecutive 64 KiB client reads with no further upstream I/O.
-// Windows' SMB 2.1 target typically negotiates MaxReadSize ≥ 1 MiB, so a
-// single SMB2 READ PDU can carry all 1 MiB; lower it here if the upstream
-// rejects large reads.
-const readAheadSize = 1 << 20 // 1 MiB
+// readAheadSize is the upstream batch size: how many bytes we fetch from the
+// target in one go, both for synchronous fetches and for the async prefetch.
+// It should match MaxReadSize in ServerConfig so each client READ maps to one
+// upstream batch — the server sends one large response to the client while the
+// goroutine fetches the next batch, hiding upstream latency entirely.
+// go-smb internally caps each individual SMB2 READ to the negotiated
+// MaxReadSize/credit window, so a single ReadFile call may return less than
+// readAheadSize; we loop until we have the full block or hit EOF.
+const readAheadSize = 8 << 20 // 8 MiB — matches ServerConfig.MaxReadSize below
 
 // ---------------------------------------------------------------------------
 // proxyHandle — implements server.Handle
@@ -197,11 +198,23 @@ type proxyHandle struct {
 	// readAheadSize bytes from upstream and keep the result here. Subsequent
 	// reads that fall inside [cacheOff, cacheOff+len(cacheData)) are served
 	// entirely from memory, eliminating the upstream round-trip for each one.
-	// Protected by cacheMu (separate from fileMu so cache hits don't block
-	// concurrent readers waiting for the RLock).
+	// Current upstream cache block. One upstream fetch fills this with up to
+	// readAheadSize bytes; subsequent client reads that fall inside the window
+	// [cacheOff, cacheOff+len(cacheData)) are served from memory with no
+	// upstream I/O. Protected by cacheMu.
 	cacheMu   sync.Mutex
 	cacheOff  int64
-	cacheData []byte // nil = no valid cache entry
+	cacheData []byte
+
+	// Async prefetch: once the cache is half-consumed a background goroutine
+	// starts fetching the next readAheadSize block. When the cache is exhausted
+	// the next Read finds the prefetch done and swaps it in as the new cache,
+	// hiding upstream latency entirely. Protected by prefMu.
+	prefMu   sync.Mutex
+	prefOff  int64         // file offset the goroutine is fetching (-1 = none)
+	prefData []byte        // filled on completion (nil until then)
+	prefErr  error         // non-nil means the prefetch failed
+	prefDone chan struct{} // closed when goroutine finishes; nil = not started
 
 	// Directory listing cursor (populated lazily; protected by mu).
 	mu          sync.Mutex
@@ -378,10 +391,24 @@ func (v *proxyVFS) Close(_ context.Context, h server.Handle) (err error) {
 	ph.file = nil
 	ph.fileMu.Unlock()
 
-	// Drop the cache now that the handle is gone.
+	// Drop the cache and wait for any in-flight prefetch goroutine to finish
+	// before releasing. The goroutine will error out quickly once it sees
+	// ph.file is nil (it holds only a copied pointer, not the field).
 	ph.cacheMu.Lock()
 	ph.cacheData = nil
 	ph.cacheMu.Unlock()
+
+	ph.prefMu.Lock()
+	done := ph.prefDone
+	ph.prefMu.Unlock()
+	if done != nil {
+		<-done
+	}
+	ph.prefMu.Lock()
+	ph.prefData = nil
+	ph.prefDone = nil
+	ph.prefOff = -1
+	ph.prefMu.Unlock()
 
 	if file != nil {
 		func() {
@@ -395,23 +422,22 @@ func (v *proxyVFS) Close(_ context.Context, h server.Handle) (err error) {
 
 // Read forwards a positional read to the upstream file.
 //
-// Read serves data to the client using a per-handle read-ahead cache to
-// minimise upstream round-trips.
+// Read serves data to the client using a two-level strategy:
 //
-// fileMu is held as a shared (read) lock for the duration of the upstream
-// ReadFile call. This lets multiple client connections read the same handle
-// concurrently while still blocking Close from freeing ph.file underneath us.
+//  1. Cache: one upstream fetch fills a readAheadSize block that satisfies
+//     many consecutive client reads, regardless of whether the client sends
+//     64 KiB or 8 MiB requests. This hides per-request overhead.
 //
-// On a cache hit no upstream I/O is needed at all — the data is copied
-// straight from the in-memory cache. On a miss we fetch readAheadSize bytes
-// from the upstream (typically 1 MiB), store it in the cache, and return
-// the portion the client requested. Subsequent reads that fall within the
-// cached window are served entirely from memory.
+//  2. Async prefetch: once the cache is half-consumed a background goroutine
+//     starts fetching the next block. By the time the current block is
+//     exhausted the next one is waiting — zero upstream wait for the client.
+//
+// go-smb caps each individual ReadFile call to the upstream credit window,
+// so a single call may return less than readAheadSize. Both the sync path and
+// the prefetch goroutine loop until the full block is filled.
 func (v *proxyVFS) Read(_ context.Context, h server.Handle, offset int64, buf []byte) (n int, status uint32, err error) {
 	ph := h.(*proxyHandle)
 
-	// Shared lock: multiple concurrent reads are fine; Close waits for all
-	// of them to finish before acquiring the exclusive lock and nilling ph.file.
 	ph.fileMu.RLock()
 	defer ph.fileMu.RUnlock()
 
@@ -431,21 +457,29 @@ func (v *proxyVFS) Read(_ context.Context, h server.Handle, offset int64, buf []
 
 	need := len(buf)
 
-	// ---- cache lookup -------------------------------------------------
-	// Check whether [offset, offset+need) is covered by the cached window.
-	// We only need cacheMu here, not fileMu (already held), not upMu.
+	// ---- tier 1: cache hit -----------------------------------------------
 	ph.cacheMu.Lock()
 	if ph.cacheData != nil {
-		cacheEnd := ph.cacheOff + int64(len(ph.cacheData))
-		if offset >= ph.cacheOff && offset < cacheEnd {
-			start := int(offset - ph.cacheOff)
-			avail := len(ph.cacheData) - start // bytes in cache from offset
+		cacheOff := ph.cacheOff
+		cacheLen := int64(len(ph.cacheData))
+		cacheEnd := cacheOff + cacheLen
+		if offset >= cacheOff && offset < cacheEnd {
+			start := int(offset - cacheOff)
+			avail := len(ph.cacheData) - start
 			serve := avail
 			if serve > need {
 				serve = need
 			}
 			copy(buf[:serve], ph.cacheData[start:start+serve])
+			// Trigger prefetch of the next block once we are past the midpoint
+			// of the current block, so the goroutine runs while the remaining
+			// first half is still being served.
+			triggerAt := cacheOff + cacheLen/2
+			nextOff := cacheEnd
 			ph.cacheMu.Unlock()
+			if offset+int64(serve) >= triggerAt {
+				v.startPrefetch(ph, nextOff)
+			}
 			if serve == 0 {
 				return 0, smb.StatusEndOfFile, nil
 			}
@@ -454,45 +488,147 @@ func (v *proxyVFS) Read(_ context.Context, h server.Handle, offset int64, buf []
 	}
 	ph.cacheMu.Unlock()
 
-	// ---- cache miss: fetch a large chunk from upstream ----------------
-	fetchSize := readAheadSize
-	if fetchSize < need {
-		fetchSize = need
-	}
-	upBuf := make([]byte, fetchSize)
+	// ---- tier 2: prefetch hit --------------------------------------------
+	ph.prefMu.Lock()
+	if ph.prefDone != nil && ph.prefOff == offset {
+		done := ph.prefDone
+		ph.prefMu.Unlock()
+		<-done // wait if still running (usually already done)
+		ph.prefMu.Lock()
+		data, pErr := ph.prefData, ph.prefErr
+		ph.prefData = nil
+		ph.prefOff = -1
+		ph.prefDone = nil
+		ph.prefMu.Unlock()
 
-	// upMu serialises all v.up.* calls on the shared upstream connection.
-	// Use an inline closure so defer guarantees the unlock even on panic.
-	var readN int
-	var readErr error
-	func() {
-		v.upMu.Lock()
-		defer v.upMu.Unlock()
-		readN, readErr = ph.file.ReadFile(upBuf, uint64(offset))
-	}()
+		isEOF := errors.Is(pErr, io.EOF) ||
+			errors.Is(pErr, smb.StatusMap[smb.StatusEndOfFile])
+		if pErr != nil && !isEOF {
+			return 0, errToStatus(pErr), nil
+		}
+		if len(data) == 0 {
+			return 0, smb.StatusEndOfFile, nil
+		}
+		// Install prefetch result as the new cache.
+		ph.cacheMu.Lock()
+		ph.cacheOff = offset
+		ph.cacheData = data
+		ph.cacheMu.Unlock()
+		// Kick off prefetch for the block after this one.
+		v.startPrefetch(ph, offset+int64(len(data)))
 
-	isEOF := errors.Is(readErr, io.EOF) ||
-		errors.Is(readErr, smb.StatusMap[smb.StatusEndOfFile])
-	if readErr != nil && !isEOF {
-		return 0, errToStatus(readErr), nil
+		serve := len(data)
+		if serve > need {
+			serve = need
+		}
+		copy(buf[:serve], data[:serve])
+		return serve, smb.StatusOk, nil
 	}
-	if readN == 0 {
+	ph.prefMu.Unlock()
+
+	// ---- tier 3: synchronous fetch ---------------------------------------
+	// Loop ReadFile until readAheadSize bytes are accumulated or EOF is hit.
+	upBuf := make([]byte, readAheadSize)
+	totalN := 0
+	v.upMu.Lock()
+	for totalN < readAheadSize {
+		rn, rErr := ph.file.ReadFile(upBuf[totalN:], uint64(offset)+uint64(totalN))
+		if rn > 0 {
+			totalN += rn
+		}
+		isEOF := errors.Is(rErr, io.EOF) ||
+			errors.Is(rErr, smb.StatusMap[smb.StatusEndOfFile])
+		if rErr != nil {
+			if !isEOF && totalN == 0 {
+				v.upMu.Unlock()
+				return 0, errToStatus(rErr), nil
+			}
+			break
+		}
+		if rn == 0 {
+			break
+		}
+	}
+	v.upMu.Unlock()
+
+	if totalN == 0 {
 		return 0, smb.StatusEndOfFile, nil
 	}
-
-	// Populate cache with the full upstream response.
+	// Populate cache and start prefetch for the next block.
 	ph.cacheMu.Lock()
 	ph.cacheOff = offset
-	ph.cacheData = upBuf[:readN]
+	ph.cacheData = upBuf[:totalN]
 	ph.cacheMu.Unlock()
+	v.startPrefetch(ph, offset+int64(totalN))
 
-	// Return what the client requested.
-	serve := readN
+	serve := totalN
 	if serve > need {
 		serve = need
 	}
 	copy(buf[:serve], upBuf[:serve])
 	return serve, smb.StatusOk, nil
+}
+
+// startPrefetch launches a background goroutine that fetches the block at off
+// from upstream. The result is stored in ph.prefData / ph.prefErr and signals
+// ph.prefDone. If a prefetch is already running for any offset, this is a
+// no-op — only one prefetch per handle at a time.
+func (v *proxyVFS) startPrefetch(ph *proxyHandle, off int64) {
+	ph.prefMu.Lock()
+	if ph.prefDone != nil {
+		ph.prefMu.Unlock()
+		return // already running
+	}
+	ch := make(chan struct{})
+	ph.prefDone = ch
+	ph.prefOff = off
+	ph.prefMu.Unlock()
+
+	go func() {
+		defer close(ch)
+
+		// Brief RLock just to copy the file pointer safely.
+		ph.fileMu.RLock()
+		file := ph.file
+		ph.fileMu.RUnlock()
+		if file == nil {
+			return
+		}
+
+		upBuf := make([]byte, readAheadSize)
+		totalN := 0
+		var fetchErr error
+
+		// Hold upMu for the entire loop so the batch is atomic with respect
+		// to other upstream operations (Create, QueryDirectory).
+		v.upMu.Lock()
+		for totalN < readAheadSize {
+			rn, rErr := file.ReadFile(upBuf[totalN:], uint64(off)+uint64(totalN))
+			if rn > 0 {
+				totalN += rn
+			}
+			isEOF := errors.Is(rErr, io.EOF) ||
+				errors.Is(rErr, smb.StatusMap[smb.StatusEndOfFile])
+			if rErr != nil {
+				if !isEOF && totalN == 0 {
+					fetchErr = rErr
+				}
+				break
+			}
+			if rn == 0 {
+				break
+			}
+		}
+		v.upMu.Unlock()
+
+		ph.prefMu.Lock()
+		if totalN > 0 {
+			ph.prefData = upBuf[:totalN]
+		}
+		ph.prefErr = fetchErr
+		ph.prefMu.Unlock()
+		// ch closed by defer above
+	}()
 }
 
 // Write: read-only proxy; all mutations are rejected.
@@ -715,6 +851,11 @@ func main() {
 		// specifying credentials (null/anonymous session). Windows Explorer
 		// always sends credentials so it goes through MapAuthenticator above.
 		AllowAnonymous: true,
+		// Advertise 8 MiB max read so Windows Explorer sends 8 MiB requests
+		// instead of the default 64 KiB. Combined with the async prefetch
+		// this eliminates per-request round-trip overhead: one upstream fetch
+		// per 8 MiB, overlapped with the TCP send of the previous 8 MiB.
+		MaxReadSize: readAheadSize,
 	}
 
 	srv := &server.Server{Config: cfg}
