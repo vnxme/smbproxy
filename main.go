@@ -153,6 +153,15 @@ func sharedFileToDirEntry(sf smb.SharedFile) server.DirEntry {
 	}
 }
 
+// readAheadSize is how many bytes we fetch from the upstream server per cache
+// miss, regardless of how many bytes the client actually requested. Fetching
+// in large chunks amortises the per-round-trip cost: a 1 MiB upstream fetch
+// satisfies ~16 consecutive 64 KiB client reads with no further upstream I/O.
+// Windows' SMB 2.1 target typically negotiates MaxReadSize ≥ 1 MiB, so a
+// single SMB2 READ PDU can carry all 1 MiB; lower it here if the upstream
+// rejects large reads.
+const readAheadSize = 1 << 20 // 1 MiB
+
 // ---------------------------------------------------------------------------
 // proxyHandle — implements server.Handle
 //
@@ -177,13 +186,22 @@ type proxyHandle struct {
 	// isRoot is true for the share-root synthetic handle.
 	isRoot bool
 
-	// fileMu serialises Read and Close. It is held for the ENTIRE duration
-	// of each ReadFile call so that a concurrent Close cannot nil ph.file
-	// underneath an in-flight upstream read. A panic inside ReadFile (e.g.
-	// if the upstream TCP connection drops and Connection.Session is set to
-	// nil mid-read) is caught by the recover() in VFS.Read, and the deferred
-	// Unlock still runs because defer always executes on the way out.
-	fileMu sync.Mutex
+	// fileMu guards ph.file. Read acquires an RLock for the duration of each
+	// upstream ReadFile call, allowing multiple concurrent reads (different
+	// client connections) on the same handle. Close acquires the exclusive
+	// Lock, which blocks until all in-progress reads finish, then nils ph.file
+	// before calling CloseFile — ensuring no read can use a closed file.
+	fileMu sync.RWMutex
+
+	// Read-ahead cache. When the client asks for N bytes at offset X we fetch
+	// readAheadSize bytes from upstream and keep the result here. Subsequent
+	// reads that fall inside [cacheOff, cacheOff+len(cacheData)) are served
+	// entirely from memory, eliminating the upstream round-trip for each one.
+	// Protected by cacheMu (separate from fileMu so cache hits don't block
+	// concurrent readers waiting for the RLock).
+	cacheMu   sync.Mutex
+	cacheOff  int64
+	cacheData []byte // nil = no valid cache entry
 
 	// Directory listing cursor (populated lazily; protected by mu).
 	mu          sync.Mutex
@@ -343,8 +361,9 @@ func (v *proxyVFS) Create(ctx context.Context, _ *server.Session, req server.Cre
 }
 
 // Close releases the upstream file handle.
-// Close releases the upstream file handle. fileMu ensures we wait for any
-// in-flight Read to finish before nilling ph.file and closing upstream.
+// The exclusive fileMu.Lock() waits for any concurrent Read (which holds
+// RLock) to finish before ph.file is nilled and the upstream handle closed.
+// The read-ahead cache is also cleared so its memory is released promptly.
 func (v *proxyVFS) Close(_ context.Context, h server.Handle) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -352,10 +371,18 @@ func (v *proxyVFS) Close(_ context.Context, h server.Handle) (err error) {
 		}
 	}()
 	ph := h.(*proxyHandle)
+
+	// Exclusive lock: blocks until all in-progress RLock reads complete.
 	ph.fileMu.Lock()
 	file := ph.file
 	ph.file = nil
 	ph.fileMu.Unlock()
+
+	// Drop the cache now that the handle is gone.
+	ph.cacheMu.Lock()
+	ph.cacheData = nil
+	ph.cacheMu.Unlock()
+
 	if file != nil {
 		func() {
 			v.upMu.Lock()
@@ -368,20 +395,25 @@ func (v *proxyVFS) Close(_ context.Context, h server.Handle) (err error) {
 
 // Read forwards a positional read to the upstream file.
 //
-// fileMu is held for the entire ReadFile call so a concurrent Close cannot
-// nil ph.file underneath an in-flight read.
+// Read serves data to the client using a per-handle read-ahead cache to
+// minimise upstream round-trips.
 //
-// ReadFile can panic when the upstream TCP connection is torn down mid-read
-// (go-smb's Connection embeds *Session; if Session becomes nil during teardown
-// the promoted field access f.supportsMultiCredit panics before any network
-// I/O starts). The recover() converts that into a clean STATUS_PIPE_BROKEN so
-// Windows Explorer gets "The pipe has been ended" rather than a dropped
-// connection (which it would show as a much more confusing access-denied).
+// fileMu is held as a shared (read) lock for the duration of the upstream
+// ReadFile call. This lets multiple client connections read the same handle
+// concurrently while still blocking Close from freeing ph.file underneath us.
+//
+// On a cache hit no upstream I/O is needed at all — the data is copied
+// straight from the in-memory cache. On a miss we fetch readAheadSize bytes
+// from the upstream (typically 1 MiB), store it in the cache, and return
+// the portion the client requested. Subsequent reads that fall within the
+// cached window are served entirely from memory.
 func (v *proxyVFS) Read(_ context.Context, h server.Handle, offset int64, buf []byte) (n int, status uint32, err error) {
 	ph := h.(*proxyHandle)
 
-	ph.fileMu.Lock()
-	defer ph.fileMu.Unlock()
+	// Shared lock: multiple concurrent reads are fine; Close waits for all
+	// of them to finish before acquiring the exclusive lock and nilling ph.file.
+	ph.fileMu.RLock()
+	defer ph.fileMu.RUnlock()
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -397,21 +429,70 @@ func (v *proxyVFS) Read(_ context.Context, h server.Handle, offset int64, buf []
 		return 0, smb.StatusFileClosed, nil
 	}
 
-	// upMu serialises this ReadFile against concurrent Create / QueryDirectory
-	// calls on the same upstream connection. Use defer so the lock is released
-	// even if ReadFile panics (the recover() above catches the panic, but a
-	// raw Unlock() call after the panic site would never run).
-	v.upMu.Lock()
-	defer v.upMu.Unlock()
-	readN, readErr := ph.file.ReadFile(buf, uint64(offset))
+	need := len(buf)
 
-	if readErr != nil {
-		if errors.Is(readErr, io.EOF) || errors.Is(readErr, smb.StatusMap[smb.StatusEndOfFile]) {
-			return 0, smb.StatusEndOfFile, nil
+	// ---- cache lookup -------------------------------------------------
+	// Check whether [offset, offset+need) is covered by the cached window.
+	// We only need cacheMu here, not fileMu (already held), not upMu.
+	ph.cacheMu.Lock()
+	if ph.cacheData != nil {
+		cacheEnd := ph.cacheOff + int64(len(ph.cacheData))
+		if offset >= ph.cacheOff && offset < cacheEnd {
+			start := int(offset - ph.cacheOff)
+			avail := len(ph.cacheData) - start // bytes in cache from offset
+			serve := avail
+			if serve > need {
+				serve = need
+			}
+			copy(buf[:serve], ph.cacheData[start:start+serve])
+			ph.cacheMu.Unlock()
+			if serve == 0 {
+				return 0, smb.StatusEndOfFile, nil
+			}
+			return serve, smb.StatusOk, nil
 		}
+	}
+	ph.cacheMu.Unlock()
+
+	// ---- cache miss: fetch a large chunk from upstream ----------------
+	fetchSize := readAheadSize
+	if fetchSize < need {
+		fetchSize = need
+	}
+	upBuf := make([]byte, fetchSize)
+
+	// upMu serialises all v.up.* calls on the shared upstream connection.
+	// Use an inline closure so defer guarantees the unlock even on panic.
+	var readN int
+	var readErr error
+	func() {
+		v.upMu.Lock()
+		defer v.upMu.Unlock()
+		readN, readErr = ph.file.ReadFile(upBuf, uint64(offset))
+	}()
+
+	isEOF := errors.Is(readErr, io.EOF) ||
+		errors.Is(readErr, smb.StatusMap[smb.StatusEndOfFile])
+	if readErr != nil && !isEOF {
 		return 0, errToStatus(readErr), nil
 	}
-	return readN, 0, nil
+	if readN == 0 {
+		return 0, smb.StatusEndOfFile, nil
+	}
+
+	// Populate cache with the full upstream response.
+	ph.cacheMu.Lock()
+	ph.cacheOff = offset
+	ph.cacheData = upBuf[:readN]
+	ph.cacheMu.Unlock()
+
+	// Return what the client requested.
+	serve := readN
+	if serve > need {
+		serve = need
+	}
+	copy(buf[:serve], upBuf[:serve])
+	return serve, smb.StatusOk, nil
 }
 
 // Write: read-only proxy; all mutations are rejected.
