@@ -773,9 +773,15 @@ func openUpstream(target, user, domain, hashArg string) (*smb.Connection, error)
 	return smb.NewConnection(smb.Options{
 		Host: target,
 		Port: 445,
-		// SMB 2.1: required for the PtH path; later dialects need extra signing
-		// context negotiation that can block hash-only auth on some targets.
-		Dialects: append([]uint16{}, smb.DialectsSMB2Only...),
+		// SMB2Only skips the SMB1 multi-protocol probe and sends a direct
+		// SMB2 NEGOTIATE offering all dialects. The server picks the highest
+		// it supports (typically SMB 3.1.1 or 3.0.2 on modern Windows).
+		// Higher dialects advertise MaxReadSize = 8 MiB (vs 64 KiB for 2.1),
+		// enabling go-smb to fill the 8 MiB cache in 1–2 upstream ReadFile
+		// calls instead of 128, cutting upstream fetch time ~64×.
+		// PtH (NT hash auth) works with all SMB2/3 dialects; signing is
+		// handled correctly by go-smb's NTLMInitiator if required.
+		SMB2Only: true,
 		Initiator: &spnego.NTLMInitiator{
 			User:   user,
 			Domain: domain,
