@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/hex"
+	"errors"
+	"log"
 	"sync"
 
 	"github.com/jfjallid/go-smb/smb"
@@ -17,8 +19,69 @@ import (
 // ---------------------------------------------------------------------------
 
 type upstream struct {
+	m    mapping                             // retained so a dropped link can be redialed
+	dial func(mapping) (upstreamConn, error) // injectable for tests; dialConn in production
 	conn upstreamConn
 	mu   sync.Mutex
+}
+
+// do runs a connection-level operation under the upstream lock. If fn fails
+// with what looks like a dead connection (see isTransportErr), it redials once
+// and retries fn on the fresh connection. The lock is held across the redial
+// so no other operation observes a half-swapped conn.
+//
+// Only connection-level entry points (opening a handle, enumerating the share
+// root) go through do. Operations on an already-open file handle do not: a
+// redial yields a new connection on which the old handle is invalid, so a
+// retry there is pointless and a false-positive transport error must not tear
+// down a handle that is still in use. Those paths recover when the client
+// re-opens the handle, which routes back through do via Create.
+func (u *upstream) do(fn func(c upstreamConn) error) error {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	err := fn(u.conn)
+	if !isTransportErr(err) {
+		return err
+	}
+	log.Printf("[*] upstream %s connection error (%v); reconnecting...", u.m.remoteHost, err)
+	if rerr := u.redial(); rerr != nil {
+		log.Printf("[!] upstream %s reconnect failed: %v", u.m.remoteHost, rerr)
+		return err // surface the original failure, not the reconnect error
+	}
+	log.Printf("[+] upstream %s reconnected", u.m.remoteHost)
+	return fn(u.conn)
+}
+
+// redial opens a fresh authenticated connection and swaps it in, closing the
+// old one. The caller must hold u.mu.
+func (u *upstream) redial() error {
+	c, err := u.dial(u.m)
+	if err != nil {
+		return err
+	}
+	if u.conn != nil {
+		u.conn.Close()
+	}
+	u.conn = c
+	return nil
+}
+
+// isTransportErr reports whether err indicates a broken connection rather than
+// a protocol response. The library returns every server NTSTATUS as a sentinel
+// from smb.StatusMap, so anything wrapping one of those means the link is alive
+// and answered; a dead socket surfaces as a plain error ("remote connection
+// has closed", a net error, etc.), which is what we redial on.
+func isTransportErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	for _, sentinel := range smb.StatusMap {
+		if errors.Is(err, sentinel) {
+			return false
+		}
+	}
+	return true
 }
 
 // upstreamConn is the subset of *smb.Connection the proxy uses. Abstracting it
@@ -87,6 +150,16 @@ func (f smbFile) meta() fileMeta {
 // from the mapping's credential (a supplied hash, or one computed from a
 // password at parse time).
 func openUpstream(m mapping) (*upstream, error) {
+	conn, err := dialConn(m)
+	if err != nil {
+		return nil, err
+	}
+	return &upstream{m: m, dial: dialConn, conn: conn}, nil
+}
+
+// dialConn opens one authenticated connection to the target in mapping m. It is
+// the production dial func stored on upstream; tests substitute their own.
+func dialConn(m mapping) (upstreamConn, error) {
 	hashBytes, err := hex.DecodeString(m.ntHex)
 	if err != nil {
 		return nil, err
@@ -109,7 +182,7 @@ func openUpstream(m mapping) (*upstream, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &upstream{conn: smbConn{conn}}, nil
+	return smbConn{conn}, nil
 }
 
 // dialectByName maps the -max-dialect flag value to the go-smb constant.

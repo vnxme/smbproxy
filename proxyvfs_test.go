@@ -248,6 +248,45 @@ func TestProxyCreateDirFallback(t *testing.T) {
 	}
 }
 
+// Create must transparently recover when the upstream link has dropped: the
+// first open fails as a transport error, do() redials, and the retry succeeds.
+func TestProxyCreateReconnects(t *testing.T) {
+	ff := &fakeFile{metaVal: fileMeta{endOfFile: 5, attributes: server.FileAttributeNormal}}
+	conn1 := &fakeConn{openFn: func(_, _ string, _ *smb.CreateReqOpts) (upstreamFile, error) {
+		return nil, connDown
+	}}
+	conn2 := &fakeConn{openFn: func(_, _ string, _ *smb.CreateReqOpts) (upstreamFile, error) {
+		return ff, nil
+	}}
+	u := &upstream{m: mapping{remoteHost: "h"}, conn: conn1, dial: func(mapping) (upstreamConn, error) {
+		return conn2, nil
+	}}
+	v := &proxyVFS{up: u, share: "C$"}
+
+	res, status, err := v.Create(context.Background(), nil, server.CreateRequest{Path: "\\a.txt"})
+	if err != nil || status != 0 {
+		t.Fatalf("Create after drop = (0x%08x, %v), want success", status, err)
+	}
+	if res.Handle.(*proxyHandle).file != upstreamFile(ff) {
+		t.Errorf("handle not backed by the reconnected file")
+	}
+}
+
+func TestProxyQueryDirectoryRootReconnects(t *testing.T) {
+	conn1 := &fakeConn{treeErr: connDown}
+	conn2 := &fakeConn{listResult: []smb.SharedFile{{Name: "f"}}}
+	u := &upstream{m: mapping{remoteHost: "h"}, conn: conn1, dial: func(mapping) (upstreamConn, error) {
+		return conn2, nil
+	}}
+	v := &proxyVFS{up: u, share: "C$"}
+	ph := &proxyHandle{isRoot: true, isDir: true}
+
+	entries, status, err := v.QueryDirectory(context.Background(), ph, "*", false)
+	if err != nil || status != 0 || len(entries) != 1 || entries[0].Name != "f" {
+		t.Fatalf("root list after drop = (%d entries, 0x%08x, %v), want 1 entry 'f'", len(entries), status, err)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Read
 // ---------------------------------------------------------------------------

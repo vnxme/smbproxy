@@ -141,23 +141,24 @@ func (v *proxyVFS) Create(_ context.Context, _ *server.Session, req server.Creat
 	wantsDir := (req.CreateOptions&smb.FileDirectoryFile) != 0 ||
 		(req.FileAttributes&smb.FileAttrDirectory) != 0
 
-	v.up.mu.Lock()
-	defer v.up.mu.Unlock()
-
 	var upFile upstreamFile
-	if wantsDir {
-		upFile, err = v.up.conn.OpenFileExt(v.share, remote, openDirOpts())
-		if err != nil {
-			o := openDirOpts()
-			o.CreateOpts = 0
-			upFile, err = v.up.conn.OpenFileExt(v.share, remote, o)
+	err = v.up.do(func(c upstreamConn) error {
+		var e error
+		if wantsDir {
+			upFile, e = c.OpenFileExt(v.share, remote, openDirOpts())
+			if e != nil {
+				o := openDirOpts()
+				o.CreateOpts = 0
+				upFile, e = c.OpenFileExt(v.share, remote, o)
+			}
+		} else {
+			upFile, e = c.OpenFileExt(v.share, remote, openFileOpts())
+			if e != nil {
+				upFile, e = c.OpenFileExt(v.share, remote, openDirOpts())
+			}
 		}
-	} else {
-		upFile, err = v.up.conn.OpenFileExt(v.share, remote, openFileOpts())
-		if err != nil {
-			upFile, err = v.up.conn.OpenFileExt(v.share, remote, openDirOpts())
-		}
-	}
+		return e
+	})
 	if err != nil {
 		return server.CreateResult{}, errToStatus(err), nil
 	}
@@ -405,16 +406,14 @@ func (v *proxyVFS) QueryDirectory(_ context.Context, h server.Handle, pattern st
 		var raw []smb.SharedFile
 
 		if ph.isRoot {
-			func() {
-				v.up.mu.Lock()
-				defer v.up.mu.Unlock()
-				tcErr := v.up.conn.TreeConnect(v.share)
-				if tcErr == nil {
-					raw, err = v.up.conn.ListDirectory(v.share, "", pattern)
-				} else {
-					err = tcErr
+			err = v.up.do(func(c upstreamConn) error {
+				if tcErr := c.TreeConnect(v.share); tcErr != nil {
+					return tcErr
 				}
-			}()
+				var e error
+				raw, e = c.ListDirectory(v.share, "", pattern)
+				return e
+			})
 		} else {
 			if ph.file == nil {
 				return nil, smb.StatusFileClosed, nil
