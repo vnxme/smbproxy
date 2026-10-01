@@ -75,13 +75,13 @@ func main() {
 	localUser := flag.String("local-user", "guest", "username clients authenticate with")
 	localPass := flag.String("local-pass", "guest", "password clients authenticate with")
 	allowGuest := flag.Bool("allow-guest", false, "accept any failed/unknown logon as a guest session (lets Explorer browse \\\\host, which first tries the username \"guest\")")
-	maxDialect := flag.String("max-dialect", "3.1.1", "highest SMB dialect to offer clients: 2.0.2, 2.1, 3.0, 3.0.2 or 3.1.1 (min stays 2.1; 3.x uses AES-CMAC signing that Windows prefers over 2.1's HMAC-SHA256)")
+	maxDialect := flag.String("max-dialect", "3.1.1", "highest SMB dialect to offer clients: 2.1, 3.0, 3.0.2 or 3.1.1 (min stays 2.1; 3.x uses AES-CMAC signing that Windows prefers over 2.1's HMAC-SHA256)")
 	debugLog := flag.Bool("debug", false, "enable verbose go-smb debug logging (dialect, signing, session setup, DCE/RPC)")
 	flag.Parse()
 
 	maxDialectID, ok := dialectByName[*maxDialect]
 	if !ok {
-		log.Fatalf("[!] invalid -max-dialect %q: use one of 2.0.2, 2.1, 3.0, 3.0.2, 3.1.1", *maxDialect)
+		log.Fatalf("[!] invalid -max-dialect %q: use one of 2.1, 3.0, 3.0.2, 3.1.1", *maxDialect)
 	}
 
 	// Verbose go-smb logging. Every go-smb package registers its own named

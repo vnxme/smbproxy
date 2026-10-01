@@ -52,7 +52,6 @@ func openUpstream(m mapping) (*upstream, error) {
 
 // dialectByName maps the -max-dialect flag value to the go-smb constant.
 var dialectByName = map[string]uint16{
-	"2.0.2": smb.DialectSmb_2_0_2,
 	"2.1":   smb.DialectSmb_2_1,
 	"3.0":   smb.DialectSmb_3_0,
 	"3.0.2": smb.DialectSmb_3_0_2,
