@@ -52,6 +52,7 @@ import (
 	"github.com/jfjallid/go-smb/smb"
 	"github.com/jfjallid/go-smb/smb/server"
 	"github.com/jfjallid/go-smb/spnego"
+	"github.com/jfjallid/golog"
 )
 
 // ---------------------------------------------------------------------------
@@ -811,23 +812,9 @@ func (v *noopVFS) Ioctl(_ context.Context, _ server.Handle, _ uint32, _ []byte, 
 }
 
 // ---------------------------------------------------------------------------
-// authStrippingPipe — PipeBackend wrapper that handles DCE/RPC auth
-//
-// When the downstream SMB session is authenticated (guest/guest via NTLM),
-// Windows always embeds an NTLM auth_verifier in the DCE/RPC BIND PDU.
-// The inner dcesrv.PipeHandler rejects any BIND with AuthLength > 0 because
-// it does not implement DCE/RPC-level authentication. This wrapper:
-//
-//  1. Strips the auth_verifier trailer from BIND, ALTER_CONTEXT, and
-//     REQUEST PDUs, zeroing AuthLength and trimming FragLength so the inner
-//     handler sees a clean, auth-free PDU.
-//
-//  2. Silently absorbs AUTH_3 PDUs (the client's NTLM AUTHENTICATE message).
-//     AUTH_3 is one-way — no server response is defined — so we return an
-//     empty body with StatusOk to complete the FSCTL_PIPE_TRANSCEIVE IOCTL.
-//
-// After these steps the inner handler accepts the bind, sends a BindAck
-// without auth, and Windows proceeds normally to call NetShareEnumAll.
+// rpcPipe — PipeBackend wrapper adding DCE/RPC auth handling and a WRITE/READ
+// transport on top of the library's Transceive-only dcesrv.PipeHandler.
+// See the type doc below for details.
 // ---------------------------------------------------------------------------
 
 // DCE/RPC common-header packet types (MS-RPCE §2.2.2.4)
@@ -867,27 +854,87 @@ func stripRPCAuth(pdu []byte) []byte {
 	return out
 }
 
-type authStrippingPipe struct{ inner server.PipeBackend }
+// rpcPipe wraps dcesrv.PipeHandler and supplies two things it lacks.
+//
+// Auth: the inner handler rejects any BIND carrying an auth_verifier
+// (AuthLength > 0). Windows attaches NTLMSSP to the srvsvc bind, so process()
+// strips the verifier from BIND/ALTER_CONTEXT/REQUEST PDUs and absorbs the
+// one-way AUTH_3, leaving the inner handler a clean bind it accepts.
+//
+// Transport: the inner handler only answers FSCTL_PIPE_TRANSCEIVE (one IOCTL
+// round trip); its Write/Read return STATUS_NOT_SUPPORTED. Windows Explorer on
+// the observed target instead drives srvsvc over separate SMB2 WRITE then READ,
+// so every bind failed before this. Write accumulates whole PDUs and runs them
+// through the same processing as Transceive; Read returns the queued response.
+type rpcPipe struct {
+	inner server.PipeBackend
 
-func (a *authStrippingPipe) Transceive(ctx context.Context, in []byte) ([]byte, uint32, error) {
-	if len(in) >= 16 {
-		switch in[2] { // PDU type byte
+	mu  sync.Mutex
+	in  []byte // WRITE bytes accumulated until a full PDU is present
+	out []byte // response bytes awaiting the client's READ
+}
+
+// process handles one complete inbound PDU and returns the inner handler's
+// response. AUTH_3 is one-way, so it yields no response body.
+func (p *rpcPipe) process(ctx context.Context, pdu []byte) ([]byte, uint32, error) {
+	if len(pdu) >= 16 {
+		switch pdu[2] { // PDU type byte
 		case rpcTypeBind, rpcTypeAlterContext, rpcTypeRequest:
-			in = stripRPCAuth(in)
+			pdu = stripRPCAuth(pdu)
 		case rpcTypeAuth3:
-			// One-way message; no response body required.
-			return []byte{}, smb.StatusOk, nil
+			return nil, smb.StatusOk, nil
 		}
 	}
-	return a.inner.Transceive(ctx, in)
+	return p.inner.Transceive(ctx, pdu)
 }
-func (a *authStrippingPipe) Write(ctx context.Context, b []byte) (int, uint32, error) {
-	return a.inner.Write(ctx, b)
+
+func (p *rpcPipe) Transceive(ctx context.Context, in []byte) ([]byte, uint32, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out, status, err := p.process(ctx, in)
+	if out == nil {
+		out = []byte{}
+	}
+	return out, status, err
 }
-func (a *authStrippingPipe) Read(ctx context.Context, max int) ([]byte, uint32, error) {
-	return a.inner.Read(ctx, max)
+
+// Write buffers inbound bytes and processes each complete DCE/RPC PDU, whose
+// length is frag_length at header bytes 8-9. A short tail is kept until the
+// rest of the fragment arrives. Responses queue in p.out for the next READ.
+func (p *rpcPipe) Write(_ context.Context, b []byte) (int, uint32, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := len(b)
+	p.in = append(p.in, b...)
+	for len(p.in) >= 16 {
+		fragLen := int(p.in[8]) | int(p.in[9])<<8
+		if fragLen < 16 || fragLen > len(p.in) {
+			break // incomplete fragment (or malformed) — wait for more
+		}
+		pdu := p.in[:fragLen]
+		p.in = p.in[fragLen:]
+		out, status, err := p.process(context.Background(), pdu)
+		if err != nil || status != smb.StatusOk {
+			return n, status, err // surface the failure on the write
+		}
+		p.out = append(p.out, out...)
+	}
+	return n, smb.StatusOk, nil
 }
-func (a *authStrippingPipe) Close(ctx context.Context) error { return a.inner.Close(ctx) }
+
+// Read drains the queued response in one shot. The library discards the data
+// whenever a pipe Read returns a non-OK status (see smb/server/read.go), so a
+// message-mode partial read via StatusBufferOverflow is not possible here;
+// srvsvc enum responses are small enough to always fit a single client READ.
+func (p *rpcPipe) Read(_ context.Context, _ int) ([]byte, uint32, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := p.out
+	p.out = nil
+	return out, smb.StatusOk, nil
+}
+
+func (p *rpcPipe) Close(ctx context.Context) error { return p.inner.Close(ctx) }
 
 // ---------------------------------------------------------------------------
 // Upstream connection
@@ -939,7 +986,16 @@ func main() {
 	listen := flag.String("l", "0.0.0.0:445", "local listen addr:port (port 445 needs root/CAP_NET_BIND_SERVICE)")
 	localUser := flag.String("local-user", "guest", "username clients authenticate with")
 	localPass := flag.String("local-pass", "guest", "password clients authenticate with")
+	debugLog := flag.Bool("debug", false, "enable verbose go-smb debug logging (dialect, signing, session setup, DCE/RPC)")
 	flag.Parse()
+
+	// Verbose go-smb logging. Every go-smb package registers its own named
+	// logger at init via golog.Get(...); SetAll raises the level on all of
+	// them at once. Lshortfile adds file:line so a failing leg is easy to
+	// trace. Without -debug the library stays at its default (Notice).
+	if *debugLog {
+		golog.SetAll(golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, os.Stdout, os.Stderr)
+	}
 
 	if len(maps) == 0 {
 		flag.Usage()
@@ -1047,7 +1103,7 @@ func main() {
 	cfg.PipeOpener = &server.MapPipeOpener{
 		Pipes: map[string]func(*server.Session) (server.PipeBackend, error){
 			"srvsvc": func(_ *server.Session) (server.PipeBackend, error) {
-				return &authStrippingPipe{
+				return &rpcPipe{
 					inner: dcesrv.NewPipeHandler("srvsvc", extSvc),
 				}, nil
 			},
