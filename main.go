@@ -1,5 +1,6 @@
-// smbproxy: local SMB server that authenticates upstream using NTLM credential
-// hashes, exposing remote Windows shares to local SMB clients.
+// smbproxy: local SMB server that authenticates upstream using NTLM
+// credentials (an NTLM hash or a password), exposing remote Windows shares to
+// local SMB clients.
 //
 // Architecture:
 //   Windows Explorer → [local SMB server (this tool)] → [target(s), NTLM auth]
@@ -21,8 +22,11 @@
 //     -map "corp_d:10.0.0.5:D$:Administrator:CORP:8846...86c" \
 //     -map "dev:10.0.0.6:Builds:svc_build:CORP:aad3...04ee:dead...beef"
 //
-// The credential field accepts either 32 hex chars (NTLM hash) or the
-// "lmhash:nthash" pair format — only the NT half is used for authentication.
+// The credential field accepts a 32-char NTLM hash, an "lmhash:nthash" pair
+// (only the NT half is used), a plaintext password, or "pass:<password>" to
+// force password mode (needed only when the password is itself 32 hex chars).
+// A password is converted to its NT hash internally, so it is equivalent to
+// passing that hash.
 //
 // Connect from Explorer:  \\<this-host>\<local-share-name>
 // Map a drive:            net use Z: \\<this-host>\corp_c /user:guest guest
@@ -76,17 +80,39 @@ type mapping struct {
 	remoteShare string // share on the target (e.g. "C$")
 	user        string
 	domain      string
-	hashArg     string // raw credential value from -map (32 hex or lm:nt pair)
 	ntHex       string // normalised 32-char NTLM hash (lowercase)
 }
 
-// parseMapping parses one -map value: local:host:share:user:domain:hash
-// SplitN with n=6 keeps any colon inside the hash field intact.
+// isNTHash reports whether s is exactly 32 hexadecimal characters — i.e. a
+// bare NT hash with no LM-hash prefix.
+func isNTHash(s string) bool {
+	if len(s) != 32 {
+		return false
+	}
+	_, err := hex.DecodeString(s)
+	return err == nil
+}
+
+// parseMapping parses one -map value: local:host:share:user:domain:credential
+// SplitN with n=6 keeps any colon inside the credential field intact.
+//
+// The credential field is interpreted as follows:
+//   - "pass:<password>"   → explicit password (everything after the first
+//     colon, so a password may contain ':' or even be 32 hex chars without
+//     being mistaken for a hash)
+//   - 32 hex chars        → NT hash (pass-the-hash)
+//   - "<lmhash>:<nthash>" → LM:NT pair; only the NT half is used
+//   - anything else       → password
+//
+// Passwords are converted to their NT hash via NTOWFv1 up front, so the rest
+// of the proxy (dedup keying, openUpstream) only ever deals with a 32-char
+// hash; from the target's perspective password and pass-the-hash auth are
+// equivalent for NTLM.
 func parseMapping(s string) (mapping, error) {
 	parts := strings.SplitN(s, ":", 6)
 	if len(parts) != 6 {
 		return mapping{}, fmt.Errorf(
-			"-map value must be local_share:host:share:user:domain:hash, got %q", s)
+			"-map value must be local_share:host:share:user:domain:credential, got %q", s)
 	}
 	for i, p := range parts[:5] {
 		if p == "" {
@@ -94,25 +120,36 @@ func parseMapping(s string) (mapping, error) {
 				"-map field %d is empty in %q", i, s)
 		}
 	}
-	ntHex := parts[5]
-	if idx := strings.LastIndexByte(ntHex, ':'); idx >= 0 {
-		ntHex = ntHex[idx+1:] // strip the LM-hash prefix
+	cred := parts[5]
+	if cred == "" {
+		return mapping{}, fmt.Errorf("-map credential field is empty in %q", s)
 	}
-	ntHex = strings.ToLower(ntHex)
-	if len(ntHex) != 32 {
-		return mapping{}, fmt.Errorf(
-			"NTLM credential hash must be 32 hex chars; got %d chars in %q", len(ntHex), parts[5])
+
+	var ntHex string
+	switch {
+	case strings.HasPrefix(cred, "pass:"):
+		// Explicit password; everything after "pass:" is taken verbatim.
+		ntHex = hex.EncodeToString(ntlmssp.Ntowfv1(cred[len("pass:"):]))
+	default:
+		// Auto-detect: a bare NT hash, or the NT half of an "lmhash:nthash"
+		// pair, is used as-is; everything else is treated as a password.
+		h := cred
+		if idx := strings.LastIndexByte(h, ':'); idx >= 0 {
+			h = h[idx+1:] // strip the LM-hash prefix, if any
+		}
+		if isNTHash(h) {
+			ntHex = strings.ToLower(h)
+		} else {
+			ntHex = hex.EncodeToString(ntlmssp.Ntowfv1(cred))
+		}
 	}
-	if _, err := hex.DecodeString(ntHex); err != nil {
-		return mapping{}, fmt.Errorf("invalid NTLM credential hash in %q: %w", s, err)
-	}
+
 	return mapping{
 		localShare:  parts[0],
 		remoteHost:  parts[1],
 		remoteShare: parts[2],
 		user:        parts[3],
 		domain:      parts[4],
-		hashArg:     parts[5],
 		ntHex:       ntHex,
 	}, nil
 }
@@ -924,13 +961,11 @@ func (p *rpcPipe) Close(ctx context.Context) error { return p.inner.Close(ctx) }
 // Upstream connection
 // ---------------------------------------------------------------------------
 
-// openUpstream dials the target and authenticates using the supplied NTLM credential hash.
+// openUpstream dials the target and authenticates using the NT hash derived
+// from the mapping's credential (a supplied hash, or one computed from a
+// password at parse time).
 func openUpstream(m mapping) (*upstream, error) {
-	ntHex := m.hashArg
-	if idx := strings.LastIndexByte(ntHex, ':'); idx >= 0 {
-		ntHex = ntHex[idx+1:]
-	}
-	hashBytes, err := hex.DecodeString(ntHex)
+	hashBytes, err := hex.DecodeString(m.ntHex)
 	if err != nil {
 		return nil, err
 	}
@@ -972,7 +1007,9 @@ func main() {
 	var maps multiFlag
 	flag.Var(&maps, "map",
 		"share mapping: local_share:host:remote_share:user:domain:credential\n"+
-			"\t  credential = 32 hex chars (NTLM hash) OR lmhash:nthash pair\n"+
+			"\t  credential = 32 hex chars (NTLM hash), lmhash:nthash pair,\n"+
+			"\t               a password, or pass:<password> to force password mode\n"+
+			"\t               (use pass: for a password that is itself 32 hex chars)\n"+
 			"\t  repeat -map for multiple shares / multiple targets\n"+
 			"\t  mappings with identical (host,user,domain,credential) share one upstream connection")
 
@@ -1008,7 +1045,10 @@ func main() {
 			"  sudo ./smbproxy \\\n" +
 			"    -map \"corp_c:10.0.0.5:C$:Administrator:CORP:8846...86c\" \\\n" +
 			"    -map \"corp_d:10.0.0.5:D$:Administrator:CORP:8846...86c\" \\\n" +
-			"    -map \"dev:10.0.0.6:Builds:svc_build:CORP:dead...beef\"")
+			"    -map \"dev:10.0.0.6:Builds:svc_build:CORP:dead...beef\"\n\n" +
+			"Password instead of a hash (converted to its NT hash internally):\n" +
+			"  sudo ./smbproxy \\\n" +
+			"    -map \"share:10.0.0.5:C$:Administrator:CORP:S3cretP@ss\"")
 	}
 
 	// ---- Parse and validate all mappings ----

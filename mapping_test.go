@@ -1,0 +1,102 @@
+package main
+
+import (
+	"encoding/hex"
+	"testing"
+
+	"github.com/jfjallid/go-smb/ntlmssp"
+)
+
+// ntHashOf returns the lowercase hex NT hash of a password, matching what
+// parseMapping stores for password credentials.
+func ntHashOf(pw string) string {
+	return hex.EncodeToString(ntlmssp.Ntowfv1(pw))
+}
+
+func TestParseMappingCredential(t *testing.T) {
+	const (
+		nt  = "8846f7eaee8fb117ad06bdd830b7586c"
+		lm  = "aad3b435b51404eeaad3b435b51404ee"
+		pre = "share:10.0.0.5:C$:Administrator:CORP:"
+	)
+
+	cases := []struct {
+		name      string
+		cred      string
+		wantNTHex string
+	}{
+		{"bare NT hash", nt, nt},
+		{"uppercase NT hash", "8846F7EAEE8FB117AD06BDD830B7586C", nt},
+		{"lm:nt pair uses NT half", lm + ":" + nt, nt},
+		{"plain password", "S3cretP@ss", ntHashOf("S3cretP@ss")},
+		{"password with colons", "a:b:c", ntHashOf("a:b:c")},
+		{"explicit pass prefix", "pass:hunter2", ntHashOf("hunter2")},
+		{"pass prefix with colons kept", "pass:a:b:c", ntHashOf("a:b:c")},
+		// A password that happens to be 32 hex chars: auto-detect reads it as a
+		// hash, but the pass: escape forces password mode.
+		{"32-hex password forced via pass", "pass:" + nt, ntHashOf(nt)},
+		// A 32-char non-hex credential is not a valid hash → treated as password.
+		{"32 non-hex chars is a password", "ThisIsExactlyThirtyTwoCharsLong!", ntHashOf("ThisIsExactlyThirtyTwoCharsLong!")},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m, err := parseMapping(pre + tc.cred)
+			if err != nil {
+				t.Fatalf("parseMapping(%q) returned error: %v", tc.cred, err)
+			}
+			if m.ntHex != tc.wantNTHex {
+				t.Errorf("ntHex = %q, want %q", m.ntHex, tc.wantNTHex)
+			}
+			if len(tc.wantNTHex) != 32 {
+				t.Fatalf("test bug: want hash is not 32 chars: %q", tc.wantNTHex)
+			}
+		})
+	}
+}
+
+func TestParseMappingErrors(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+	}{
+		{"too few fields", "share:10.0.0.5:C$:Administrator:CORP"},
+		{"empty host", "share::C$:Administrator:CORP:8846f7eaee8fb117ad06bdd830b7586c"},
+		{"empty credential", "share:10.0.0.5:C$:Administrator:CORP:"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := parseMapping(tc.raw); err == nil {
+				t.Errorf("parseMapping(%q) = nil error, want error", tc.raw)
+			}
+		})
+	}
+}
+
+// Fields with identical (host,user,domain) share a connKey only when the
+// resolved NT hash matches, whether supplied as a hash or a password.
+func TestParseMappingKeyDedup(t *testing.T) {
+	const nt = "8846f7eaee8fb117ad06bdd830b7586c"
+	pw := "secret"
+
+	byHash, err := parseMapping("a:10.0.0.5:C$:u:CORP:" + ntHashOf(pw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	byPass, err := parseMapping("b:10.0.0.5:C$:u:CORP:" + pw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if byHash.key() != byPass.key() {
+		t.Errorf("password and its hash produced different conn keys: %+v vs %+v",
+			byHash.key(), byPass.key())
+	}
+
+	diff, err := parseMapping("c:10.0.0.5:C$:u:CORP:" + nt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff.key() == byPass.key() {
+		t.Errorf("different credentials unexpectedly shared a conn key: %+v", diff.key())
+	}
+}
