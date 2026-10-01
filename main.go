@@ -717,10 +717,20 @@ func (e *extSrvsvcService) InterfaceUUID() string              { return e.inner.
 func (e *extSrvsvcService) InterfaceVersion() (uint16, uint16) { return e.inner.InterfaceVersion() }
 
 func (e *extSrvsvcService) Dispatch(ctx context.Context, opnum uint16, in []byte) ([]byte, error) {
+	log.Printf("[srvsvc] dispatch opnum=%d inlen=%d", opnum, len(in))
+	var out []byte
+	var err error
 	if opnum == mssrvs.SrvSvcOpNetServerGetInfo {
-		return e.handleNetServerGetInfo(in)
+		out, err = e.handleNetServerGetInfo(in)
+	} else {
+		out, err = e.inner.Dispatch(ctx, opnum, in)
 	}
-	return e.inner.Dispatch(ctx, opnum, in)
+	if err != nil {
+		log.Printf("[srvsvc] opnum=%d FAILED: %v", opnum, err)
+	} else {
+		log.Printf("[srvsvc] opnum=%d ok outlen=%d", opnum, len(out))
+	}
+	return out, err
 }
 
 // handleNetServerGetInfo responds to NetrServerGetInfo (opnum 21).
@@ -731,8 +741,10 @@ func (e *extSrvsvcService) Dispatch(ctx context.Context, opnum uint16, in []byte
 func (e *extSrvsvcService) handleNetServerGetInfo(in []byte) ([]byte, error) {
 	var req mssrvs.NetServerGetInfoRequest
 	if err := req.Unmarshal(in); err != nil {
+		log.Printf("[srvsvc] NetServerGetInfo Unmarshal failed: %v (raw %d bytes: %x)", err, len(in), in)
 		return nil, fmt.Errorf("srvsvc NetServerGetInfo decode: %w", err)
 	}
+	log.Printf("[srvsvc] NetServerGetInfo level=%d", req.Level)
 
 	level := req.Level
 	if level != 100 && level != 101 {
@@ -914,6 +926,7 @@ func main() {
 	cfg.PipeOpener = &server.MapPipeOpener{
 		Pipes: map[string]func(*server.Session) (server.PipeBackend, error){
 			"srvsvc": func(_ *server.Session) (server.PipeBackend, error) {
+				log.Printf("[srvsvc] pipe opened by client")
 				return dcesrv.NewPipeHandler("srvsvc", extSvc), nil
 			},
 		},
