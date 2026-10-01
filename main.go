@@ -22,7 +22,7 @@
 //     -map "corp_d:10.0.0.5:D$:Administrator:CORP:8846...86c" \
 //     -map "dev:10.0.0.6:Builds:svc_build:CORP:aad3...04ee:dead...beef"
 //
-// The credential field accepts a 32-char NTLM hash, an "lmhash:nthash" pair
+// The credential field accepts a 32-char NTLM hash, a "lmhash:nthash" pair
 // (only the NT half is used), a plaintext password, or "pass:<password>" to
 // force password mode (needed only when the password is itself 32 hex chars).
 // A password is converted to its NT hash internally, so it is equivalent to
@@ -80,7 +80,7 @@ type mapping struct {
 	remoteShare string // share on the target (e.g. "C$")
 	user        string
 	domain      string
-	ntHex       string // normalised 32-char NTLM hash (lowercase)
+	ntHex       string // normalized 32-char NTLM hash (lowercase)
 }
 
 // isNTHash reports whether s is exactly 32 hexadecimal characters — i.e. a
@@ -131,7 +131,7 @@ func parseMapping(s string) (mapping, error) {
 		// Explicit password; everything after "pass:" is taken verbatim.
 		ntHex = hex.EncodeToString(ntlmssp.Ntowfv1(cred[len("pass:"):]))
 	default:
-		// Auto-detect: a bare NT hash, or the NT half of an "lmhash:nthash"
+		// Auto-detect: a bare NT hash, or the NT half of a "lmhash:nthash"
 		// pair, is used as-is; everything else is treated as a password.
 		h := cred
 		if idx := strings.LastIndexByte(h, ':'); idx >= 0 {
@@ -237,16 +237,14 @@ func fixTime(t, now time.Time) time.Time {
 func sharedFileToDirEntry(sf smb.SharedFile) server.DirEntry {
 	now := time.Now()
 	return server.DirEntry{
-		FileInfo: server.FileInfo{
-			Name:           sf.Name,
-			Size:           int64(sf.Size),
-			AllocationSize: allocSize(int64(sf.Size)),
-			Attributes:     sharedFileAttrs(sf),
-			CreationTime:   fixTime(filetimeToTime(sf.CreationTime), now),
-			LastAccessTime: fixTime(filetimeToTime(sf.LastAccessTime), now),
-			LastWriteTime:  fixTime(filetimeToTime(sf.LastWriteTime), now),
-			ChangeTime:     fixTime(filetimeToTime(sf.ChangeTime), now),
-		},
+		Name:           sf.Name,
+		Size:           int64(sf.Size),
+		AllocationSize: allocSize(int64(sf.Size)),
+		Attributes:     sharedFileAttrs(sf),
+		CreationTime:   fixTime(filetimeToTime(sf.CreationTime), now),
+		LastAccessTime: fixTime(filetimeToTime(sf.LastAccessTime), now),
+		LastWriteTime:  fixTime(filetimeToTime(sf.LastWriteTime), now),
+		ChangeTime:     fixTime(filetimeToTime(sf.ChangeTime), now),
 	}
 }
 
@@ -258,7 +256,7 @@ const readAheadSize = 8 << 20 // 8 MiB
 // upstream — shared connection + mutex
 //
 // Multiple proxyVFS instances that point to the same (host, user, hash) share
-// one *upstream so that all their upstream calls are serialised by a single
+// one *upstream so that all their upstream calls are serialized by a single
 // mutex rather than each VFS thinking it has exclusive access to the conn.
 // ---------------------------------------------------------------------------
 
@@ -377,7 +375,7 @@ func handleFromFile(req server.CreateRequest, f *smb.File, shareName string) *pr
 	}
 }
 
-func (v *proxyVFS) Create(ctx context.Context, _ *server.Session, req server.CreateRequest) (result server.CreateResult, status uint32, err error) {
+func (v *proxyVFS) Create(_ context.Context, _ *server.Session, req server.CreateRequest) (result server.CreateResult, status uint32, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[proxy] Create %q panic: %v\n%s", req.Path, r, debug.Stack())
@@ -489,10 +487,7 @@ func (v *proxyVFS) Read(_ context.Context, h server.Handle, offset int64, buf []
 		if offset >= cacheOff && offset < cacheEnd {
 			start := int(offset - cacheOff)
 			avail := len(ph.cacheData) - start
-			serve := avail
-			if serve > need {
-				serve = need
-			}
+			serve := min(avail, need)
 			copy(buf[:serve], ph.cacheData[start:start+serve])
 			triggerAt := cacheOff + cacheLen/2
 			nextOff := cacheEnd
@@ -535,10 +530,7 @@ func (v *proxyVFS) Read(_ context.Context, h server.Handle, offset int64, buf []
 		ph.cacheMu.Unlock()
 		v.startPrefetch(ph, offset+int64(len(data)))
 
-		serve := len(data)
-		if serve > need {
-			serve = need
-		}
+		serve := min(len(data), need)
 		copy(buf[:serve], data[:serve])
 		return serve, smb.StatusOk, nil
 	}
@@ -577,10 +569,7 @@ func (v *proxyVFS) Read(_ context.Context, h server.Handle, offset int64, buf []
 	ph.cacheMu.Unlock()
 	v.startPrefetch(ph, offset+int64(totalN))
 
-	serve := totalN
-	if serve > need {
-		serve = need
-	}
+	serve := min(totalN, need)
 	copy(buf[:serve], upBuf[:serve])
 	return serve, smb.StatusOk, nil
 }
@@ -801,13 +790,15 @@ var (
 
 // fixBindAck rewrites the result list in a BindAck / AlterContextResp. The
 // library's handler accepts every presentation context whose abstract syntax
-// matches the interface and echoes its transfer syntax back as Acceptance —
-// but Windows always offers three srvsvc contexts (32-bit NDR, NDR64, and Bind
+// matches the interface and echoes its transfer syntax back as Acceptance.
+//
+// But Windows always offers three srvsvc contexts (32-bit NDR, NDR64, and Bind
 // Time Feature Negotiation), and "Acceptance" for the latter two is an RPC
-// protocol error that makes the client drop the pipe. We keep the NDR context
-// as Acceptance, reject NDR64 (we only decode NDR), and answer BTFN with
-// negotiate_ack as MS-RPCE requires. Mutates pdu in place (the inner handler's
-// freshly marshalled buffer) and returns it.
+// protocol error that makes the client drop the pipe.
+//
+// We keep the NDR context as Acceptance, reject NDR64 (we only decode NDR),
+// and answer BTFN with negotiate_ack as MS-RPCE requires. Mutates pdu in place
+// (the inner handler's freshly marshaled buffer) and returns it.
 func fixBindAck(pdu []byte) []byte {
 	if len(pdu) < 26 || (pdu[2] != rpcTypeBindAck && pdu[2] != rpcTypeAlterCtxResp) {
 		return pdu
@@ -822,7 +813,7 @@ func fixBindAck(pdu []byte) []byte {
 	}
 	n := int(pdu[off])
 	base := off + 4
-	for i := 0; i < n; i++ {
+	for i := range n {
 		e := base + i*24 // each p_result_t: result(2) reason(2) transfer_syntax(20)
 		if e+24 > len(pdu) {
 			break
@@ -894,7 +885,7 @@ func (p *rpcPipe) process(ctx context.Context, pdu []byte) ([]byte, uint32, erro
 	out, status, err := p.inner.Transceive(ctx, pdu)
 	out = fixBindAck(out) // correct the result list for NDR64 / BTFN contexts
 	if verbose {
-		var rtype int = -1
+		var rtype = -1
 		if len(out) >= 3 {
 			rtype = int(out[2])
 		}
@@ -933,7 +924,7 @@ func (p *rpcPipe) Write(_ context.Context, b []byte) (int, uint32, error) {
 		p.in = p.in[fragLen:]
 		out, status, err := p.process(context.Background(), pdu)
 		if err != nil || status != smb.StatusOk {
-			return n, status, err // surface the failure on the write
+			return n, status, err // surface the failure on write
 		}
 		p.out = append(p.out, out...)
 	}
@@ -972,7 +963,7 @@ func openUpstream(m mapping) (*upstream, error) {
 	conn, err := smb.NewConnection(smb.Options{
 		Host: m.remoteHost,
 		Port: 445,
-		// SMB2Only skips the SMB1 multi-protocol probe, sending a direct SMB2
+		// SMB2Only skips the SMB1 multiprotocol probe, sending a direct SMB2
 		// NEGOTIATE that offers all dialects. The server picks the highest it
 		// supports (typically 3.1.1 on modern Windows), which advertises
 		// MaxReadSize = 8 MiB instead of the 64 KiB that SMB 2.1 returns.
