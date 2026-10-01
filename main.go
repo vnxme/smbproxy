@@ -44,6 +44,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jfjallid/go-smb/dcerpc/mssrvs"
 	srvsvc "github.com/jfjallid/go-smb/dcerpc/mssrvs/server"
 	dcesrv "github.com/jfjallid/go-smb/dcerpc/server"
 	"github.com/jfjallid/go-smb/ntlmssp"
@@ -696,6 +697,76 @@ func (v *proxyVFS) Ioctl(_ context.Context, _ server.Handle, _ uint32, _ []byte,
 }
 
 // ---------------------------------------------------------------------------
+// Extended srvsvc service
+//
+// The library's srvsvc.Service only handles NetShareEnumAll (opnum 15).
+// Windows Explorer calls NetServerGetInfo (opnum 21) first when browsing
+// \\host\ — without a valid response the library returns a DCE/RPC fault
+// and Explorer shows "The remote procedure call failed and didn't execute".
+//
+// extSrvsvcService wraps the base service, intercepts opnum 21, and
+// delegates everything else to the inner handler.
+// ---------------------------------------------------------------------------
+
+type extSrvsvcService struct {
+	inner      *srvsvc.Service
+	serverName string
+}
+
+func (e *extSrvsvcService) InterfaceUUID() string              { return e.inner.InterfaceUUID() }
+func (e *extSrvsvcService) InterfaceVersion() (uint16, uint16) { return e.inner.InterfaceVersion() }
+
+func (e *extSrvsvcService) Dispatch(ctx context.Context, opnum uint16, in []byte) ([]byte, error) {
+	if opnum == mssrvs.SrvSvcOpNetServerGetInfo {
+		return e.handleNetServerGetInfo(in)
+	}
+	return e.inner.Dispatch(ctx, opnum, in)
+}
+
+// handleNetServerGetInfo responds to NetrServerGetInfo (opnum 21).
+// Explorer uses this to learn the server type before calling NetShareEnumAll.
+// We return a minimal SERVER_INFO_101 (or 100 if explicitly requested)
+// advertising a generic Windows NT workstation/server — enough for Explorer
+// to proceed and call NetShareEnumAll next.
+func (e *extSrvsvcService) handleNetServerGetInfo(in []byte) ([]byte, error) {
+	var req mssrvs.NetServerGetInfoRequest
+	if err := req.Unmarshal(in); err != nil {
+		return nil, fmt.Errorf("srvsvc NetServerGetInfo decode: %w", err)
+	}
+
+	level := req.Level
+	if level != 100 && level != 101 {
+		level = 101 // default for unknown levels
+	}
+	const (
+		platformNT = uint32(500)    // PLATFORM_ID_NT
+		svType     = uint32(0x9003) // SV_TYPE_WORKSTATION | SV_TYPE_SERVER | SV_TYPE_SERVER_NT
+	)
+	name := e.serverName
+	res := mssrvs.NetServerGetInfoResponse{WindowsError: mssrvs.ErrorSuccess}
+	switch level {
+	case 100:
+		res.Info = mssrvs.ServerInfoUnion{
+			Level:    100,
+			Level100: &mssrvs.NetServerInfo100{PlatformId: platformNT, Name: name},
+		}
+	default: // 101
+		res.Info = mssrvs.ServerInfoUnion{
+			Level: 101,
+			Level101: &mssrvs.NetServerInfo101{
+				PlatformId:   platformNT,
+				Name:         name,
+				VersionMajor: 5,
+				VersionMinor: 2,
+				SvType:       svType,
+				Comment:      "",
+			},
+		}
+	}
+	return res.Marshal()
+}
+
+// ---------------------------------------------------------------------------
 // Upstream connection
 // ---------------------------------------------------------------------------
 
@@ -834,12 +905,16 @@ func main() {
 	}
 
 	// ---- Wire srvsvc so Explorer can enumerate shares at \\host level ----
+	// extSrvsvcService adds NetServerGetInfo (opnum 21) handling on top of
+	// the library's NetShareEnumAll (opnum 15) so that browsing \\host\
+	// works: Explorer calls opnum 21 first and would fault without it.
 	shareEntries := srvsvc.FromConfig(cfg)
-	svc := &srvsvc.Service{Shares: shareEntries}
+	innerSvc := &srvsvc.Service{Shares: shareEntries}
+	extSvc := &extSrvsvcService{inner: innerSvc, serverName: cfg.NetBIOSName}
 	cfg.PipeOpener = &server.MapPipeOpener{
 		Pipes: map[string]func(*server.Session) (server.PipeBackend, error){
 			"srvsvc": func(_ *server.Session) (server.PipeBackend, error) {
-				return dcesrv.NewPipeHandler("srvsvc", svc), nil
+				return dcesrv.NewPipeHandler("srvsvc", extSvc), nil
 			},
 		},
 	}
