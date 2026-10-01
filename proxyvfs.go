@@ -21,7 +21,7 @@ type proxyHandle struct {
 	info   server.FileInfo
 	path   server.Path
 	isDir  bool
-	file   *smb.File
+	file   upstreamFile
 	isRoot bool
 
 	fileMu sync.RWMutex
@@ -92,9 +92,10 @@ func syntheticRootHandle(shareName string) *proxyHandle {
 	}
 }
 
-func handleFromFile(req server.CreateRequest, f *smb.File, shareName string) *proxyHandle {
+func handleFromFile(req server.CreateRequest, f upstreamFile, shareName string) *proxyHandle {
 	now := time.Now()
-	attrs := f.Attributes
+	m := f.meta()
+	attrs := m.attributes
 	if attrs == 0 {
 		if f.IsDir() {
 			attrs = server.FileAttributeDirectory
@@ -109,13 +110,13 @@ func handleFromFile(req server.CreateRequest, f *smb.File, shareName string) *pr
 	return &proxyHandle{
 		info: server.FileInfo{
 			Name:           name,
-			Size:           int64(f.EndOfFile),
-			AllocationSize: allocSize(int64(f.EndOfFile)),
+			Size:           int64(m.endOfFile),
+			AllocationSize: allocSize(int64(m.endOfFile)),
 			Attributes:     attrs,
-			CreationTime:   fixTime(filetimeToTime(f.CreationTime), now),
-			LastAccessTime: fixTime(filetimeToTime(f.LastAccessTime), now),
-			LastWriteTime:  fixTime(filetimeToTime(f.LastWriteTime), now),
-			ChangeTime:     fixTime(filetimeToTime(f.ChangeTime), now),
+			CreationTime:   fixTime(filetimeToTime(m.creationTime), now),
+			LastAccessTime: fixTime(filetimeToTime(m.lastAccessTime), now),
+			LastWriteTime:  fixTime(filetimeToTime(m.lastWriteTime), now),
+			ChangeTime:     fixTime(filetimeToTime(m.changeTime), now),
 		},
 		path:  req.Path,
 		isDir: f.IsDir(),
@@ -143,7 +144,7 @@ func (v *proxyVFS) Create(_ context.Context, _ *server.Session, req server.Creat
 	v.up.mu.Lock()
 	defer v.up.mu.Unlock()
 
-	var upFile *smb.File
+	var upFile upstreamFile
 	if wantsDir {
 		upFile, err = v.up.conn.OpenFileExt(v.share, remote, openDirOpts())
 		if err != nil {
