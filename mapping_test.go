@@ -100,3 +100,21 @@ func TestParseMappingKeyDedup(t *testing.T) {
 		t.Errorf("different credentials unexpectedly shared a conn key: %+v", diff.key())
 	}
 }
+
+func TestMultiFlag(t *testing.T) {
+	var f multiFlag
+	if got := f.String(); got != "" {
+		t.Errorf("empty String() = %q, want \"\"", got)
+	}
+	for _, s := range []string{"a:1", "b:2"} {
+		if err := f.Set(s); err != nil {
+			t.Fatalf("Set(%q): %v", s, err)
+		}
+	}
+	if len(f) != 2 || f[0] != "a:1" || f[1] != "b:2" {
+		t.Errorf("values = %q, want [a:1 b:2] in order", []string(f))
+	}
+	if got := f.String(); got != "a:1, b:2" {
+		t.Errorf("String() = %q, want \"a:1, b:2\"", got)
+	}
+}
