@@ -813,9 +813,8 @@ func (v *noopVFS) Ioctl(_ context.Context, _ server.Handle, _ uint32, _ []byte, 
 }
 
 // ---------------------------------------------------------------------------
-// rpcPipe — PipeBackend wrapper adding DCE/RPC auth handling and a WRITE/READ
-// transport on top of the library's Transceive-only dcesrv.PipeHandler.
-// See the type doc below for details.
+// rpcPipe — PipeBackend wrapper that makes the library's dcesrv.PipeHandler
+// usable by Windows Explorer's srvsvc client. See the rpcPipe type doc below.
 // ---------------------------------------------------------------------------
 
 // DCE/RPC common-header packet types (MS-RPCE §2.2.2.4)
@@ -915,18 +914,23 @@ func stripRPCAuth(pdu []byte) []byte {
 	return out
 }
 
-// rpcPipe wraps dcesrv.PipeHandler and supplies two things it lacks.
+// rpcPipe wraps dcesrv.PipeHandler and supplies three things it lacks, which
+// together let Windows Explorer enumerate shares at \\host.
 //
-// Auth: the inner handler rejects any BIND carrying an auth_verifier
-// (AuthLength > 0). Windows attaches NTLMSSP to the srvsvc bind, so process()
-// strips the verifier from BIND/ALTER_CONTEXT/REQUEST PDUs and absorbs the
-// one-way AUTH_3, leaving the inner handler a clean bind it accepts.
+//  1. A WRITE/READ transport. The inner handler only answers
+//     FSCTL_PIPE_TRANSCEIVE; its Write/Read return STATUS_NOT_SUPPORTED. The
+//     observed client drives srvsvc over separate SMB2 WRITE then READ, so the
+//     bind never reached a handler. Write accumulates whole PDUs and runs each
+//     through the same path as Transceive; Read returns the queued response.
 //
-// Transport: the inner handler only answers FSCTL_PIPE_TRANSCEIVE (one IOCTL
-// round trip); its Write/Read return STATUS_NOT_SUPPORTED. Windows Explorer on
-// the observed target instead drives srvsvc over separate SMB2 WRITE then READ,
-// so every bind failed before this. Write accumulates whole PDUs and runs them
-// through the same processing as Transceive; Read returns the queued response.
+//  2. A corrected BIND result list (see fixBindAck) — the fix the observed
+//     client actually needed.
+//
+//  3. Best-effort DCE/RPC auth handling (see process). The inner handler
+//     rejects any BIND carrying an auth_verifier, so we strip it and absorb the
+//     one-way AUTH_3. The observed client bound with auth_length 0, so this is
+//     defensive; it only helps Connect-level auth, as stripping cannot satisfy
+//     a client that expects a signed or sealed exchange.
 type rpcPipe struct {
 	inner server.PipeBackend
 
@@ -951,8 +955,9 @@ func pduInfo(pdu []byte) (ptype byte, fragLen, authLen, opnum int) {
 	return
 }
 
-// process handles one complete inbound PDU and returns the inner handler's
-// response. AUTH_3 is one-way, so it yields no response body.
+// process handles one complete inbound PDU: it strips any auth_verifier
+// (best effort; see rpcPipe) and absorbs the one-way AUTH_3, dispatches to the
+// inner handler, and corrects the BindAck result list on the way out.
 func (p *rpcPipe) process(ctx context.Context, pdu []byte) ([]byte, uint32, error) {
 	if len(pdu) >= 16 {
 		ptype, fragLen, authLen, opnum := pduInfo(pdu)
