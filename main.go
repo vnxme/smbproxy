@@ -46,7 +46,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jfjallid/go-smb/dcerpc/mssrvs"
 	srvsvc "github.com/jfjallid/go-smb/dcerpc/mssrvs/server"
 	dcesrv "github.com/jfjallid/go-smb/dcerpc/server"
 	"github.com/jfjallid/go-smb/ntlmssp"
@@ -700,76 +699,6 @@ func (v *proxyVFS) Ioctl(_ context.Context, _ server.Handle, _ uint32, _ []byte,
 }
 
 // ---------------------------------------------------------------------------
-// Extended srvsvc service
-//
-// The library's srvsvc.Service only handles NetShareEnumAll (opnum 15).
-// Windows Explorer calls NetServerGetInfo (opnum 21) first when browsing
-// \\host\ — without a valid response the library returns a DCE/RPC fault
-// and Explorer shows "The remote procedure call failed and didn't execute".
-//
-// extSrvsvcService wraps the base service, intercepts opnum 21, and
-// delegates everything else to the inner handler.
-// ---------------------------------------------------------------------------
-
-type extSrvsvcService struct {
-	inner      *srvsvc.Service
-	serverName string
-}
-
-func (e *extSrvsvcService) InterfaceUUID() string              { return e.inner.InterfaceUUID() }
-func (e *extSrvsvcService) InterfaceVersion() (uint16, uint16) { return e.inner.InterfaceVersion() }
-
-func (e *extSrvsvcService) Dispatch(ctx context.Context, opnum uint16, in []byte) ([]byte, error) {
-	if opnum == mssrvs.SrvSvcOpNetServerGetInfo {
-		return e.handleNetServerGetInfo(in)
-	}
-	return e.inner.Dispatch(ctx, opnum, in)
-}
-
-// handleNetServerGetInfo responds to NetrServerGetInfo (opnum 21).
-// Explorer uses this to learn the server type before calling NetShareEnumAll.
-// We return a minimal SERVER_INFO_101 (or 100 if explicitly requested)
-// advertising a generic Windows NT workstation/server — enough for Explorer
-// to proceed and call NetShareEnumAll next.
-func (e *extSrvsvcService) handleNetServerGetInfo(in []byte) ([]byte, error) {
-	var req mssrvs.NetServerGetInfoRequest
-	if err := req.Unmarshal(in); err != nil {
-		return nil, fmt.Errorf("srvsvc NetServerGetInfo decode: %w", err)
-	}
-
-	level := req.Level
-	if level != 100 && level != 101 {
-		level = 101 // default for unknown levels
-	}
-	const (
-		platformNT = uint32(500)    // PLATFORM_ID_NT
-		svType     = uint32(0x9003) // SV_TYPE_WORKSTATION | SV_TYPE_SERVER | SV_TYPE_SERVER_NT
-	)
-	name := e.serverName
-	res := mssrvs.NetServerGetInfoResponse{WindowsError: mssrvs.ErrorSuccess}
-	switch level {
-	case 100:
-		res.Info = mssrvs.ServerInfoUnion{
-			Level:    100,
-			Level100: &mssrvs.NetServerInfo100{PlatformId: platformNT, Name: name},
-		}
-	default: // 101
-		res.Info = mssrvs.ServerInfoUnion{
-			Level: 101,
-			Level101: &mssrvs.NetServerInfo101{
-				PlatformId:   platformNT,
-				Name:         name,
-				VersionMajor: 5,
-				VersionMinor: 2,
-				SvType:       svType,
-				Comment:      "",
-			},
-		}
-	}
-	return res.Marshal()
-}
-
-// ---------------------------------------------------------------------------
 // noopVFS — placeholder VFS for the IPC$ pipe share
 //
 // The server auto-creates IPC$ with VFS=nil. If any code path calls
@@ -819,12 +748,9 @@ func (v *noopVFS) Ioctl(_ context.Context, _ server.Handle, _ uint32, _ []byte, 
 
 // DCE/RPC common-header packet types (MS-RPCE §2.2.2.4)
 const (
-	rpcTypeBind         = 11 // PacketTypeBind
-	rpcTypeBindAck      = 12 // PacketTypeBindAck
-	rpcTypeAlterContext = 14 // PacketTypeAlterContext
-	rpcTypeAlterCtxResp = 15 // PacketTypeAlterContextResp
-	rpcTypeAuth3        = 16 // PacketTypeAuth3
 	rpcTypeRequest      = 0  // PacketTypeRequest
+	rpcTypeBindAck      = 12 // PacketTypeBindAck
+	rpcTypeAlterCtxResp = 15 // PacketTypeAlterContextResp
 )
 
 // Transfer-syntax UUIDs as they appear on the wire (first three fields
@@ -885,36 +811,7 @@ func fixBindAck(pdu []byte) []byte {
 	return pdu
 }
 
-// stripRPCAuth removes the auth_verifier from a DCE/RPC PDU and updates
-// the common header fields (FragLength, AuthLength) to match.
-func stripRPCAuth(pdu []byte) []byte {
-	if len(pdu) < 16 {
-		return pdu
-	}
-	authLen := int(pdu[10]) | int(pdu[11])<<8 // bytes 10-11 LE
-	if authLen == 0 {
-		return pdu
-	}
-	fragLen := int(pdu[8]) | int(pdu[9])<<8 // bytes 8-9 LE
-	if fragLen > len(pdu) {
-		fragLen = len(pdu)
-	}
-	// The sec_trailer occupies 8 bytes before the auth_value blob.
-	// New PDU body ends at: fragLen - authLen - 8 (the sec_trailer size).
-	newLen := fragLen - authLen - 8
-	if newLen < 16 || newLen >= fragLen {
-		return pdu // malformed
-	}
-	out := make([]byte, newLen)
-	copy(out, pdu[:newLen])
-	out[8] = byte(newLen)      // FragLength low
-	out[9] = byte(newLen >> 8) // FragLength high
-	out[10] = 0                // AuthLength low  → 0
-	out[11] = 0                // AuthLength high → 0
-	return out
-}
-
-// rpcPipe wraps dcesrv.PipeHandler and supplies three things it lacks, which
+// rpcPipe wraps dcesrv.PipeHandler and supplies two things it lacks, which
 // together let Windows Explorer enumerate shares at \\host.
 //
 //  1. A WRITE/READ transport. The inner handler only answers
@@ -925,12 +822,6 @@ func stripRPCAuth(pdu []byte) []byte {
 //
 //  2. A corrected BIND result list (see fixBindAck) — the fix the observed
 //     client actually needed.
-//
-//  3. Best-effort DCE/RPC auth handling (see process). The inner handler
-//     rejects any BIND carrying an auth_verifier, so we strip it and absorb the
-//     one-way AUTH_3. The observed client bound with auth_length 0, so this is
-//     defensive; it only helps Connect-level auth, as stripping cannot satisfy
-//     a client that expects a signed or sealed exchange.
 type rpcPipe struct {
 	inner server.PipeBackend
 
@@ -955,25 +846,13 @@ func pduInfo(pdu []byte) (ptype byte, fragLen, authLen, opnum int) {
 	return
 }
 
-// process handles one complete inbound PDU: it strips any auth_verifier
-// (best effort; see rpcPipe) and absorbs the one-way AUTH_3, dispatches to the
-// inner handler, and corrects the BindAck result list on the way out.
+// process dispatches one complete inbound PDU to the inner handler and
+// corrects the BindAck result list on the way out.
 func (p *rpcPipe) process(ctx context.Context, pdu []byte) ([]byte, uint32, error) {
-	if len(pdu) >= 16 {
+	if verbose && len(pdu) >= 16 {
 		ptype, fragLen, authLen, opnum := pduInfo(pdu)
-		if verbose {
-			log.Printf("[rpc] in  type=%d frag=%d auth=%d opnum=%d (%d bytes)",
-				ptype, fragLen, authLen, opnum, len(pdu))
-		}
-		switch ptype {
-		case rpcTypeBind, rpcTypeAlterContext, rpcTypeRequest:
-			pdu = stripRPCAuth(pdu)
-		case rpcTypeAuth3:
-			if verbose {
-				log.Printf("[rpc] absorbing AUTH_3 (no response)")
-			}
-			return nil, smb.StatusOk, nil
-		}
+		log.Printf("[rpc] in  type=%d frag=%d auth=%d opnum=%d (%d bytes)",
+			ptype, fragLen, authLen, opnum, len(pdu))
 	}
 	out, status, err := p.inner.Transceive(ctx, pdu)
 	out = fixBindAck(out) // correct the result list for NDR64 / BTFN contexts
@@ -1217,17 +1096,15 @@ func main() {
 	}
 
 	// ---- Wire srvsvc so Explorer can enumerate shares at \\host level ----
-	// extSrvsvcService adds NetServerGetInfo (opnum 21) handling on top of
-	// the library's NetShareEnumAll (opnum 15) so that browsing \\host\
-	// works: Explorer calls opnum 21 first and would fault without it.
-	shareEntries := srvsvc.FromConfig(cfg)
-	innerSvc := &srvsvc.Service{Shares: shareEntries}
-	extSvc := &extSrvsvcService{inner: innerSvc, serverName: cfg.NetBIOSName}
+	// The library's srvsvc.Service answers NetShareEnumAll (opnum 15), which is
+	// all Explorer calls to list shares. rpcPipe adds the WRITE/READ transport
+	// and the BindAck fixup the Windows client needs (see its doc).
+	svc := &srvsvc.Service{Shares: srvsvc.FromConfig(cfg)}
 	cfg.PipeOpener = &server.MapPipeOpener{
 		Pipes: map[string]func(*server.Session) (server.PipeBackend, error){
 			"srvsvc": func(_ *server.Session) (server.PipeBackend, error) {
 				return &rpcPipe{
-					inner: dcesrv.NewPipeHandler("srvsvc", extSvc),
+					inner: dcesrv.NewPipeHandler("srvsvc", svc),
 				}, nil
 			},
 		},
