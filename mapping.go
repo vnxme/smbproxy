@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/hex"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/jfjallid/go-smb/ntlmssp"
@@ -101,6 +102,34 @@ func parseMapping(s string) (mapping, error) {
 		domain:      parts[4],
 		ntHex:       ntHex,
 	}, nil
+}
+
+// readMapFile reads map-formatted lines from a file supplied via -mapfile.
+// Each kept line has the same syntax as a -map value, so credentials can live
+// in a file (with restricted permissions) instead of the process argument
+// list. Lines are returned in file order; parseMapping validates them later.
+func readMapFile(path string) ([]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return parseMapLines(string(data)), nil
+}
+
+// parseMapLines splits map-file content into raw map strings. Surrounding
+// whitespace is trimmed (so CRLF files work), and blank lines and lines whose
+// first non-space character is '#' are dropped. A '#' elsewhere is left intact,
+// since a password may legitimately contain one.
+func parseMapLines(content string) []string {
+	var out []string
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		out = append(out, line)
+	}
+	return out
 }
 
 // connKey identifies a unique upstream SMB session.

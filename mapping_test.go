@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/hex"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/jfjallid/go-smb/ntlmssp"
@@ -98,6 +100,63 @@ func TestParseMappingKeyDedup(t *testing.T) {
 	}
 	if diff.key() == byPass.key() {
 		t.Errorf("different credentials unexpectedly shared a conn key: %+v", diff.key())
+	}
+}
+
+func TestParseMapLines(t *testing.T) {
+	// Mixed content: a comment, blanks, CRLF endings, surrounding whitespace,
+	// a credential that itself contains '#', and an indented comment.
+	content := "# header comment\r\n" +
+		"\r\n" +
+		"  corp_c:10.0.0.5:C$:Admin:CORP:8846f7eaee8fb117ad06bdd830b7586c  \r\n" +
+		"   # indented comment\r\n" +
+		"dev:10.0.0.6:Builds:svc:CORP:p@ss#word\n" +
+		"\t\n"
+
+	got := parseMapLines(content)
+	want := []string{
+		"corp_c:10.0.0.5:C$:Admin:CORP:8846f7eaee8fb117ad06bdd830b7586c",
+		"dev:10.0.0.6:Builds:svc:CORP:p@ss#word",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("parseMapLines returned %d lines %q, want %d", len(got), got, len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("line %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	if lines := parseMapLines("\n# all comments\n   \n"); lines != nil {
+		t.Errorf("comment/blank-only content = %q, want nil", lines)
+	}
+}
+
+func TestReadMapFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "shares.maps")
+	content := "# shares\na:h:C$:u:d:p1\n\nb:h:D$:u:d:p2\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	lines, err := readMapFile(path)
+	if err != nil {
+		t.Fatalf("readMapFile: %v", err)
+	}
+	if len(lines) != 2 || lines[0] != "a:h:C$:u:d:p1" || lines[1] != "b:h:D$:u:d:p2" {
+		t.Errorf("readMapFile = %q, want the two share lines", lines)
+	}
+
+	// Each kept line must parse as a valid mapping.
+	for _, raw := range lines {
+		if _, err := parseMapping(raw); err != nil {
+			t.Errorf("parseMapping(%q): %v", raw, err)
+		}
+	}
+
+	if _, err := readMapFile(filepath.Join(dir, "missing.maps")); err == nil {
+		t.Errorf("readMapFile on a missing path = nil error, want an error")
 	}
 }
 

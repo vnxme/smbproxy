@@ -22,6 +22,11 @@
 //     -map "corp_d:10.0.0.5:D$:Administrator:CORP:8846...86c" \
 //     -map "dev:10.0.0.6:Builds:svc_build:CORP:aad3...04ee:dead...beef"
 //
+// Usage (mappings from a file, one -map-formatted line per entry; blank lines
+// and #-comments are ignored). This keeps credentials out of the process
+// argument list and can be combined with -map:
+//   sudo ./smbproxy -mapfile /etc/smbproxy.maps
+//
 // The credential field accepts a 32-char NTLM hash, a "lmhash:nthash" pair
 // (only the NT half is used), a plaintext password, or "pass:<password>" to
 // force password mode (needed only when the password is itself 32 hex chars).
@@ -71,6 +76,14 @@ func main() {
 			"\t  repeat -map for multiple shares / multiple targets\n"+
 			"\t  mappings with identical (host,user,domain,credential) share one upstream connection")
 
+	var mapFiles multiFlag
+	flag.Var(&mapFiles, "mapfile",
+		"read share mappings from a file, one -map-formatted line per entry:\n"+
+			"\t  local_share:host:remote_share:user:domain:credential\n"+
+			"\t  blank lines and lines beginning with # are ignored. Keeps\n"+
+			"\t  credentials out of the process argument list; repeat for\n"+
+			"\t  several files. Combined with any -map flags.")
+
 	listen := flag.String("l", "0.0.0.0:445", "local listen addr:port (port 445 needs root/CAP_NET_BIND_SERVICE)")
 	localUser := flag.String("local-user", "guest", "username clients authenticate with")
 	localPass := flag.String("local-pass", "guest", "password clients authenticate with")
@@ -93,9 +106,19 @@ func main() {
 		verbose = true // enable rpcPipe PDU tracing
 	}
 
-	if len(maps) == 0 {
+	// ---- Gather raw map lines from -map flags and -mapfile files ----
+	rawMaps := append([]string(nil), maps...)
+	for _, path := range mapFiles {
+		lines, err := readMapFile(path)
+		if err != nil {
+			log.Fatalf("[!] -mapfile %q: %v", path, err)
+		}
+		rawMaps = append(rawMaps, lines...)
+	}
+
+	if len(rawMaps) == 0 {
 		flag.Usage()
-		log.Fatal("\nat least one -map flag is required\n\n" +
+		log.Fatal("\nat least one -map or -mapfile entry is required\n\n" +
 			"Example:\n" +
 			"  sudo ./smbproxy \\\n" +
 			"    -map \"share:10.0.0.5:C$:Administrator:CORP:8846f7eaee8fb117ad06bdd830b7586c\"\n\n" +
@@ -104,18 +127,20 @@ func main() {
 			"    -map \"corp_c:10.0.0.5:C$:Administrator:CORP:8846...86c\" \\\n" +
 			"    -map \"corp_d:10.0.0.5:D$:Administrator:CORP:8846...86c\" \\\n" +
 			"    -map \"dev:10.0.0.6:Builds:svc_build:CORP:dead...beef\"\n\n" +
+			"From a file (one such line per entry, keeps credentials off the cmdline):\n" +
+			"  sudo ./smbproxy -mapfile /etc/smbproxy.maps\n\n" +
 			"Password instead of a hash (converted to its NT hash internally):\n" +
 			"  sudo ./smbproxy \\\n" +
 			"    -map \"share:10.0.0.5:C$:Administrator:CORP:S3cretP@ss\"")
 	}
 
 	// ---- Parse and validate all mappings ----
-	mappings := make([]mapping, 0, len(maps))
+	mappings := make([]mapping, 0, len(rawMaps))
 	seen := map[string]bool{}
-	for _, raw := range maps {
+	for _, raw := range rawMaps {
 		m, err := parseMapping(raw)
 		if err != nil {
-			log.Fatalf("[!] invalid -map %q: %v", raw, err)
+			log.Fatalf("[!] invalid mapping %q: %v", raw, err)
 		}
 		if seen[m.localShare] {
 			log.Fatalf("[!] duplicate local share name %q", m.localShare)
