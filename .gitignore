@@ -1,2 +1,7 @@
+.claude
 .idea
+.mcp.json
+
 _gitignore
+
+*.exe
