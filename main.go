@@ -1,27 +1,28 @@
-// smb-pth-proxy: browse remote Windows shares with NT hashes, no password.
+// smbproxy: local SMB server that authenticates upstream using NTLM credential
+// hashes, exposing remote Windows shares to local SMB clients.
 //
 // Architecture:
-//   Windows Explorer → [local SMB server (this tool)] → [target(s), auth via NT hash]
+//   Windows Explorer → [local SMB server (this tool)] → [target(s), NTLM auth]
 //
 // Multiple upstream shares can be proxied simultaneously. Mappings that share
-// the same (host, user, domain, hash) tuple reuse a single upstream SMB
+// the same (host, user, domain, credential) tuple reuse a single upstream SMB
 // connection; different credentials get separate connections.
 //
 // Build:
-//   go mod tidy && go build -o smb-pth-proxy .
+//   go mod tidy && go build -o smbproxy .
 //
-// Usage (single share, backward-compatible style):
-//   sudo ./smb-pth-proxy \
+// Usage (single share):
+//   sudo ./smbproxy \
 //     -map "share:10.0.0.5:C$:Administrator:CORP:8846f7eaee8fb117ad06bdd830b7586c"
 //
 // Usage (multiple shares, possibly across multiple hosts):
-//   sudo ./smb-pth-proxy \
+//   sudo ./smbproxy \
 //     -map "corp_c:10.0.0.5:C$:Administrator:CORP:8846...86c" \
 //     -map "corp_d:10.0.0.5:D$:Administrator:CORP:8846...86c" \
 //     -map "dev:10.0.0.6:Builds:svc_build:CORP:aad3...04ee:dead...beef"
 //
-// The hash field accepts either 32 hex chars (NT hash only) or the
-// impacket-style "lmhash:nthash" pair — only the NT half is used.
+// The credential field accepts either 32 hex chars (NTLM hash) or the
+// "lmhash:nthash" pair format — only the NT half is used for authentication.
 //
 // Connect from Explorer:  \\<this-host>\<local-share-name>
 // Map a drive:            net use Z: \\<this-host>\corp_c /user:guest guest
@@ -74,8 +75,8 @@ type mapping struct {
 	remoteShare string // share on the target (e.g. "C$")
 	user        string
 	domain      string
-	hashArg     string // raw value from -map (32 hex or lmhash:nthash)
-	ntHex       string // normalised 32-char NT hash (lowercase)
+	hashArg     string // raw credential value from -map (32 hex or lm:nt pair)
+	ntHex       string // normalised 32-char NTLM hash (lowercase)
 }
 
 // parseMapping parses one -map value: local:host:share:user:domain:hash
@@ -99,10 +100,10 @@ func parseMapping(s string) (mapping, error) {
 	ntHex = strings.ToLower(ntHex)
 	if len(ntHex) != 32 {
 		return mapping{}, fmt.Errorf(
-			"NT hash must be 32 hex chars; got %d chars in %q", len(ntHex), parts[5])
+			"NTLM credential hash must be 32 hex chars; got %d chars in %q", len(ntHex), parts[5])
 	}
 	if _, err := hex.DecodeString(ntHex); err != nil {
-		return mapping{}, fmt.Errorf("invalid NT hash in %q: %w", s, err)
+		return mapping{}, fmt.Errorf("invalid NTLM credential hash in %q: %w", s, err)
 	}
 	return mapping{
 		localShare:  parts[0],
@@ -892,7 +893,7 @@ func (a *authStrippingPipe) Close(ctx context.Context) error { return a.inner.Cl
 // Upstream connection
 // ---------------------------------------------------------------------------
 
-// openUpstream dials the target and authenticates via pass-the-hash.
+// openUpstream dials the target and authenticates using the supplied NTLM credential hash.
 func openUpstream(m mapping) (*upstream, error) {
 	ntHex := m.hashArg
 	if idx := strings.LastIndexByte(ntHex, ':'); idx >= 0 {
@@ -930,10 +931,10 @@ func openUpstream(m mapping) (*upstream, error) {
 func main() {
 	var maps multiFlag
 	flag.Var(&maps, "map",
-		"share mapping: local_share:host:remote_share:user:domain:hash\n"+
-			"\t  hash = 32 hex chars OR lmhash:nthash (impacket style)\n"+
+		"share mapping: local_share:host:remote_share:user:domain:credential\n"+
+			"\t  credential = 32 hex chars (NTLM hash) OR lmhash:nthash pair\n"+
 			"\t  repeat -map for multiple shares / multiple targets\n"+
-			"\t  mappings with identical (host,user,domain,hash) share one upstream connection")
+			"\t  mappings with identical (host,user,domain,credential) share one upstream connection")
 
 	listen := flag.String("l", "0.0.0.0:445", "local listen addr:port (port 445 needs root/CAP_NET_BIND_SERVICE)")
 	localUser := flag.String("local-user", "guest", "username clients authenticate with")
@@ -944,10 +945,10 @@ func main() {
 		flag.Usage()
 		log.Fatal("\nat least one -map flag is required\n\n" +
 			"Example:\n" +
-			"  sudo ./smb-pth-proxy \\\n" +
+			"  sudo ./smbproxy \\\n" +
 			"    -map \"share:10.0.0.5:C$:Administrator:CORP:8846f7eaee8fb117ad06bdd830b7586c\"\n\n" +
 			"Multiple shares:\n" +
-			"  sudo ./smb-pth-proxy \\\n" +
+			"  sudo ./smbproxy \\\n" +
 			"    -map \"corp_c:10.0.0.5:C$:Administrator:CORP:8846...86c\" \\\n" +
 			"    -map \"corp_d:10.0.0.5:D$:Administrator:CORP:8846...86c\" \\\n" +
 			"    -map \"dev:10.0.0.6:Builds:svc_build:CORP:dead...beef\"")
@@ -980,9 +981,9 @@ func main() {
 		up, err := openUpstream(m)
 		if err != nil {
 			log.Fatalf("[!] upstream connect \\\\%s as %s\\%s failed: %v\n"+
-				"    STATUS_LOGON_FAILURE  → wrong hash\n"+
-				"    STATUS_ACCESS_DENIED  → wrong hash or account restrictions\n"+
-				"    'signing required'    → target mandates SMB signing; PtH won't work",
+				"    STATUS_LOGON_FAILURE  → wrong credential\n"+
+				"    STATUS_ACCESS_DENIED  → wrong credential or account restrictions\n"+
+				"    'signing required'    → target mandates SMB signing; NTLM hash auth not supported",
 				m.remoteHost, m.domain, m.user, err)
 		}
 		upstreams[k] = up
