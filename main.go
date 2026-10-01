@@ -717,20 +717,10 @@ func (e *extSrvsvcService) InterfaceUUID() string              { return e.inner.
 func (e *extSrvsvcService) InterfaceVersion() (uint16, uint16) { return e.inner.InterfaceVersion() }
 
 func (e *extSrvsvcService) Dispatch(ctx context.Context, opnum uint16, in []byte) ([]byte, error) {
-	log.Printf("[srvsvc] dispatch opnum=%d inlen=%d", opnum, len(in))
-	var out []byte
-	var err error
 	if opnum == mssrvs.SrvSvcOpNetServerGetInfo {
-		out, err = e.handleNetServerGetInfo(in)
-	} else {
-		out, err = e.inner.Dispatch(ctx, opnum, in)
+		return e.handleNetServerGetInfo(in)
 	}
-	if err != nil {
-		log.Printf("[srvsvc] opnum=%d FAILED: %v", opnum, err)
-	} else {
-		log.Printf("[srvsvc] opnum=%d ok outlen=%d", opnum, len(out))
-	}
-	return out, err
+	return e.inner.Dispatch(ctx, opnum, in)
 }
 
 // handleNetServerGetInfo responds to NetrServerGetInfo (opnum 21).
@@ -741,10 +731,8 @@ func (e *extSrvsvcService) Dispatch(ctx context.Context, opnum uint16, in []byte
 func (e *extSrvsvcService) handleNetServerGetInfo(in []byte) ([]byte, error) {
 	var req mssrvs.NetServerGetInfoRequest
 	if err := req.Unmarshal(in); err != nil {
-		log.Printf("[srvsvc] NetServerGetInfo Unmarshal failed: %v (raw %d bytes: %x)", err, len(in), in)
 		return nil, fmt.Errorf("srvsvc NetServerGetInfo decode: %w", err)
 	}
-	log.Printf("[srvsvc] NetServerGetInfo level=%d", req.Level)
 
 	level := req.Level
 	if level != 100 && level != 101 {
@@ -777,6 +765,128 @@ func (e *extSrvsvcService) handleNetServerGetInfo(in []byte) ([]byte, error) {
 	}
 	return res.Marshal()
 }
+
+// ---------------------------------------------------------------------------
+// noopVFS — placeholder VFS for the IPC$ pipe share
+//
+// The server auto-creates IPC$ with VFS=nil. If any code path calls
+// tree.Share.VFS.SomeMethod() on the IPC$ tree (e.g. queryFileInfo when
+// Explorer sends QUERY_INFO on a pipe handle), a nil dereference panic
+// occurs. Registering IPC$ explicitly with noopVFS gives the server a
+// non-nil VFS that returns StatusNotSupported for every call, so the
+// server falls through to its Stat()-driven default instead of panicking.
+// ---------------------------------------------------------------------------
+
+type noopVFS struct{}
+
+func (v *noopVFS) Create(_ context.Context, _ *server.Session, _ server.CreateRequest) (server.CreateResult, uint32, error) {
+	return server.CreateResult{}, smb.StatusObjectNameNotFound, nil
+}
+func (v *noopVFS) Close(_ context.Context, _ server.Handle) error { return nil }
+func (v *noopVFS) Read(_ context.Context, _ server.Handle, _ int64, _ []byte) (int, uint32, error) {
+	return 0, smb.StatusAccessDenied, nil
+}
+func (v *noopVFS) Write(_ context.Context, _ server.Handle, _ int64, _ []byte) (int, uint32, error) {
+	return 0, smb.StatusAccessDenied, nil
+}
+func (v *noopVFS) Flush(_ context.Context, _ server.Handle) (uint32, error) { return 0, nil }
+func (v *noopVFS) QueryDirectory(_ context.Context, _ server.Handle, _ string, _ bool) ([]server.DirEntry, uint32, error) {
+	return nil, smb.StatusNoMoreFiles, nil
+}
+func (v *noopVFS) QueryFileInfo(_ context.Context, _ server.Handle, _ byte) (any, uint32, error) {
+	return nil, smb.StatusNotSupported, nil
+}
+func (v *noopVFS) SetFileInfo(_ context.Context, _ server.Handle, _ byte, _ []byte) (uint32, error) {
+	return smb.StatusAccessDenied, nil
+}
+func (v *noopVFS) QueryFSInfo(_ context.Context, _ byte) (any, uint32, error) {
+	return nil, smb.StatusNotSupported, nil
+}
+func (v *noopVFS) QuerySecurity(_ context.Context, _ server.Handle, _ uint32) ([]byte, uint32, error) {
+	return nil, smb.StatusNotSupported, nil
+}
+func (v *noopVFS) Ioctl(_ context.Context, _ server.Handle, _ uint32, _ []byte, _ uint32) ([]byte, uint32, error) {
+	return nil, smb.StatusNotSupported, nil
+}
+
+// ---------------------------------------------------------------------------
+// authStrippingPipe — PipeBackend wrapper that handles DCE/RPC auth
+//
+// When the downstream SMB session is authenticated (guest/guest via NTLM),
+// Windows always embeds an NTLM auth_verifier in the DCE/RPC BIND PDU.
+// The inner dcesrv.PipeHandler rejects any BIND with AuthLength > 0 because
+// it does not implement DCE/RPC-level authentication. This wrapper:
+//
+//  1. Strips the auth_verifier trailer from BIND, ALTER_CONTEXT, and
+//     REQUEST PDUs, zeroing AuthLength and trimming FragLength so the inner
+//     handler sees a clean, auth-free PDU.
+//
+//  2. Silently absorbs AUTH_3 PDUs (the client's NTLM AUTHENTICATE message).
+//     AUTH_3 is one-way — no server response is defined — so we return an
+//     empty body with StatusOk to complete the FSCTL_PIPE_TRANSCEIVE IOCTL.
+//
+// After these steps the inner handler accepts the bind, sends a BindAck
+// without auth, and Windows proceeds normally to call NetShareEnumAll.
+// ---------------------------------------------------------------------------
+
+// DCE/RPC common-header packet types (MS-RPCE §2.2.2.4)
+const (
+	rpcTypeBind         = 11 // PacketTypeBind
+	rpcTypeAlterContext = 14 // PacketTypeAlterContext
+	rpcTypeAuth3        = 16 // PacketTypeAuth3
+	rpcTypeRequest      = 0  // PacketTypeRequest
+)
+
+// stripRPCAuth removes the auth_verifier from a DCE/RPC PDU and updates
+// the common header fields (FragLength, AuthLength) to match.
+func stripRPCAuth(pdu []byte) []byte {
+	if len(pdu) < 16 {
+		return pdu
+	}
+	authLen := int(pdu[10]) | int(pdu[11])<<8 // bytes 10-11 LE
+	if authLen == 0 {
+		return pdu
+	}
+	fragLen := int(pdu[8]) | int(pdu[9])<<8 // bytes 8-9 LE
+	if fragLen > len(pdu) {
+		fragLen = len(pdu)
+	}
+	// The sec_trailer occupies 8 bytes before the auth_value blob.
+	// New PDU body ends at: fragLen - authLen - 8 (the sec_trailer size).
+	newLen := fragLen - authLen - 8
+	if newLen < 16 || newLen >= fragLen {
+		return pdu // malformed
+	}
+	out := make([]byte, newLen)
+	copy(out, pdu[:newLen])
+	out[8] = byte(newLen)      // FragLength low
+	out[9] = byte(newLen >> 8) // FragLength high
+	out[10] = 0                // AuthLength low  → 0
+	out[11] = 0                // AuthLength high → 0
+	return out
+}
+
+type authStrippingPipe struct{ inner server.PipeBackend }
+
+func (a *authStrippingPipe) Transceive(ctx context.Context, in []byte) ([]byte, uint32, error) {
+	if len(in) >= 16 {
+		switch in[2] { // PDU type byte
+		case rpcTypeBind, rpcTypeAlterContext, rpcTypeRequest:
+			in = stripRPCAuth(in)
+		case rpcTypeAuth3:
+			// One-way message; no response body required.
+			return []byte{}, smb.StatusOk, nil
+		}
+	}
+	return a.inner.Transceive(ctx, in)
+}
+func (a *authStrippingPipe) Write(ctx context.Context, b []byte) (int, uint32, error) {
+	return a.inner.Write(ctx, b)
+}
+func (a *authStrippingPipe) Read(ctx context.Context, max int) ([]byte, uint32, error) {
+	return a.inner.Read(ctx, max)
+}
+func (a *authStrippingPipe) Close(ctx context.Context) error { return a.inner.Close(ctx) }
 
 // ---------------------------------------------------------------------------
 // Upstream connection
@@ -902,6 +1012,16 @@ func main() {
 
 	srv := &server.Server{Config: cfg}
 
+	// ---- Register IPC$ with a no-op VFS ----
+	// Without this the server auto-provides IPC$ with VFS=nil, which causes
+	// a nil dereference panic in queryFileInfo when Explorer sends QUERY_INFO
+	// on a pipe handle (e.g. during the initial IPC$ tree setup).
+	srv.RegisterShare("IPC$", server.Share{
+		Name: "IPC$",
+		Type: smb.ShareTypePipe,
+		VFS:  &noopVFS{},
+	})
+
 	// ---- Register each proxied share ----
 	for _, m := range mappings {
 		up := upstreams[m.key()]
@@ -926,8 +1046,9 @@ func main() {
 	cfg.PipeOpener = &server.MapPipeOpener{
 		Pipes: map[string]func(*server.Session) (server.PipeBackend, error){
 			"srvsvc": func(_ *server.Session) (server.PipeBackend, error) {
-				log.Printf("[srvsvc] pipe opened by client")
-				return dcesrv.NewPipeHandler("srvsvc", extSvc), nil
+				return &authStrippingPipe{
+					inner: dcesrv.NewPipeHandler("srvsvc", extSvc),
+				}, nil
 			},
 		},
 	}
