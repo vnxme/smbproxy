@@ -30,6 +30,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -820,10 +821,70 @@ func (v *noopVFS) Ioctl(_ context.Context, _ server.Handle, _ uint32, _ []byte, 
 // DCE/RPC common-header packet types (MS-RPCE §2.2.2.4)
 const (
 	rpcTypeBind         = 11 // PacketTypeBind
+	rpcTypeBindAck      = 12 // PacketTypeBindAck
 	rpcTypeAlterContext = 14 // PacketTypeAlterContext
+	rpcTypeAlterCtxResp = 15 // PacketTypeAlterContextResp
 	rpcTypeAuth3        = 16 // PacketTypeAuth3
 	rpcTypeRequest      = 0  // PacketTypeRequest
 )
+
+// Transfer-syntax UUIDs as they appear on the wire (first three fields
+// little-endian), used to classify BindAck result entries. We only speak
+// 32-bit NDR; NDR64 and the Bind Time Feature Negotiation pseudo-syntax need
+// different result codes than the library emits.
+var (
+	uuidNDR  = []byte{0x04, 0x5d, 0x88, 0x8a, 0xeb, 0x1c, 0xc9, 0x11, 0x9f, 0xe8, 0x08, 0x00, 0x2b, 0x10, 0x48, 0x60}
+	uuidBTFN = []byte{0x2c, 0x1c, 0xb7, 0x6c, 0x12, 0x98, 0x40, 0x45, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+)
+
+// fixBindAck rewrites the result list in a BindAck / AlterContextResp. The
+// library's handler accepts every presentation context whose abstract syntax
+// matches the interface and echoes its transfer syntax back as Acceptance —
+// but Windows always offers three srvsvc contexts (32-bit NDR, NDR64, and Bind
+// Time Feature Negotiation), and "Acceptance" for the latter two is an RPC
+// protocol error that makes the client drop the pipe. We keep the NDR context
+// as Acceptance, reject NDR64 (we only decode NDR), and answer BTFN with
+// negotiate_ack as MS-RPCE requires. Mutates pdu in place (the inner handler's
+// freshly marshalled buffer) and returns it.
+func fixBindAck(pdu []byte) []byte {
+	if len(pdu) < 26 || (pdu[2] != rpcTypeBindAck && pdu[2] != rpcTypeAlterCtxResp) {
+		return pdu
+	}
+	// Header(16) + max_xmit(2) + max_recv(2) + assoc_group(4) = 24, then the
+	// variable-length secondary address, then 4-byte padding, then the list.
+	secLen := int(pdu[24]) | int(pdu[25])<<8
+	off := 26 + secLen
+	off = (off + 3) &^ 3 // align to 4 bytes
+	if off+4 > len(pdu) {
+		return pdu
+	}
+	n := int(pdu[off])
+	base := off + 4
+	for i := 0; i < n; i++ {
+		e := base + i*24 // each p_result_t: result(2) reason(2) transfer_syntax(20)
+		if e+24 > len(pdu) {
+			break
+		}
+		syn := pdu[e+4 : e+20]
+		switch {
+		case bytes.Equal(syn, uuidNDR):
+			// keep Acceptance (0,0) with the NDR transfer syntax
+		case bytes.Equal(syn, uuidBTFN):
+			pdu[e], pdu[e+1] = 3, 0 // negotiate_ack
+			pdu[e+2], pdu[e+3] = 0, 0
+			for j := e + 4; j < e+24; j++ {
+				pdu[j] = 0
+			}
+		default: // NDR64 or any syntax we don't implement
+			pdu[e], pdu[e+1] = 2, 0   // provider_rejection
+			pdu[e+2], pdu[e+3] = 2, 0 // reason: transfer syntaxes not supported
+			for j := e + 4; j < e+24; j++ {
+				pdu[j] = 0
+			}
+		}
+	}
+	return pdu
+}
 
 // stripRPCAuth removes the auth_verifier from a DCE/RPC PDU and updates
 // the common header fields (FragLength, AuthLength) to match.
@@ -874,18 +935,51 @@ type rpcPipe struct {
 	out []byte // response bytes awaiting the client's READ
 }
 
+// verbose gates rpcPipe PDU tracing; set from -debug in main.
+var verbose bool
+
+// pduInfo decodes the common-header fields used for tracing. opnum is -1 for
+// non-request PDUs. Assumes len(pdu) >= 16 (callers check).
+func pduInfo(pdu []byte) (ptype byte, fragLen, authLen, opnum int) {
+	ptype = pdu[2]
+	fragLen = int(pdu[8]) | int(pdu[9])<<8
+	authLen = int(pdu[10]) | int(pdu[11])<<8
+	opnum = -1
+	if ptype == rpcTypeRequest && len(pdu) >= 24 {
+		opnum = int(pdu[22]) | int(pdu[23])<<8 // request header: +alloc_hint(4)+ctx_id(2)
+	}
+	return
+}
+
 // process handles one complete inbound PDU and returns the inner handler's
 // response. AUTH_3 is one-way, so it yields no response body.
 func (p *rpcPipe) process(ctx context.Context, pdu []byte) ([]byte, uint32, error) {
 	if len(pdu) >= 16 {
-		switch pdu[2] { // PDU type byte
+		ptype, fragLen, authLen, opnum := pduInfo(pdu)
+		if verbose {
+			log.Printf("[rpc] in  type=%d frag=%d auth=%d opnum=%d (%d bytes)",
+				ptype, fragLen, authLen, opnum, len(pdu))
+		}
+		switch ptype {
 		case rpcTypeBind, rpcTypeAlterContext, rpcTypeRequest:
 			pdu = stripRPCAuth(pdu)
 		case rpcTypeAuth3:
+			if verbose {
+				log.Printf("[rpc] absorbing AUTH_3 (no response)")
+			}
 			return nil, smb.StatusOk, nil
 		}
 	}
-	return p.inner.Transceive(ctx, pdu)
+	out, status, err := p.inner.Transceive(ctx, pdu)
+	out = fixBindAck(out) // correct the result list for NDR64 / BTFN contexts
+	if verbose {
+		var rtype int = -1
+		if len(out) >= 3 {
+			rtype = int(out[2])
+		}
+		log.Printf("[rpc] out type=%d status=0x%08x err=%v (%d bytes)", rtype, status, err, len(out))
+	}
+	return out, status, err
 }
 
 func (p *rpcPipe) Transceive(ctx context.Context, in []byte) ([]byte, uint32, error) {
@@ -905,6 +999,9 @@ func (p *rpcPipe) Write(_ context.Context, b []byte) (int, uint32, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	n := len(b)
+	if verbose {
+		log.Printf("[rpc] Write %d bytes (buffered total %d)", n, len(p.in)+n)
+	}
 	p.in = append(p.in, b...)
 	for len(p.in) >= 16 {
 		fragLen := int(p.in[8]) | int(p.in[9])<<8
@@ -926,11 +1023,14 @@ func (p *rpcPipe) Write(_ context.Context, b []byte) (int, uint32, error) {
 // whenever a pipe Read returns a non-OK status (see smb/server/read.go), so a
 // message-mode partial read via StatusBufferOverflow is not possible here;
 // srvsvc enum responses are small enough to always fit a single client READ.
-func (p *rpcPipe) Read(_ context.Context, _ int) ([]byte, uint32, error) {
+func (p *rpcPipe) Read(_ context.Context, max int) ([]byte, uint32, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	out := p.out
 	p.out = nil
+	if verbose {
+		log.Printf("[rpc] Read max=%d -> %d bytes", max, len(out))
+	}
 	return out, smb.StatusOk, nil
 }
 
@@ -971,6 +1071,15 @@ func openUpstream(m mapping) (*upstream, error) {
 	return &upstream{conn: conn}, nil
 }
 
+// dialectByName maps the -max-dialect flag value to the go-smb constant.
+var dialectByName = map[string]uint16{
+	"2.0.2": smb.DialectSmb_2_0_2,
+	"2.1":   smb.DialectSmb_2_1,
+	"3.0":   smb.DialectSmb_3_0,
+	"3.0.2": smb.DialectSmb_3_0_2,
+	"3.1.1": smb.DialectSmb_3_1_1,
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -986,8 +1095,15 @@ func main() {
 	listen := flag.String("l", "0.0.0.0:445", "local listen addr:port (port 445 needs root/CAP_NET_BIND_SERVICE)")
 	localUser := flag.String("local-user", "guest", "username clients authenticate with")
 	localPass := flag.String("local-pass", "guest", "password clients authenticate with")
+	allowGuest := flag.Bool("allow-guest", false, "accept any failed/unknown logon as a guest session (lets Explorer browse \\\\host, which first tries the username \"guest\")")
+	maxDialect := flag.String("max-dialect", "3.1.1", "highest SMB dialect to offer clients: 2.0.2, 2.1, 3.0, 3.0.2 or 3.1.1 (min stays 2.1; 3.x uses AES-CMAC signing that Windows prefers over 2.1's HMAC-SHA256)")
 	debugLog := flag.Bool("debug", false, "enable verbose go-smb debug logging (dialect, signing, session setup, DCE/RPC)")
 	flag.Parse()
+
+	maxDialectID, ok := dialectByName[*maxDialect]
+	if !ok {
+		log.Fatalf("[!] invalid -max-dialect %q: use one of 2.0.2, 2.1, 3.0, 3.0.2, 3.1.1", *maxDialect)
+	}
 
 	// Verbose go-smb logging. Every go-smb package registers its own named
 	// logger at init via golog.Get(...); SetAll raises the level on all of
@@ -995,6 +1111,7 @@ func main() {
 	// trace. Without -debug the library stays at its default (Notice).
 	if *debugLog {
 		golog.SetAll(golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, os.Stdout, os.Stderr)
+		verbose = true // enable rpcPipe PDU tracing
 	}
 
 	if len(maps) == 0 {
@@ -1061,9 +1178,10 @@ func main() {
 	cfg := &server.ServerConfig{
 		NetBIOSName:    "SMBPROXY",
 		MinDialect:     smb.DialectSmb_2_1,
-		MaxDialect:     smb.DialectSmb_2_1,
+		MaxDialect:     maxDialectID,
 		Authenticator:  auth,
 		AllowAnonymous: true,
+		AllowGuest:     *allowGuest,
 		MaxReadSize:    readAheadSize,
 	}
 
@@ -1112,6 +1230,7 @@ func main() {
 
 	log.Printf("[*] listening on %s", *listen)
 	log.Printf("[*] local credentials: user=%s  pass=%s", *localUser, *localPass)
+	log.Printf("[*] dialect range: 2.1 .. %s  allow-guest=%t", *maxDialect, *allowGuest)
 	log.Printf("[*] browse \\\\<this-host>  or connect directly to \\\\<this-host>\\<share>")
 
 	// ---- Graceful shutdown ----
