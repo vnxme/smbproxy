@@ -64,6 +64,7 @@
 //   helpers.go   — FILETIME/attr/path conversions shared by the VFS
 //   proxyvfs.go  — proxyHandle and proxyVFS (reads, prefetch, dir listing)
 //   noopvfs.go   — the no-op VFS registered for IPC$
+//   tracevfs.go  — the -debug wrapper logging every VFS call and its result
 //   rpcpipe.go   — the srvsvc DCE/RPC pipe wrapper and BindAck fixup
 //   main.go      — flag wiring and server startup (this file)
 
@@ -161,7 +162,8 @@ func main() {
 		"close an upstream connection after this period with no open handles and no\n"+
 			"\tactivity; it is re-established on demand when a client next uses the share.\n"+
 			"\t0 keeps each connection (still dialed on demand) until shutdown")
-	debugLog := flag.Bool("debug", false, "enable verbose go-smb debug logging (dialect, signing, session setup, DCE/RPC)")
+	debugLog := flag.Bool("debug", false, "enable verbose go-smb debug logging (dialect, signing, session setup, DCE/RPC)\n"+
+		"\tand log every file-system call the proxy answers, with its result")
 	flag.Parse()
 
 	maxDialectID, ok := dialectByName[*maxDialect]
@@ -279,7 +281,10 @@ func main() {
 	// ---- Register each proxied share ----
 	for _, m := range mappings {
 		up := upstreams[m.key()]
-		vfs := &proxyVFS{up: up, share: m.remoteShare, base: m.remoteSub}
+		var vfs server.VFS = &proxyVFS{up: up, share: m.remoteShare, base: m.remoteSub}
+		if *debugLog {
+			vfs = &tracingVFS{share: m.localShare, inner: vfs}
+		}
 		srv.RegisterShare(m.localShare, server.Share{
 			Name:          m.localShare,
 			Type:          smb.ShareTypeDisk,
