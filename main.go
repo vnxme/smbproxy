@@ -163,7 +163,11 @@ func main() {
 			log.Fatalf("[!] upstream connect \\\\%s as %s\\%s failed: %v\n"+
 				"    STATUS_LOGON_FAILURE  → wrong credential\n"+
 				"    STATUS_ACCESS_DENIED  → wrong credential or account restrictions\n"+
-				"    'signing required'    → target mandates SMB signing; NTLM hash auth not supported",
+				"    'signing required'    → target mandates SMB signing. smbproxy signs with the\n"+
+				"                            supplied credential (an NT hash works as well as a\n"+
+				"                            password), so this usually means the credential was\n"+
+				"                            rejected and the session fell back to guest/anonymous,\n"+
+				"                            which cannot sign — re-check user/domain/credential.",
 				m.remoteHost, m.domain, m.user, err)
 		}
 		upstreams[k] = up
