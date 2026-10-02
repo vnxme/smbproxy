@@ -14,9 +14,10 @@ import (
 // ---------------------------------------------------------------------------
 // upstream — shared connection + mutex
 //
-// Multiple proxyVFS instances that point to the same (host, user, hash) share
-// one *upstream so that all their upstream calls are serialized by a single
-// mutex rather than each VFS thinking it has exclusive access to the conn.
+// Multiple proxyVFS instances that point to the same (host, user, domain,
+// credential) target share one *upstream, so that all their upstream calls are
+// serialized by a single mutex rather than each VFS thinking it has exclusive
+// access to the conn.
 // ---------------------------------------------------------------------------
 
 type upstream struct {

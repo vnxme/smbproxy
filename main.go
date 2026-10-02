@@ -1,12 +1,26 @@
-// smbproxy: local SMB server that authenticates upstream using NTLM
-// credentials (an NTLM hash or a password), exposing remote Windows shares to
-// local SMB clients.
+// smbproxy: a local SMB server that gathers remote Windows shares — each
+// reached with its own upstream credentials — under one host that local
+// clients browse with a single local login.
+//
+// What it is for:
+//   - Aggregation: present many shares, possibly spread across several servers
+//     and reached under different accounts, behind one \\host that clients see
+//     as ordinary shares — a single umbrella over scattered storage.
+//   - Indirect access: reach a share when a direct client→server connection is
+//     unwanted or not technically possible. The proxy terminates the client
+//     connection and makes its own to the target, so routing, firewalling, and
+//     dialect/signing differences are handled once, at the proxy.
+//   - Credential confinement: avoid handing the upstream server's credentials
+//     to every client. Clients authenticate to the proxy with a separate local
+//     login; the real upstream credentials stay in the proxy's configuration.
 //
 // Architecture:
-//   Windows Explorer → [local SMB server (this tool)] → [target(s), NTLM auth]
+//   SMB client → [local SMB server (this tool), upstream auth] → target(s)
 //
-// Multiple upstream shares can be proxied simultaneously. Mappings that share
-// the same (host, user, domain, credential) tuple reuse a single upstream SMB
+// Clients connect using the proxy's own -local-user / -local-pass. Each mapping
+// carries the credentials used to reach its own target, so one proxy can front
+// shares that require different accounts. Mappings that share the same
+// (host, user, domain, credential) tuple reuse a single upstream SMB
 // connection; different credentials get separate connections.
 //
 // Build:
@@ -14,24 +28,25 @@
 //
 // Usage (single share):
 //   sudo ./smbproxy \
-//     -map "share:10.0.0.5:C$:Administrator:CORP:8846f7eaee8fb117ad06bdd830b7586c"
+//     -map "share:10.0.0.5:C$:Administrator:CORP:S3cretP@ss"
 //
-// Usage (multiple shares, possibly across multiple hosts):
+// Usage (several shares behind one umbrella, across hosts and accounts):
 //   sudo ./smbproxy \
-//     -map "corp_c:10.0.0.5:C$:Administrator:CORP:8846...86c" \
-//     -map "corp_d:10.0.0.5:D$:Administrator:CORP:8846...86c" \
-//     -map "dev:10.0.0.6:Builds:svc_build:CORP:aad3...04ee:dead...beef"
+//     -map "corp_c:10.0.0.5:C$:Administrator:CORP:S3cretP@ss" \
+//     -map "corp_d:10.0.0.5:D$:Administrator:CORP:S3cretP@ss" \
+//     -map "dev:10.0.0.6:Builds:svc_build:CORP:BuildB0t!"
 //
 // Usage (mappings from a file, one -map-formatted line per entry; blank lines
-// and #-comments are ignored). This keeps credentials out of the process
-// argument list and can be combined with -map:
+// and #-comments are ignored). A file keeps the upstream credentials out of
+// the process argument list, and can be combined with -map:
 //   sudo ./smbproxy -mapfile /etc/smbproxy.maps
 //
-// The credential field accepts a 32-char NTLM hash, a "lmhash:nthash" pair
-// (only the NT half is used), a plaintext password, or "pass:<password>" to
-// force password mode (needed only when the password is itself 32 hex chars).
-// A password is converted to its NT hash internally, so it is equivalent to
-// passing that hash.
+// The credential field is the secret used to reach that target. It accepts a
+// plaintext password (the usual case), "pass:<password>" to force password
+// mode when the password is itself 32 hex characters, a 32-character NTLM hash,
+// or an "lmhash:nthash" pair (only the NT half is used). A password is
+// converted to its NT hash internally, so every form behaves identically from
+// the target's point of view.
 //
 // Connect from Explorer:  \\<this-host>\<local-share-name>
 // Map a drive:            net use Z: \\<this-host>\corp_c /user:guest guest
@@ -89,10 +104,10 @@ func main() {
 	var maps multiFlag
 	flag.Var(&maps, "map",
 		"share mapping: local_share:host:remote_share:user:domain:credential\n"+
-			"\t  credential = 32 hex chars (NTLM hash), lmhash:nthash pair,\n"+
-			"\t               a password, or pass:<password> to force password mode\n"+
-			"\t               (use pass: for a password that is itself 32 hex chars)\n"+
-			"\t  repeat -map for multiple shares / multiple targets\n"+
+			"\t  credential = a password, pass:<password> to force password mode\n"+
+			"\t               (use pass: for a password that is itself 32 hex chars),\n"+
+			"\t               a 32-hex-char NTLM hash, or an lmhash:nthash pair\n"+
+			"\t  repeat -map to place several shares, hosts or accounts behind one host\n"+
 			"\t  mappings with identical (host,user,domain,credential) share one upstream connection")
 
 	var mapFiles multiFlag

@@ -46,18 +46,17 @@ func isNTHash(s string) bool {
 // parseMapping parses one -map value: local:host:share:user:domain:credential
 // SplitN with n=6 keeps any colon inside the credential field intact.
 //
-// The credential field is interpreted as follows:
+// The credential is the secret used to reach that target, interpreted as:
 //   - "pass:<password>"   → explicit password (everything after the first
 //     colon, so a password may contain ':' or even be 32 hex chars without
 //     being mistaken for a hash)
-//   - 32 hex chars        → NT hash (pass-the-hash)
-//   - "<lmhash>:<nthash>" → LM:NT pair; only the NT half is used
-//   - anything else       → password
+//   - 32 hex chars        → an NTLM hash, used directly
+//   - "<lmhash>:<nthash>" → an LM:NT pair; only the NT half is used
+//   - anything else       → a password
 //
 // Passwords are converted to their NT hash via NTOWFv1 up front, so the rest
-// of the proxy (dedup keying, openUpstream) only ever deals with a 32-char
-// hash; from the target's perspective password and pass-the-hash auth are
-// equivalent for NTLM.
+// of the proxy (dedup keying, openUpstream) only ever handles a 32-char NT
+// hash; every credential form is equivalent from the target's point of view.
 func parseMapping(s string) (mapping, error) {
 	parts := strings.SplitN(s, ":", 6)
 	if len(parts) != 6 {
