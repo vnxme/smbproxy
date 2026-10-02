@@ -18,14 +18,10 @@ import (
 // the library returns when the socket is gone.
 var connDown = fmt.Errorf("remote connection has closed")
 
-// A malformed ntHex must fail in dialConn before any network use. (parseMapping
-// always normalizes ntHex, so this guards direct callers only.) The dial itself
-// needs a live SMB server and is not unit-tested.
-func TestDialConnBadHash(t *testing.T) {
-	conn, err := dialConn(mapping{remoteHost: "192.0.2.1", ntHex: "not-hex"}, time.Second)
-	if err == nil || conn != nil {
-		t.Errorf("dialConn = (%v, %v), want (nil, hex decode error)", conn, err)
-	}
+// testTarget returns a target for upstreams under test, which dial a fake
+// rather than the target itself.
+func testTarget() *target {
+	return &target{name: "h", host: "h", port: 445, user: "u", domain: "D"}
 }
 
 // newUpstream must not dial until the first operation, and must reuse the
@@ -33,7 +29,7 @@ func TestDialConnBadHash(t *testing.T) {
 func TestUpstreamLazyConnect(t *testing.T) {
 	conn := &fakeConn{}
 	dialed := 0
-	u := &upstream{m: mapping{remoteHost: "h"}, dial: func(mapping) (upstreamConn, error) {
+	u := &upstream{t: testTarget(), dial: func() (upstreamConn, error) {
 		dialed++
 		return conn, nil
 	}}
@@ -56,7 +52,7 @@ func TestUpstreamLazyConnect(t *testing.T) {
 }
 
 func TestNewUpstreamIsLazy(t *testing.T) {
-	u := newUpstream(mapping{remoteHost: "h"}, upstreamTimeouts{idle: 90 * time.Second, io: 30 * time.Second})
+	u := newUpstream(testTarget(), upstreamTimeouts{idle: 90 * time.Second, io: 30 * time.Second})
 	if u.conn != nil {
 		t.Errorf("newUpstream dialed eagerly (conn=%v)", u.conn)
 	}
@@ -116,7 +112,7 @@ func TestUpstreamConnectErrorStatus(t *testing.T) {
 		{"bad credentials", &smb.NTStatusError{Op: "SessionSetup", Status: smb.StatusLogonFailure,
 			Err: smb.StatusMap[smb.StatusLogonFailure]}, smb.StatusAccessDenied},
 	} {
-		u := &upstream{m: mapping{remoteHost: "h"}, dial: func(mapping) (upstreamConn, error) { return nil, c.dialErr }}
+		u := &upstream{t: testTarget(), dial: func() (upstreamConn, error) { return nil, c.dialErr }}
 		err := u.do(func(upstreamConn) error { return nil })
 		if _, ok := errors.AsType[*connectError](err); !ok {
 			t.Errorf("%s: do error %v is not a *connectError", c.name, err)
@@ -132,7 +128,7 @@ func TestUpstreamConnectErrorStatus(t *testing.T) {
 func TestUpstreamRedialsOnSessionLost(t *testing.T) {
 	expired := &smb.NTStatusError{Op: "Create", Status: statusNetworkSessionExpired} // unmapped in go-smb
 	dialed, calls := 0, 0
-	u := &upstream{m: mapping{remoteHost: "h"}, dial: func(mapping) (upstreamConn, error) {
+	u := &upstream{t: testTarget(), dial: func() (upstreamConn, error) {
 		dialed++
 		return &fakeConn{}, nil
 	}}
@@ -150,7 +146,7 @@ func TestUpstreamRedialsOnSessionLost(t *testing.T) {
 
 func TestUpstreamClose(t *testing.T) {
 	c := &fakeConn{}
-	u := &upstream{conn: c}
+	u := &upstream{t: testTarget(), conn: c}
 	u.close()
 	c.mu.Lock()
 	closed := c.closed
@@ -163,7 +159,7 @@ func TestUpstreamClose(t *testing.T) {
 
 func TestUpstreamConnectError(t *testing.T) {
 	wantErr := errors.New("nope")
-	u := &upstream{m: mapping{remoteHost: "h"}, dial: func(mapping) (upstreamConn, error) {
+	u := &upstream{t: testTarget(), dial: func() (upstreamConn, error) {
 		return nil, wantErr
 	}}
 
@@ -184,7 +180,7 @@ func TestReapIfIdle(t *testing.T) {
 	newU := func() (*upstream, *fakeConn) {
 		c := &fakeConn{}
 		return &upstream{
-			m:       mapping{remoteHost: "h"},
+			t:       testTarget(),
 			conn:    c,
 			idle:    time.Minute,
 			lastUse: now.Add(-2 * time.Minute), // idle long enough to reap
@@ -235,7 +231,7 @@ func TestReapIfIdle(t *testing.T) {
 // The full lifecycle: connect on demand, reap when idle, reconnect on next use.
 func TestUpstreamReconnectAfterReap(t *testing.T) {
 	dialed := 0
-	u := &upstream{m: mapping{remoteHost: "h"}, idle: time.Minute, dial: func(mapping) (upstreamConn, error) {
+	u := &upstream{t: testTarget(), idle: time.Minute, dial: func() (upstreamConn, error) {
 		dialed++
 		return &fakeConn{}, nil
 	}}
@@ -307,7 +303,7 @@ func TestIsNetworkError(t *testing.T) {
 
 func TestConnectFailureHint(t *testing.T) {
 	netHint := connectFailureHint(&net.OpError{Op: "dial", Err: errors.New("refused")})
-	if !strings.Contains(netHint, "port 445") {
+	if !strings.Contains(netHint, "host and port") {
 		t.Errorf("network hint missing reachability guidance: %q", netHint)
 	}
 	if strings.Contains(netHint, "STATUS_LOGON_FAILURE") {
@@ -325,8 +321,9 @@ func TestConnectFailureHint(t *testing.T) {
 
 func TestUpstreamDoSuccessNoRedial(t *testing.T) {
 	u := &upstream{
+		t:    testTarget(),
 		conn: &fakeConn{},
-		dial: func(mapping) (upstreamConn, error) {
+		dial: func() (upstreamConn, error) {
 			t.Fatal("dial must not be called on success")
 			return nil, nil
 		},
@@ -338,8 +335,9 @@ func TestUpstreamDoSuccessNoRedial(t *testing.T) {
 
 func TestUpstreamDoNoRedialOnStatusError(t *testing.T) {
 	u := &upstream{
+		t:    testTarget(),
 		conn: &fakeConn{treeErr: smb.StatusMap[smb.StatusAccessDenied]},
-		dial: func(mapping) (upstreamConn, error) {
+		dial: func() (upstreamConn, error) {
 			t.Fatal("dial must not be called for a protocol NTSTATUS")
 			return nil, nil
 		},
@@ -355,9 +353,9 @@ func TestUpstreamDoRedialsAndRetries(t *testing.T) {
 	conn2 := &fakeConn{}                  // healthy replacement
 	dialed := 0
 	u := &upstream{
-		m:    mapping{remoteHost: "h"},
+		t:    testTarget(),
 		conn: conn1,
-		dial: func(mapping) (upstreamConn, error) { dialed++; return conn2, nil },
+		dial: func() (upstreamConn, error) { dialed++; return conn2, nil },
 	}
 
 	if err := u.do(func(c upstreamConn) error { return c.TreeConnect("x") }); err != nil {
@@ -380,8 +378,9 @@ func TestUpstreamDoRedialsAndRetries(t *testing.T) {
 func TestUpstreamDoRedialFailureReturnsOriginalError(t *testing.T) {
 	conn1 := &fakeConn{treeErr: connDown}
 	u := &upstream{
+		t:    testTarget(),
 		conn: conn1,
-		dial: func(mapping) (upstreamConn, error) { return nil, errors.New("dial failed") },
+		dial: func() (upstreamConn, error) { return nil, errors.New("dial failed") },
 	}
 
 	err := u.do(func(c upstreamConn) error { return c.TreeConnect("x") })

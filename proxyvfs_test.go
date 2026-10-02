@@ -169,7 +169,7 @@ func (c *fakeConn) isClosed() bool {
 }
 
 func newVFS(c *fakeConn) *proxyVFS {
-	return &proxyVFS{up: &upstream{conn: c}, share: "C$"}
+	return &proxyVFS{up: &upstream{t: testTarget(), conn: c}, share: "C$"}
 }
 
 // fileHandle returns an open-file handle on ff whose size, as captured at open
@@ -316,7 +316,7 @@ func TestProxyCreateReconnects(t *testing.T) {
 	conn2 := &fakeConn{openFn: func(_, _ string, _ *smb.CreateReqOpts) (upstreamFile, error) {
 		return ff, nil
 	}}
-	u := &upstream{m: mapping{remoteHost: "h"}, conn: conn1, dial: func(mapping) (upstreamConn, error) {
+	u := &upstream{t: testTarget(), conn: conn1, dial: func() (upstreamConn, error) {
 		return conn2, nil
 	}}
 	v := &proxyVFS{up: u, share: "C$"}
@@ -337,8 +337,8 @@ func TestProxyHandlePinsConnectionAgainstReap(t *testing.T) {
 	conn := &fakeConn{openFn: func(_, _ string, _ *smb.CreateReqOpts) (upstreamFile, error) {
 		return ff, nil
 	}}
-	u := &upstream{m: mapping{remoteHost: "h"}, conn: conn, idle: time.Minute,
-		dial: func(mapping) (upstreamConn, error) { return conn, nil }}
+	u := &upstream{t: testTarget(), conn: conn, idle: time.Minute,
+		dial: func() (upstreamConn, error) { return conn, nil }}
 	v := &proxyVFS{up: u, share: "C$"}
 	ctx := context.Background()
 
@@ -369,7 +369,7 @@ func TestProxyHandlePinsConnectionAgainstReap(t *testing.T) {
 func TestProxyQueryDirectoryRootReconnects(t *testing.T) {
 	conn1 := &fakeConn{treeErr: connDown}
 	conn2 := &fakeConn{listResult: []smb.SharedFile{{Name: "f"}}}
-	u := &upstream{m: mapping{remoteHost: "h"}, conn: conn1, dial: func(mapping) (upstreamConn, error) {
+	u := &upstream{t: testTarget(), conn: conn1, dial: func() (upstreamConn, error) {
 		return conn2, nil
 	}}
 	v := &proxyVFS{up: u, share: "C$"}
@@ -393,7 +393,7 @@ func TestProxyCreateWithBase(t *testing.T) {
 	c := &fakeConn{openFn: func(_, _ string, _ *smb.CreateReqOpts) (upstreamFile, error) {
 		return ff, nil
 	}}
-	v := &proxyVFS{up: &upstream{conn: c}, share: "C$", base: "Users\\Public"}
+	v := &proxyVFS{up: &upstream{t: testTarget(), conn: c}, share: "C$", base: "Users\\Public"}
 	ctx := context.Background()
 
 	if _, status, err := v.Create(ctx, nil, server.CreateRequest{Path: "\\sub\\a.txt"}); err != nil || status != 0 {
@@ -420,7 +420,7 @@ func TestProxyCreateNormalizesClientSlashes(t *testing.T) {
 	c := &fakeConn{openFn: func(_, _ string, _ *smb.CreateReqOpts) (upstreamFile, error) {
 		return ff, nil
 	}}
-	v := &proxyVFS{up: &upstream{conn: c}, share: "data", base: "Users\\Public"}
+	v := &proxyVFS{up: &upstream{t: testTarget(), conn: c}, share: "data", base: "Users\\Public"}
 
 	if _, status, err := v.Create(context.Background(), nil, server.CreateRequest{Path: "/sub/a.txt"}); err != nil || status != 0 {
 		t.Fatalf("Create with slash path = (0x%08x, %v), want success", status, err)
@@ -432,7 +432,7 @@ func TestProxyCreateNormalizesClientSlashes(t *testing.T) {
 
 func TestProxyQueryDirectoryRootWithBase(t *testing.T) {
 	c := &fakeConn{listResult: []smb.SharedFile{{Name: "f"}}}
-	v := &proxyVFS{up: &upstream{conn: c}, share: "C$", base: "Users\\Public"}
+	v := &proxyVFS{up: &upstream{t: testTarget(), conn: c}, share: "C$", base: "Users\\Public"}
 	ph := &proxyHandle{isRoot: true, isDir: true}
 
 	if _, status, err := v.QueryDirectory(context.Background(), ph, "*", false); err != nil || status != 0 {
@@ -448,7 +448,7 @@ func TestProxyCreateRejectsTraversal(t *testing.T) {
 		t.Fatal("upstream opened despite a traversal path")
 		return nil, nil
 	}}
-	v := &proxyVFS{up: &upstream{conn: c}, share: "C$", base: "Users\\Public"}
+	v := &proxyVFS{up: &upstream{t: testTarget(), conn: c}, share: "C$", base: "Users\\Public"}
 
 	_, status, err := v.Create(context.Background(), nil, server.CreateRequest{Path: "\\..\\..\\Windows"})
 	if err != nil || status != smb.StatusAccessDenied {
@@ -1045,7 +1045,7 @@ func TestProxyQueryFSInfo(t *testing.T) {
 	if !bytes.Equal(vol[8:12], v.objectID("")[16:20]) || bytes.Equal(vol[8:12], make([]byte, 4)) {
 		t.Errorf("VolumeSerialNumber = %x, want the nonzero per-share volume ID prefix", vol[8:12])
 	}
-	other := &proxyVFS{up: &upstream{conn: &fakeConn{}}, share: "D$"}
+	other := &proxyVFS{up: &upstream{t: testTarget(), conn: &fakeConn{}}, share: "D$"}
 	if otherVol, _, _ := other.QueryFSInfo(context.Background(), fsVolumeInformation); bytes.Equal(otherVol.([]byte)[8:12], vol[8:12]) {
 		t.Errorf("shares C$ and D$ report the same volume serial %x", vol[8:12])
 	}

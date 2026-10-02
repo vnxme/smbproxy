@@ -1,0 +1,83 @@
+# smbproxy configuration — the tool's only source of settings.
+#
+# Run with:  smbproxy -config /path/to/smbproxy.yaml   (default: ./smbproxy.yaml)
+#
+# Unknown keys are errors, so a misspelled setting fails at startup instead
+# of being silently ignored. Values shown for optional settings are the
+# defaults.
+#
+# Credentials (under local and under each target) take exactly one of:
+#   password:      the password itself
+#   password_file: a file whose first line is the password; a relative path
+#                  is relative to this file. Keeps secrets out of this file.
+#   password_hash: the NT hash, 32 hex characters (or an lmhash:nthash pair,
+#                  of which only the NT half is used)
+# If this file holds a password or password_hash, keep it readable only by
+# the account running smbproxy (e.g. chmod 600).
+
+listen: 0.0.0.0:445          # address:port clients connect to (445 needs root
+                             # or CAP_NET_BIND_SERVICE)
+min_dialect: "2.1"           # SMB dialects offered to clients: 2.0.2, 2.1,
+max_dialect: "3.1.1"         # 3.0, 3.0.2 or 3.1.1
+debug: false                 # log every SMB exchange and file-system call
+
+# The login clients use to connect to the proxy.
+local:
+  user: alice
+  domain: ""                 # if set, clients must log in as DOMAIN\user
+  password_file: local.pass
+  allow_guest: false         # accept any failed or unknown login as a guest
+                             # session (lets Explorer browse \\host, which
+                             # tries "guest" first)
+  allow_anonymous: false     # accept null sessions
+  # Both allow_* settings give every share (read-only) to clients that never
+  # present the login above. user and a credential may be left out only if
+  # one of them is true.
+
+# Upper bounds on waiting for targets (Go durations; 0 disables a limit).
+timeouts:
+  idle: 5m                   # close an unused upstream connection after this
+                             # long; it reconnects on the next use
+  connect: 15s               # connecting and logging in to a target
+  io: 1m                     # one read or directory request on an open file
+                             # (opening files and listing a share's root
+                             # cannot be bounded: go-smb offers no way to)
+
+# The servers the proxy connects to, each with the account it uses there.
+# Each target gets one connection, shared by all its shares.
+targets:
+  corp-admin:
+    host: 10.0.0.5
+    port: 445                # optional
+    user: Administrator
+    domain: CORP
+    password_file: corp-admin.pass
+  build:
+    host: fs01.corp.example
+    user: svc_build
+    domain: CORP
+    password_hash: 8846f7eaee8fb117ad06bdd830b7586c
+  lab:
+    host: "fd00::5"          # IPv6 without brackets: the port is separate
+    port: 4450
+    user: alice
+    domain: WORKGROUP
+    password: S3cretP@ss
+
+# What clients see under \\<this-host>, listed in this order.
+shares:
+  - name: corp_c             # share name clients use (case-insensitive)
+    target: corp-admin
+    path: C$                 # the target's share, optionally with an inner
+                             # folder (either slash works)
+    comment: Corp server, drive C   # shown in Explorer's share list
+    read_only: true          # the only supported value for now
+  - name: pub
+    target: corp-admin
+    path: C$/Users/Public
+  - name: builds
+    target: build
+    path: Builds
+  - name: lab
+    target: lab
+    path: data/projects/2024

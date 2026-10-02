@@ -17,58 +17,39 @@
 // Architecture:
 //   SMB client → [local SMB server (this tool), upstream auth] → target(s)
 //
-// Clients connect using the proxy's own -local-user / -local-pass (or
-// -local-pass-file, which keeps the password off the command line). Each mapping
-// carries the credentials used to reach its own target, so one proxy can front
-// shares that require different accounts. Mappings that share the same
-// (host, user, domain, credential) tuple reuse a single upstream SMB
-// connection; different credentials get separate connections.
+// Configuration:
+//   Everything is set in one YAML file (see smbproxy.example.yaml), read from
+//   ./smbproxy.yaml or the path given with -config:
+//     - local: the login clients use to connect to the proxy;
+//     - targets: the servers the proxy connects to, each with the account and
+//       credential it uses there; each target gets one upstream connection,
+//       shared by all its shares;
+//     - shares: what clients see under \\<this-host>, each a share (or a
+//       folder within one) on a target.
+//   A credential is a password, a password_file holding one, or a
+//   password_hash (NT hash); a password is converted to its NT hash
+//   internally, so every form behaves identically from the other side's
+//   point of view.
 //
 // Build:
 //   go mod tidy && go build -o smbproxy .
 //
-// Usage (single share):
-//   sudo ./smbproxy \
-//     -map "share:10.0.0.5:C$:Administrator:CORP:S3cretP@ss"
+// Run:
+//   sudo ./smbproxy -config /etc/smbproxy/smbproxy.yaml
 //
-// Usage (several shares behind one umbrella, across hosts and accounts):
-//   sudo ./smbproxy \
-//     -map "corp_c:10.0.0.5:C$:Administrator:CORP:S3cretP@ss" \
-//     -map "corp_d:10.0.0.5:D$:Administrator:CORP:S3cretP@ss" \
-//     -map "dev:10.0.0.6:Builds:svc_build:CORP:BuildB0t!"
-//
-// Usage (mappings from a file, one -map-formatted line per entry; blank lines
-// and #-comments are ignored). A file keeps the upstream credentials out of
-// the process argument list, and can be combined with -map:
-//   sudo ./smbproxy -mapfile /etc/smbproxy.maps
-//
-// Usage (map a local share to a subfolder of the target share, not its root;
-// forward or backslashes both work, which is handy on non-Windows hosts and
-// for Samba targets):
-//   sudo ./smbproxy \
-//     -map "pub:10.0.0.5:C$/Users/Public:Administrator:CORP:S3cretP@ss" \
-//     -map "proj:10.0.0.7:data/projects/2024:alice:WORKGROUP:S3cretP@ss"
-//
-// The credential field is the secret used to reach that target. It accepts a
-// plaintext password (the usual case), "pass:<password>" to force password
-// mode when the password is itself 32 hex characters, a 32-character NTLM hash,
-// or a "lmhash:nthash" pair (only the NT half is used). A password is
-// converted to its NT hash internally, so every form behaves identically from
-// the target's point of view.
-//
-// Connect from Explorer:  \\<this-host>\<local-share-name>
-// Map a drive:            net use Z: \\<this-host>\corp_c /user:guest guest
+// Connect from Explorer:  \\<this-host>\<share-name>
+// Map a drive:            net use Z: \\<this-host>\corp_c /user:<local-user> <password>
 //
 // The implementation is split across several files in this package:
-//   mapping.go   — -map flag parsing, the mapping type, and connKey dedup keys
-//   upstream.go  — the shared upstream connection and openUpstream dialing
-//   helpers.go   — FILETIME/attr/path conversions shared by the VFS
+//   config.go    — the configuration file: layout, validation, targets and shares
+//   upstream.go  — the shared upstream connection, dialing and timeouts
+//   helpers.go   — FILETIME/attr/path conversions and NTSTATUS mapping
 //   proxyvfs.go  — proxyHandle and proxyVFS (reads, prefetch, dir listing)
 //   noopvfs.go   — the no-op VFS registered for IPC$
-//   tracevfs.go  — the -debug wrapper logging every VFS call and its result
+//   tracevfs.go  — the debug wrapper logging every VFS call and its result
 //   rpcpipe.go   — the srvsvc DCE/RPC pipe wrapper and BindAck fixup
 //   srvsvc.go    — the srvsvc service: the library's plus NetrShareGetInfo
-//   main.go      — flag wiring and server startup (this file)
+//   main.go      — server startup (this file)
 
 package main
 
@@ -76,6 +57,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -85,7 +67,6 @@ import (
 
 	srvsvc "github.com/jfjallid/go-smb/dcerpc/mssrvs/server"
 	dcesrv "github.com/jfjallid/go-smb/dcerpc/server"
-	"github.com/jfjallid/go-smb/ntlmssp"
 	"github.com/jfjallid/go-smb/smb"
 	"github.com/jfjallid/go-smb/smb/server"
 	"github.com/jfjallid/golog"
@@ -104,8 +85,8 @@ const readOnlyAccess = 0x001200a9
 func connectFailureHint(err error) string {
 	if isNetworkError(err) {
 		return "    unreachable at the TCP level (connection refused / timeout / no route / DNS).\n" +
-			"    Is SMB running and port 445 open on the target and through any firewall?\n" +
-			"    Check the host and port in the mapping."
+			"    Is SMB running on the target, and its port open through any firewall?\n" +
+			"    Check the target's host and port in the configuration."
 	}
 	return "    STATUS_LOGON_FAILURE  → wrong credential\n" +
 		"    STATUS_ACCESS_DENIED  → wrong credential or account restrictions\n" +
@@ -120,7 +101,7 @@ func connectFailureHint(err error) string {
 // (see upstream.reapIfIdle), until stop is closed. The tick is a fraction of
 // the timeout, clamped to a sane range, so a connection is closed within about
 // one tick of crossing the threshold.
-func reapUpstreams(upstreams map[connKey]*upstream, idle time.Duration, stop <-chan struct{}) {
+func reapUpstreams(upstreams map[*target]*upstream, idle time.Duration, stop <-chan struct{}) {
 	interval := idle / 2
 	interval = max(interval, time.Second)
 	interval = min(interval, time.Minute)
@@ -139,141 +120,46 @@ func reapUpstreams(upstreams map[connKey]*upstream, idle time.Duration, stop <-c
 }
 
 func main() {
-	var maps multiFlag
-	flag.Var(&maps, "map",
-		"share mapping: local_share:host:remote_share:user:domain:credential\n"+
-			"\t  remote_share may include an inner path (either slash works), e.g.\n"+
-			"\t               C$\\Users\\Public or data/projects, to map the local share\n"+
-			"\t               to a subfolder instead of the share root\n"+
-			"\t  credential = a password, pass:<password> to force password mode\n"+
-			"\t               (use pass: for a password that is itself 32 hex chars),\n"+
-			"\t               a 32-hex-char NTLM hash, or an lmhash:nthash pair\n"+
-			"\t  repeat -map to place several shares, hosts or accounts behind one host\n"+
-			"\t  mappings with identical (host,user,domain,credential) share one upstream connection")
-
-	var mapFiles multiFlag
-	flag.Var(&mapFiles, "mapfile",
-		"read share mappings from a file, one -map-formatted line per entry:\n"+
-			"\t  local_share:host:remote_share:user:domain:credential\n"+
-			"\t  blank lines and lines beginning with # are ignored. Keeps\n"+
-			"\t  credentials out of the process argument list; repeat for\n"+
-			"\t  several files. Combined with any -map flags.")
-
-	listen := flag.String("l", "0.0.0.0:445", "local listen addr:port (port 445 needs root/CAP_NET_BIND_SERVICE)")
-	localUser := flag.String("local-user", "guest", "username clients authenticate with")
-	localPass := flag.String("local-pass", "guest", "password clients authenticate with")
-	localPassFile := flag.String("local-pass-file", "",
-		"read the password clients authenticate with from the first line of this file,\n"+
-			"\tkeeping it out of the process argument list (instead of -local-pass)")
-	allowGuest := flag.Bool("allow-guest", false, "accept any failed/unknown logon as a guest session (lets Explorer browse \\\\host, which first tries the username \"guest\")")
-	allowAnon := flag.Bool("allow-anonymous", false, "accept null (anonymous) sessions; like -allow-guest, this exposes every\n"+
-		"\tproxied share (read-only) to clients that never present the local credentials")
-	maxDialect := flag.String("max-dialect", "3.1.1", "highest SMB dialect to offer clients: 2.1, 3.0, 3.0.2 or 3.1.1 (min stays 2.1; 3.x uses AES-CMAC signing that Windows prefers over 2.1's HMAC-SHA256)")
-	idleTimeout := flag.Duration("idle-timeout", 5*time.Minute,
-		"close an upstream connection after this period with no open handles and no\n"+
-			"\tactivity; it is re-established on demand when a client next uses the share.\n"+
-			"\t0 keeps each connection (still dialed on demand) until shutdown")
-	connectTimeout := flag.Duration("connect-timeout", 15*time.Second,
-		"give up connecting to a target (TCP connect, negotiation and login) after this\n"+
-			"\tlong; the client's request then fails with \"network path not found\". 0 waits indefinitely")
-	ioTimeout := flag.Duration("io-timeout", time.Minute,
-		"fail a read or directory request on an open file when the target has not answered\n"+
-			"\tafter this long, so a stalled target cannot block the other clients sharing its\n"+
-			"\tconnection. Opening files and listing a share's root cannot be bounded (go-smb\n"+
-			"\toffers no way to). 0 waits indefinitely")
-	debugLog := flag.Bool("debug", false, "enable verbose go-smb debug logging (dialect, signing, session setup, DCE/RPC)\n"+
-		"\tand log every file-system call the proxy answers, with its result")
+	configPath := flag.String("config", defaultConfigPath,
+		"configuration file (YAML); see smbproxy.example.yaml for every setting")
+	flag.Usage = func() {
+		fmt.Fprintf(flag.CommandLine.Output(),
+			"usage: %s [-config file]\n\nAll settings are in the configuration file.\n\n", os.Args[0])
+		flag.PrintDefaults()
+	}
 	flag.Parse()
-
-	maxDialectID, ok := dialectByName[*maxDialect]
-	if !ok {
-		log.Fatalf("[!] invalid -max-dialect %q: use one of 2.1, 3.0, 3.0.2, 3.1.1", *maxDialect)
+	if flag.NArg() > 0 {
+		flag.Usage()
+		os.Exit(2)
 	}
 
-	// ---- Local login ----
-	passSet := false
-	flag.Visit(func(f *flag.Flag) { passSet = passSet || f.Name == "local-pass" })
-	pass := *localPass
-	if *localPassFile != "" {
-		if passSet {
-			log.Fatal("[!] use either -local-pass or -local-pass-file, not both")
-		}
-		var err error
-		if pass, err = readPassFile(*localPassFile); err != nil {
-			log.Fatalf("[!] -local-pass-file %q: %v", *localPassFile, err)
-		}
+	cfg, warnings, err := loadConfig(*configPath)
+	if err != nil {
+		log.Fatalf("[!] configuration %s: %v", *configPath, err)
+	}
+	for _, w := range warnings {
+		log.Printf("[!] configuration: %s", w)
 	}
 
 	// Verbose go-smb logging. Every go-smb package registers its own named
 	// logger at init via golog.Get(...); SetAll raises the level on all of
 	// them at once. Lshortfile adds file:line so a failing leg is easy to
-	// trace. Without -debug the library stays at its default (Notice).
-	if *debugLog {
+	// trace. Without debug the library stays at its default (Notice).
+	if cfg.debug {
 		golog.SetAll(golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, os.Stdout, os.Stderr)
 		verbose = true // enable rpcPipe PDU tracing
 	}
 
-	// ---- Gather raw map lines from -map flags and -mapfile files ----
-	rawMaps := append([]string(nil), maps...)
-	for _, path := range mapFiles {
-		lines, err := readMapFile(path)
-		if err != nil {
-			log.Fatalf("[!] -mapfile %q: %v", path, err)
-		}
-		rawMaps = append(rawMaps, lines...)
-	}
-
-	if len(rawMaps) == 0 {
-		flag.Usage()
-		log.Fatal("\nat least one -map or -mapfile entry is required\n\n" +
-			"Example:\n" +
-			"  sudo ./smbproxy \\\n" +
-			"    -map \"share:10.0.0.5:C$:Administrator:CORP:8846f7eaee8fb117ad06bdd830b7586c\"\n\n" +
-			"Multiple shares:\n" +
-			"  sudo ./smbproxy \\\n" +
-			"    -map \"corp_c:10.0.0.5:C$:Administrator:CORP:8846...86c\" \\\n" +
-			"    -map \"corp_d:10.0.0.5:D$:Administrator:CORP:8846...86c\" \\\n" +
-			"    -map \"dev:10.0.0.6:Builds:svc_build:CORP:dead...beef\"\n\n" +
-			"From a file (one such line per entry, keeps credentials off the cmdline):\n" +
-			"  sudo ./smbproxy -mapfile /etc/smbproxy.maps\n\n" +
-			"Password instead of a hash (converted to its NT hash internally):\n" +
-			"  sudo ./smbproxy \\\n" +
-			"    -map \"share:10.0.0.5:C$:Administrator:CORP:S3cretP@ss\"")
-	}
-
-	// ---- Parse and validate all mappings ----
-	mappings := make([]mapping, 0, len(rawMaps))
-	seen := map[string]string{} // lower-cased name -> name as first given
-	for _, raw := range rawMaps {
-		m, err := parseMapping(raw)
-		if err != nil {
-			log.Fatalf("[!] invalid mapping %q: %v", redactMapping(raw), err)
-		}
-		// SMB share names are case-insensitive, so "Data" and "data" collide.
-		key := strings.ToLower(m.localShare)
-		if first, dup := seen[key]; dup {
-			log.Fatalf("[!] duplicate local share name %q (share names are case-insensitive; %q is already mapped)",
-				m.localShare, first)
-		}
-		seen[key] = m.localShare
-		mappings = append(mappings, m)
-	}
-
-	// ---- Prepare upstreams (deduplicated by connKey; connected on demand) ----
+	// ---- Prepare upstreams (one per target in use; connected on demand) ----
 	// No connection is dialed here: each upstream connects when a client first
 	// touches one of its shares, and the idle reaper closes it again after
-	// -idle-timeout of inactivity. A consequence is that a bad credential or an
+	// timeouts.idle of inactivity. A consequence is that a bad credential or an
 	// unreachable target is reported on first use (to the client, and in the
 	// log), not at launch.
-	upstreams := map[connKey]*upstream{}
-	for _, m := range mappings {
-		k := m.key()
-		if _, ok := upstreams[k]; !ok {
-			upstreams[k] = newUpstream(m, upstreamTimeouts{
-				idle:    *idleTimeout,
-				connect: *connectTimeout,
-				io:      *ioTimeout,
-			})
+	upstreams := map[*target]*upstream{}
+	for _, sh := range cfg.shares {
+		if _, ok := upstreams[sh.target]; !ok {
+			upstreams[sh.target] = newUpstream(sh.target, cfg.timeouts)
 		}
 	}
 	defer func() {
@@ -283,30 +169,29 @@ func main() {
 	}()
 
 	// ---- Reap idle upstream connections ----
-	if *idleTimeout > 0 {
+	if cfg.timeouts.idle > 0 {
 		stopReaper := make(chan struct{})
 		defer close(stopReaper)
-		go reapUpstreams(upstreams, *idleTimeout, stopReaper)
+		go reapUpstreams(upstreams, cfg.timeouts.idle, stopReaper)
 	}
 
 	// ---- Build the local server ----
-	auth := &server.MapAuthenticator{
-		Accounts: map[string]*server.Account{
-			strings.ToLower(*localUser): {NTHash: ntlmssp.Ntowfv1(pass)},
-		},
+	auth := &server.MapAuthenticator{Domain: cfg.localDomain, Accounts: map[string]*server.Account{}}
+	if cfg.localUser != "" {
+		auth.Accounts[strings.ToLower(cfg.localUser)] = &server.Account{NTHash: cfg.localHash}
 	}
 
-	cfg := &server.ServerConfig{
+	srvCfg := &server.ServerConfig{
 		NetBIOSName:    "SMBPROXY",
-		MinDialect:     smb.DialectSmb_2_1,
-		MaxDialect:     maxDialectID,
+		MinDialect:     cfg.minDialect,
+		MaxDialect:     cfg.maxDialect,
 		Authenticator:  auth,
-		AllowAnonymous: *allowAnon,
-		AllowGuest:     *allowGuest,
+		AllowAnonymous: cfg.allowAnon,
+		AllowGuest:     cfg.allowGuest,
 		MaxReadSize:    readAheadSize,
 	}
 
-	srv := &server.Server{Config: cfg}
+	srv := &server.Server{Config: srvCfg}
 
 	// ---- Register IPC$ with a no-op VFS ----
 	// Without this the server auto-provides IPC$ with VFS=nil, which causes
@@ -319,24 +204,24 @@ func main() {
 	})
 
 	// ---- Register each proxied share ----
-	for _, m := range mappings {
-		up := upstreams[m.key()]
-		var vfs server.VFS = &proxyVFS{up: up, share: m.remoteShare, base: m.remoteSub}
-		if *debugLog {
-			vfs = &tracingVFS{share: m.localShare, inner: vfs}
+	for _, sh := range cfg.shares {
+		var vfs server.VFS = &proxyVFS{up: upstreams[sh.target], share: sh.remoteShare, base: sh.remoteSub}
+		if cfg.debug {
+			vfs = &tracingVFS{share: sh.name, inner: vfs}
 		}
-		srv.RegisterShare(m.localShare, server.Share{
-			Name:          m.localShare,
+		srv.RegisterShare(sh.name, server.Share{
+			Name:          sh.name,
 			Type:          smb.ShareTypeDisk,
+			Remark:        sh.comment,
 			VFS:           vfs,
 			MaximalAccess: readOnlyAccess,
 		})
 		sub := ""
-		if m.remoteSub != "" {
-			sub = "\\" + m.remoteSub
+		if sh.remoteSub != "" {
+			sub = "\\" + sh.remoteSub
 		}
-		log.Printf("[+] share \\\\<host>\\%s  →  \\\\%s\\%s%s  (as %s\\%s)",
-			m.localShare, m.remoteHost, m.remoteShare, sub, m.domain, m.user)
+		log.Printf("[+] share \\\\<host>\\%s  →  %s\\%s%s  (target %s, as %s)",
+			sh.name, sh.target.addr(), sh.remoteShare, sub, sh.target.name, sh.target.account())
 	}
 
 	// ---- Wire srvsvc so Explorer can enumerate shares at \\host level ----
@@ -345,8 +230,8 @@ func main() {
 	// (opnum 16), queried when a file is opened in an application. rpcPipe adds
 	// the WRITE/READ transport and the BindAck fixup the Windows client needs
 	// (see its doc).
-	svc := &shareService{&srvsvc.Service{Shares: srvsvc.FromConfig(cfg)}}
-	cfg.PipeOpener = &server.MapPipeOpener{
+	svc := &shareService{&srvsvc.Service{Shares: srvsvc.FromConfig(srvCfg)}}
+	srvCfg.PipeOpener = &server.MapPipeOpener{
 		Pipes: map[string]func(*server.Session) (server.PipeBackend, error){
 			"srvsvc": func(_ *server.Session) (server.PipeBackend, error) {
 				return &rpcPipe{
@@ -356,13 +241,17 @@ func main() {
 		},
 	}
 
-	log.Printf("[*] listening on %s", *listen)
-	log.Printf("[*] local login: user=%s", *localUser)
-	if strings.EqualFold(*localUser, "guest") && pass == "guest" {
-		log.Printf("[!] clients log in with the default guest/guest, which anyone can guess;" +
-			" set -local-user and -local-pass (or -local-pass-file) to restrict access")
+	log.Printf("[*] listening on %s", cfg.listen)
+	switch {
+	case cfg.localUser == "":
+		log.Printf("[*] local login: none; guest/anonymous access only")
+	case cfg.localDomain != "":
+		log.Printf("[*] local login: %s\\%s", cfg.localDomain, cfg.localUser)
+	default:
+		log.Printf("[*] local login: %s (any domain)", cfg.localUser)
 	}
-	log.Printf("[*] dialect range: 2.1 .. %s  allow-guest=%t  allow-anonymous=%t", *maxDialect, *allowGuest, *allowAnon)
+	log.Printf("[*] dialect range: %s .. %s  allow_guest=%t  allow_anonymous=%t",
+		cfg.minDialectName, cfg.maxDialectName, cfg.allowGuest, cfg.allowAnon)
 	log.Printf("[*] browse \\\\<this-host>  or connect directly to \\\\<this-host>\\<share>")
 
 	// ---- Graceful shutdown ----
@@ -376,7 +265,7 @@ func main() {
 		_ = srv.Shutdown(ctx)
 	}()
 
-	if err := srv.ListenAndServe(*listen); err != nil && !errors.Is(err, server.ErrServerClosed) {
+	if err := srv.ListenAndServe(cfg.listen); err != nil && !errors.Is(err, server.ErrServerClosed) {
 		log.Fatalf("[!] server error: %v", err)
 	}
 }

@@ -5,3 +5,6 @@
 _gitignore
 
 *.exe
+
+# Local configuration; usually holds credentials
+smbproxy.yaml

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -30,10 +29,10 @@ import (
 // refs counts open upstream file handles; a connection with live handles is
 // never reaped, since closing it would invalidate those handles mid-use.
 type upstream struct {
-	m         mapping                             // retained so the link can be (re)dialed on demand
-	dial      func(mapping) (upstreamConn, error) // injectable for tests; dialConn in production
-	idle      time.Duration                       // reap after this much inactivity (0 = never reap)
-	ioTimeout time.Duration                       // bound on one request on an open file (0 = none)
+	t         *target                      // the server and account this connection reaches
+	dial      func() (upstreamConn, error) // connects to t; injectable for tests
+	idle      time.Duration                // reap after this much inactivity (0 = never reap)
+	ioTimeout time.Duration                // bound on one request on an open file (0 = none)
 
 	mu      sync.Mutex
 	conn    upstreamConn // nil when not currently connected
@@ -49,15 +48,15 @@ type upstreamTimeouts struct {
 	io      time.Duration // one read or directory request on an open file
 }
 
-// newUpstream builds a lazily-connected upstream for mapping m. No network
-// connection is made until the first operation; t bounds how long an unused
+// newUpstream builds a lazily-connected upstream for target tg. No network
+// connection is made until the first operation; to bounds how long an unused
 // connection is kept, connecting, and each request on an open file.
-func newUpstream(m mapping, t upstreamTimeouts) *upstream {
+func newUpstream(tg *target, to upstreamTimeouts) *upstream {
 	return &upstream{
-		m:         m,
-		dial:      func(m mapping) (upstreamConn, error) { return dialConn(m, t.connect) },
-		idle:      t.idle,
-		ioTimeout: t.io,
+		t:         tg,
+		dial:      func() (upstreamConn, error) { return dialConn(tg, to.connect) },
+		idle:      to.idle,
+		ioTimeout: to.io,
 	}
 }
 
@@ -89,16 +88,15 @@ func (u *upstream) ensureConn() error {
 	if u.conn != nil {
 		return nil
 	}
-	log.Printf("[*] connecting to \\\\%s\\%s as %s\\%s ...",
-		u.m.remoteHost, u.m.remoteShare, u.m.domain, u.m.user)
-	c, err := u.dial(u.m)
+	log.Printf("[*] connecting to target %s (%s) as %s ...", u.t.name, u.t.addr(), u.t.account())
+	c, err := u.dial()
 	if err != nil {
-		log.Printf("[!] upstream connect \\\\%s as %s\\%s failed: %v\n%s",
-			u.m.remoteHost, u.m.domain, u.m.user, err, connectFailureHint(err))
+		log.Printf("[!] connecting to target %s (%s) as %s failed: %v\n%s",
+			u.t.name, u.t.addr(), u.t.account(), err, connectFailureHint(err))
 		return &connectError{err}
 	}
 	u.conn = c
-	log.Printf("[+] connected to %s as %s\\%s", u.m.remoteHost, u.m.domain, u.m.user)
+	log.Printf("[+] connected to target %s (%s) as %s", u.t.name, u.t.addr(), u.t.account())
 	return nil
 }
 
@@ -134,7 +132,7 @@ func (u *upstream) reapIfIdle(now time.Time) bool {
 	if u.conn == nil || u.refs > 0 || now.Sub(u.lastUse) < u.idle {
 		return false
 	}
-	log.Printf("[*] upstream %s idle for %s; closing", u.m.remoteHost, now.Sub(u.lastUse).Round(time.Second))
+	log.Printf("[*] upstream %s idle for %s; closing", u.t.name, now.Sub(u.lastUse).Round(time.Second))
 	u.conn.Close()
 	u.conn = nil
 	return true
@@ -175,12 +173,12 @@ func (u *upstream) do(fn func(c upstreamConn) error) error {
 	if !isTransportErr(err) {
 		return err
 	}
-	log.Printf("[*] upstream %s connection error (%v); reconnecting...", u.m.remoteHost, err)
+	log.Printf("[*] upstream %s connection error (%v); reconnecting...", u.t.name, err)
 	if rerr := u.redial(); rerr != nil {
-		log.Printf("[!] upstream %s reconnect failed: %v", u.m.remoteHost, rerr)
+		log.Printf("[!] upstream %s reconnect failed: %v", u.t.name, rerr)
 		return err // surface the original failure, not the reconnect error
 	}
-	log.Printf("[+] upstream %s reconnected", u.m.remoteHost)
+	log.Printf("[+] upstream %s reconnected", u.t.name)
 	u.lastUse = time.Now()
 	return fn(u.conn)
 }
@@ -188,7 +186,7 @@ func (u *upstream) do(fn func(c upstreamConn) error) error {
 // redial opens a fresh authenticated connection and swaps it in, closing the
 // old one. The caller must hold u.mu.
 func (u *upstream) redial() error {
-	c, err := u.dial(u.m)
+	c, err := u.dial()
 	if err != nil {
 		return err
 	}
@@ -315,17 +313,13 @@ func (f smbFile) QuerySecurity(additionalInformation uint32) ([]byte, error) {
 	return sd.MarshalBinary()
 }
 
-// dialConn opens one authenticated connection to the target in mapping m,
-// giving up after timeout (0 = no limit). It is the production dial func
-// stored on upstream; tests substitute their own.
-func dialConn(m mapping, timeout time.Duration) (upstreamConn, error) {
-	hashBytes, err := hex.DecodeString(m.ntHex)
-	if err != nil {
-		return nil, err
-	}
+// dialConn opens one authenticated connection to target tg, giving up after
+// timeout (0 = no limit). It is the production dial func stored on upstream;
+// tests substitute their own.
+func dialConn(tg *target, timeout time.Duration) (upstreamConn, error) {
 	opts := smb.Options{
-		Host:        m.remoteHost,
-		Port:        445,
+		Host:        tg.host,
+		Port:        tg.port,
 		DialTimeout: timeout, // the TCP connect; connectWithin bounds the rest
 		// SMB2Only skips the SMB1 multiprotocol probe, sending a direct SMB2
 		// NEGOTIATE that offers all dialects. The server picks the highest it
@@ -334,9 +328,9 @@ func dialConn(m mapping, timeout time.Duration) (upstreamConn, error) {
 		// This lets the cache fill in 1–2 upstream ReadFile calls rather than 128.
 		SMB2Only: true,
 		Initiator: &spnego.NTLMInitiator{
-			User:   m.user,
-			Domain: m.domain,
-			Hash:   hashBytes,
+			User:   tg.user,
+			Domain: tg.domain,
+			Hash:   tg.ntHash,
 		},
 	}
 	return connectWithin(timeout, func() (upstreamConn, error) {
@@ -381,12 +375,4 @@ func connectWithin(timeout time.Duration, connect func() (upstreamConn, error)) 
 		}()
 		return nil, fmt.Errorf("no answer within %s: %w", timeout, os.ErrDeadlineExceeded)
 	}
-}
-
-// dialectByName maps the -max-dialect flag value to the go-smb constant.
-var dialectByName = map[string]uint16{
-	"2.1":   smb.DialectSmb_2_1,
-	"3.0":   smb.DialectSmb_3_0,
-	"3.0.2": smb.DialectSmb_3_0_2,
-	"3.1.1": smb.DialectSmb_3_1_1,
 }

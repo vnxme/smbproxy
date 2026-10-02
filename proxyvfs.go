@@ -742,7 +742,7 @@ func (v *proxyVFS) Ioctl(_ context.Context, h server.Handle, ctlCode uint32, _ [
 // file's location on the target, BirthVolumeId one of the target share, and
 // DomainId is zero.
 func (v *proxyVFS) objectID(p string) []byte {
-	volume := strings.ToLower(v.up.m.remoteHost + "\\" + v.share)
+	volume := strings.ToLower(v.up.t.addr() + "\\" + v.share)
 	file := volume + "\\" + strings.ToLower(joinRemote(v.base, remotePath(p)))
 	sum := func(s string) []byte {
 		h := fnv.New128a()

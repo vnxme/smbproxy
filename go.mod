@@ -5,6 +5,7 @@ go 1.27
 require (
 	github.com/jfjallid/go-smb v0.12.0
 	github.com/jfjallid/golog v0.4.0
+	go.yaml.in/yaml/v3 v3.0.5
 )
 
 require (
