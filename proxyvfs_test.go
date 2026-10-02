@@ -144,6 +144,12 @@ func newVFS(c *fakeConn) *proxyVFS {
 	return &proxyVFS{up: &upstream{conn: c}, share: "C$"}
 }
 
+// fileHandle returns an open-file handle on ff whose size, as captured at open
+// time, is that of ff's data, so reads are clamped and prefetched against it.
+func fileHandle(ff *fakeFile) *proxyHandle {
+	return &proxyHandle{file: ff, info: server.FileInfo{Size: int64(len(ff.data))}}
+}
+
 // drainPrefetch blocks until any in-flight prefetch goroutine has finished, so
 // a test can mutate the fake without racing it.
 func drainPrefetch(ph *proxyHandle) {
@@ -446,7 +452,7 @@ func TestProxyReadTiers(t *testing.T) {
 	data := []byte("0123456789") // 10 bytes
 	ff := &fakeFile{data: data}
 	v := newVFS(&fakeConn{})
-	ph := &proxyHandle{file: ff}
+	ph := fileHandle(ff)
 	ctx := context.Background()
 	buf := make([]byte, 4)
 
@@ -486,7 +492,7 @@ func TestProxyReadPrefetchData(t *testing.T) {
 	}
 	ff := &fakeFile{data: data}
 	v := newVFS(&fakeConn{})
-	ph := &proxyHandle{file: ff}
+	ph := fileHandle(ff)
 	ctx := context.Background()
 
 	// tier 3 fills the cache with the first readAheadSize bytes and launches a
@@ -519,7 +525,7 @@ func TestProxyReadPrefetchFollowsSeek(t *testing.T) {
 	}
 	ff := &fakeFile{data: data}
 	v := newVFS(&fakeConn{})
-	ph := &proxyHandle{file: ff}
+	ph := fileHandle(ff)
 	ctx := context.Background()
 	buf := make([]byte, 4096)
 
@@ -529,8 +535,9 @@ func TestProxyReadPrefetchFollowsSeek(t *testing.T) {
 	}
 	drainPrefetch(ph)
 
-	// Seek past both the cache and the queued prefetch.
-	seek := int64(2 * readAheadSize)
+	// Seek past both the cache and the queued prefetch, far enough from the
+	// end that the next read-ahead still starts inside the file.
+	seek := int64(readAheadSize + readAheadSize/2)
 	n, status, _ := v.Read(ctx, ph, seek, buf)
 	if status != smb.StatusOk || n != len(buf) || !bytes.Equal(buf, data[seek:seek+int64(n)]) {
 		t.Fatalf("seek read = (%d, 0x%08x), want (%d, Ok) with matching bytes", n, status, len(buf))
@@ -545,12 +552,68 @@ func TestProxyReadPrefetchFollowsSeek(t *testing.T) {
 	}
 }
 
+// A small file costs a buffer of its own size, not a full read-ahead batch,
+// and reading it whole queues no read-ahead past its end.
+func TestProxyReadClampsToFileSize(t *testing.T) {
+	data := []byte("0123456789")
+	ff := &fakeFile{data: data}
+	v := newVFS(&fakeConn{})
+	ph := fileHandle(ff)
+
+	buf := make([]byte, 64)
+	n, status, _ := v.Read(context.Background(), ph, 0, buf)
+	if status != smb.StatusOk || n != len(data) || !bytes.Equal(buf[:n], data) {
+		t.Fatalf("read = (%d, 0x%08x, %q), want (10, Ok, %q)", n, status, buf[:n], data)
+	}
+	if c := cap(ph.cacheData); c != len(data) {
+		t.Errorf("cache buffer cap = %d, want %d", c, len(data))
+	}
+	if ph.pref != nil {
+		t.Errorf("prefetch queued at %d, want none past the end of file", ph.pref.off)
+	}
+	if r := ff.readCount(); r != 1 {
+		t.Errorf("upstream ReadFile called %d times, want 1", r)
+	}
+}
+
+// A file that grew after it was opened is still readable past the size seen
+// at open time: such reads go upstream with a small probe buffer.
+func TestProxyReadPastOpenTimeSize(t *testing.T) {
+	data := []byte("0123456789abcdef")
+	ff := &fakeFile{data: data}
+	v := newVFS(&fakeConn{})
+	ph := &proxyHandle{file: ff, info: server.FileInfo{Size: 10}} // grew to 16 since
+
+	buf := make([]byte, 64)
+	n, status, _ := v.Read(context.Background(), ph, 10, buf)
+	if status != smb.StatusOk || n != 6 || !bytes.Equal(buf[:n], data[10:]) {
+		t.Fatalf("read = (%d, 0x%08x, %q), want (6, Ok, %q)", n, status, buf[:n], data[10:])
+	}
+	if c := cap(ph.cacheData); c != probeSize {
+		t.Errorf("cache buffer cap = %d, want probeSize %d", c, probeSize)
+	}
+}
+
+func TestReadBufPool(t *testing.T) {
+	if b := getReadBuf(100); len(b) != 100 || cap(b) != 100 {
+		t.Errorf("small buffer len/cap = %d/%d, want 100/100", len(b), cap(b))
+	}
+	full := getReadBuf(readAheadSize)
+	if len(full) != readAheadSize {
+		t.Fatalf("full buffer len = %d, want %d", len(full), readAheadSize)
+	}
+	// Recycling a resliced full buffer, a small one, or nil must not panic.
+	putReadBuf(full[:10])
+	putReadBuf(make([]byte, 100))
+	putReadBuf(nil)
+}
+
 // A cached region must be served without touching the upstream again.
 func TestProxyReadServesFromCache(t *testing.T) {
 	data := []byte("0123456789")
 	ff := &fakeFile{data: data}
 	v := newVFS(&fakeConn{})
-	ph := &proxyHandle{file: ff}
+	ph := fileHandle(ff)
 	ctx := context.Background()
 	buf := make([]byte, 4)
 
@@ -573,7 +636,7 @@ func TestProxyReadServesFromCache(t *testing.T) {
 func TestProxyReadError(t *testing.T) {
 	ff := &fakeFile{readErr: smb.StatusMap[smb.StatusAccessDenied]}
 	v := newVFS(&fakeConn{})
-	ph := &proxyHandle{file: ff}
+	ph := fileHandle(ff)
 
 	n, status, err := v.Read(context.Background(), ph, 0, make([]byte, 8))
 	if err != nil || n != 0 || status != smb.StatusAccessDenied {
@@ -655,7 +718,7 @@ func TestProxyQueryDirectoryAllBatches(t *testing.T) {
 	}
 	ff := &fakeFile{isDir: true, dirs: dirs, dirPage: 10}
 	v := newVFS(&fakeConn{})
-	ph := &proxyHandle{file: ff, isDir: true, path: "\big"}
+	ph := &proxyHandle{file: ff, isDir: true, path: "\\big"}
 	ctx := context.Background()
 
 	entries, status, err := v.QueryDirectory(ctx, ph, "*", false)
@@ -707,7 +770,7 @@ func TestProxyQueryDirectoryClosedFile(t *testing.T) {
 func TestProxyClose(t *testing.T) {
 	ff := &fakeFile{data: []byte("0123456789")}
 	v := newVFS(&fakeConn{})
-	ph := &proxyHandle{file: ff}
+	ph := fileHandle(ff)
 	ctx := context.Background()
 
 	// A read populates the cache and starts a prefetch; Close must drain it,

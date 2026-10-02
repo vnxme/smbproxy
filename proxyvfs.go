@@ -200,9 +200,9 @@ func (v *proxyVFS) Close(_ context.Context, h server.Handle) (err error) {
 	ph.file = nil
 	ph.fileMu.Unlock()
 
-	ph.cacheMu.Lock()
-	ph.cacheData = nil
-	ph.cacheMu.Unlock()
+	// No Read can still be using the cache: each holds fileMu.RLock throughout,
+	// and from here on sees the nil file and returns before reaching it.
+	ph.setCache(0, nil)
 
 	ph.prefMu.Lock()
 	ph.pref = nil
@@ -277,43 +277,76 @@ func (v *proxyVFS) Read(_ context.Context, h server.Handle, offset int64, buf []
 		ph.pref = nil
 		ph.prefMu.Unlock()
 		<-p.done
-		data, pErr := p.data, p.err
-
-		isEOF := errors.Is(pErr, io.EOF) ||
-			errors.Is(pErr, smb.StatusMap[smb.StatusEndOfFile])
-		if pErr != nil && !isEOF {
-			return 0, errToStatus(pErr), nil
+		if p.err != nil {
+			return 0, errToStatus(p.err), nil
 		}
-		if len(data) == 0 {
+		if len(p.data) == 0 {
 			return 0, smb.StatusEndOfFile, nil
 		}
-		ph.cacheMu.Lock()
-		ph.cacheOff = offset
-		ph.cacheData = data
-		ph.cacheMu.Unlock()
-		v.startPrefetch(ph, offset+int64(len(data)))
-
-		serve := min(len(data), need)
-		copy(buf[:serve], data[:serve])
+		serve := copy(buf[:min(len(p.data), need)], p.data)
+		ph.setCache(offset, p.data)
+		v.startPrefetch(ph, offset+int64(len(p.data)))
 		return serve, smb.StatusOk, nil
 	}
 	ph.prefMu.Unlock()
 
 	// ---- tier 3: synchronous fetch ----
-	upBuf := make([]byte, readAheadSize)
+	data, fErr := v.fetch(ph.file, offset, ph.info.Size)
+	if fErr != nil {
+		return 0, errToStatus(fErr), nil
+	}
+	if len(data) == 0 {
+		return 0, smb.StatusEndOfFile, nil
+	}
+	serve := copy(buf[:min(len(data), need)], data)
+	ph.setCache(offset, data)
+	v.startPrefetch(ph, offset+int64(len(data)))
+	return serve, smb.StatusOk, nil
+}
+
+// setCache makes data, read from the target at off, the handle's cached
+// region and recycles the buffer it replaces. Readers copy out of the cache
+// under cacheMu, so once swapped out the old buffer has no other user.
+func (ph *proxyHandle) setCache(off int64, data []byte) {
+	ph.cacheMu.Lock()
+	old := ph.cacheData
+	ph.cacheOff, ph.cacheData = off, data
+	ph.cacheMu.Unlock()
+	putReadBuf(old)
+}
+
+// probeSize is how much fetch asks for at or past the end of file as seen
+// when the handle was opened. The file may have grown since, so such a read
+// still goes upstream, but without committing a full read-ahead buffer to
+// what is usually an EOF.
+const probeSize = 64 << 10
+
+// fetch reads one batch from the target at off: readAheadSize bytes, clamped
+// to the end of a file whose size was size when opened, so a small file does
+// not cost a full read-ahead buffer. It returns the bytes read, which may be
+// fewer at end of file and are empty at it, or the error that prevented
+// reading anything; an EOF is not an error. Full-size buffers come from
+// readBufPool and go back to it via putReadBuf once no longer cached.
+func (v *proxyVFS) fetch(file upstreamFile, off, size int64) ([]byte, error) {
+	want := int64(probeSize)
+	if rest := size - off; rest > 0 {
+		want = min(rest, readAheadSize)
+	}
+	upBuf := getReadBuf(int(want))
+
 	totalN := 0
+	var fetchErr error
 	v.up.mu.Lock()
-	for totalN < readAheadSize {
-		rn, rErr := ph.file.ReadFile(upBuf[totalN:], uint64(offset)+uint64(totalN))
+	for totalN < len(upBuf) {
+		rn, rErr := file.ReadFile(upBuf[totalN:], uint64(off)+uint64(totalN))
 		if rn > 0 {
 			totalN += rn
 		}
-		isEOF := errors.Is(rErr, io.EOF) ||
-			errors.Is(rErr, smb.StatusMap[smb.StatusEndOfFile])
 		if rErr != nil {
+			isEOF := errors.Is(rErr, io.EOF) ||
+				errors.Is(rErr, smb.StatusMap[smb.StatusEndOfFile])
 			if !isEOF && totalN == 0 {
-				v.up.mu.Unlock()
-				return 0, errToStatus(rErr), nil
+				fetchErr = rErr
 			}
 			break
 		}
@@ -324,29 +357,49 @@ func (v *proxyVFS) Read(_ context.Context, h server.Handle, offset int64, buf []
 	v.up.mu.Unlock()
 
 	if totalN == 0 {
-		return 0, smb.StatusEndOfFile, nil
+		putReadBuf(upBuf)
+		return nil, fetchErr
 	}
-	ph.cacheMu.Lock()
-	ph.cacheOff = offset
-	ph.cacheData = upBuf[:totalN]
-	ph.cacheMu.Unlock()
-	v.startPrefetch(ph, offset+int64(totalN))
+	return upBuf[:totalN], nil
+}
 
-	serve := min(totalN, need)
-	copy(buf[:serve], upBuf[:serve])
-	return serve, smb.StatusOk, nil
+// readBufPool recycles full read-ahead buffers, which a streaming client
+// otherwise allocates at readAheadSize per batch. Smaller, end-of-file
+// buffers are plain allocations left to the garbage collector.
+var readBufPool = sync.Pool{New: func() any { return new([readAheadSize]byte) }}
+
+// getReadBuf returns a buffer of length n, pooled when n is a full batch.
+func getReadBuf(n int) []byte {
+	if n == readAheadSize {
+		return readBufPool.Get().(*[readAheadSize]byte)[:]
+	}
+	return make([]byte, n)
+}
+
+// putReadBuf recycles b if it is a full-size buffer from getReadBuf. The
+// caller must hold the only reference to it.
+func putReadBuf(b []byte) {
+	if cap(b) == readAheadSize {
+		readBufPool.Put((*[readAheadSize]byte)(b[:readAheadSize]))
+	}
 }
 
 // startPrefetch queues a background read-ahead at off. A read-ahead already
 // queued for off is kept; one for any other offset is stale (the client has
 // moved elsewhere in the file) and is replaced, so a seek does not leave
-// read-ahead stuck on a region that will never be read.
+// read-ahead stuck on a region that will never be read. Nothing is queued at
+// or past the end of the file as it was when opened: that read would almost
+// always come back empty, and a client reading on past it (into a file that
+// has since grown) is served by a synchronous fetch instead.
 //
 // The caller must hold ph.fileMu.RLock with ph.file non-nil. The goroutine is
 // handed the file rather than taking fileMu itself: a pending Close's Lock
 // would block that RLock while Read, holding its own RLock, waits for the
 // prefetch to finish — a deadlock.
 func (v *proxyVFS) startPrefetch(ph *proxyHandle, off int64) {
+	if off >= ph.info.Size {
+		return
+	}
 	ph.prefMu.Lock()
 	if ph.pref != nil && ph.pref.off == off {
 		ph.prefMu.Unlock()
@@ -361,35 +414,7 @@ func (v *proxyVFS) startPrefetch(ph *proxyHandle, off int64) {
 	go func() {
 		defer ph.prefWG.Done()
 		defer close(p.done)
-
-		upBuf := make([]byte, readAheadSize)
-		totalN := 0
-		var fetchErr error
-
-		v.up.mu.Lock()
-		for totalN < readAheadSize {
-			rn, rErr := file.ReadFile(upBuf[totalN:], uint64(off)+uint64(totalN))
-			if rn > 0 {
-				totalN += rn
-			}
-			isEOF := errors.Is(rErr, io.EOF) ||
-				errors.Is(rErr, smb.StatusMap[smb.StatusEndOfFile])
-			if rErr != nil {
-				if !isEOF && totalN == 0 {
-					fetchErr = rErr
-				}
-				break
-			}
-			if rn == 0 {
-				break
-			}
-		}
-		v.up.mu.Unlock()
-
-		if totalN > 0 {
-			p.data = upBuf[:totalN]
-		}
-		p.err = fetchErr
+		p.data, p.err = v.fetch(file, off, ph.info.Size)
 	}()
 }
 
