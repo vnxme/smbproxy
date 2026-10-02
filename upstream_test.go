@@ -7,6 +7,7 @@ import (
 	"net"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jfjallid/go-smb/smb"
 )
@@ -15,13 +16,159 @@ import (
 // the library returns when the socket is gone.
 var connDown = fmt.Errorf("remote connection has closed")
 
-// A malformed ntHex must fail before any network dial. (parseMapping always
-// normalizes ntHex, so this guards direct callers only.) The dial path itself
+// A malformed ntHex must fail in dialConn before any network use. (parseMapping
+// always normalizes ntHex, so this guards direct callers only.) The dial itself
 // needs a live SMB server and is not unit-tested.
-func TestOpenUpstreamBadHash(t *testing.T) {
-	up, err := openUpstream(mapping{remoteHost: "192.0.2.1", ntHex: "not-hex"})
-	if err == nil || up != nil {
-		t.Errorf("openUpstream = (%v, %v), want (nil, hex decode error)", up, err)
+func TestDialConnBadHash(t *testing.T) {
+	conn, err := dialConn(mapping{remoteHost: "192.0.2.1", ntHex: "not-hex"})
+	if err == nil || conn != nil {
+		t.Errorf("dialConn = (%v, %v), want (nil, hex decode error)", conn, err)
+	}
+}
+
+// newUpstream must not dial until the first operation, and must reuse the
+// connection on later operations.
+func TestUpstreamLazyConnect(t *testing.T) {
+	conn := &fakeConn{}
+	dialed := 0
+	u := &upstream{m: mapping{remoteHost: "h"}, dial: func(mapping) (upstreamConn, error) {
+		dialed++
+		return conn, nil
+	}}
+
+	if u.conn != nil || dialed != 0 {
+		t.Fatalf("dialed before first use (conn=%v, dialed=%d)", u.conn, dialed)
+	}
+	if err := u.do(func(upstreamConn) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if dialed != 1 || u.conn == nil {
+		t.Errorf("after first op: dialed=%d conn=%v, want 1 and connected", dialed, u.conn)
+	}
+	if err := u.do(func(upstreamConn) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if dialed != 1 {
+		t.Errorf("second op redialed (dialed=%d), want the connection reused", dialed)
+	}
+}
+
+func TestNewUpstreamIsLazy(t *testing.T) {
+	u := newUpstream(mapping{remoteHost: "h"}, 90*time.Second)
+	if u.conn != nil {
+		t.Errorf("newUpstream dialed eagerly (conn=%v)", u.conn)
+	}
+	if u.dial == nil || u.idle != 90*time.Second {
+		t.Errorf("newUpstream fields = (dial set=%v, idle=%v), want dial set and idle 90s", u.dial != nil, u.idle)
+	}
+}
+
+func TestUpstreamClose(t *testing.T) {
+	c := &fakeConn{}
+	u := &upstream{conn: c}
+	u.close()
+	c.mu.Lock()
+	closed := c.closed
+	c.mu.Unlock()
+	if !closed || u.conn != nil {
+		t.Errorf("close: connClosed=%v conn=%v, want closed and nil", closed, u.conn)
+	}
+	u.close() // idempotent / safe when already disconnected
+}
+
+func TestUpstreamConnectError(t *testing.T) {
+	wantErr := errors.New("nope")
+	u := &upstream{m: mapping{remoteHost: "h"}, dial: func(mapping) (upstreamConn, error) {
+		return nil, wantErr
+	}}
+
+	err := u.do(func(upstreamConn) error {
+		t.Fatal("operation ran despite a failed connect")
+		return nil
+	})
+	if !errors.Is(err, wantErr) {
+		t.Errorf("do = %v, want the dial error surfaced", err)
+	}
+	if u.conn != nil {
+		t.Errorf("conn set despite a failed dial")
+	}
+}
+
+func TestReapIfIdle(t *testing.T) {
+	now := time.Now()
+	newU := func() (*upstream, *fakeConn) {
+		c := &fakeConn{}
+		return &upstream{
+			m:       mapping{remoteHost: "h"},
+			conn:    c,
+			idle:    time.Minute,
+			lastUse: now.Add(-2 * time.Minute), // idle long enough to reap
+		}, c
+	}
+
+	t.Run("idle and unused is reaped", func(t *testing.T) {
+		u, c := newU()
+		if !u.reapIfIdle(now) || u.conn != nil {
+			t.Fatalf("idle unused upstream not reaped (conn=%v)", u.conn)
+		}
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if !c.closed {
+			t.Errorf("reaped connection was not closed")
+		}
+	})
+	t.Run("recent activity is kept", func(t *testing.T) {
+		u, _ := newU()
+		u.lastUse = now
+		if u.reapIfIdle(now) || u.conn == nil {
+			t.Errorf("recently-used upstream was reaped")
+		}
+	})
+	t.Run("open handle is kept", func(t *testing.T) {
+		u, _ := newU()
+		u.refs = 1
+		if u.reapIfIdle(now) || u.conn == nil {
+			t.Errorf("upstream with an open handle was reaped")
+		}
+	})
+	t.Run("idle disabled", func(t *testing.T) {
+		u, _ := newU()
+		u.idle = 0
+		if u.reapIfIdle(now) || u.conn == nil {
+			t.Errorf("reaped despite idle timeout disabled")
+		}
+	})
+	t.Run("not connected", func(t *testing.T) {
+		u, _ := newU()
+		u.conn = nil
+		if u.reapIfIdle(now) {
+			t.Errorf("reapIfIdle reported closing a nil connection")
+		}
+	})
+}
+
+// The full lifecycle: connect on demand, reap when idle, reconnect on next use.
+func TestUpstreamReconnectAfterReap(t *testing.T) {
+	dialed := 0
+	u := &upstream{m: mapping{remoteHost: "h"}, idle: time.Minute, dial: func(mapping) (upstreamConn, error) {
+		dialed++
+		return &fakeConn{}, nil
+	}}
+
+	if err := u.do(func(upstreamConn) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	u.mu.Lock()
+	u.lastUse = time.Now().Add(-2 * time.Minute)
+	u.mu.Unlock()
+	if !u.reapIfIdle(time.Now()) {
+		t.Fatal("expected the idle connection to be reaped")
+	}
+	if err := u.do(func(upstreamConn) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if dialed != 2 {
+		t.Errorf("dialed %d times, want 2 (initial + reconnect after reap)", dialed)
 	}
 }
 

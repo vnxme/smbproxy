@@ -163,6 +163,9 @@ func (v *proxyVFS) Create(_ context.Context, _ *server.Session, req server.Creat
 		return server.CreateResult{}, errToStatus(err), nil
 	}
 
+	// Pin the connection open for the lifetime of this handle so the idle
+	// reaper cannot close it mid-use; Close drops the pin.
+	v.up.hold()
 	h := handleFromFile(req, upFile, v.share)
 	return server.CreateResult{Handle: h, CreateAction: smb.FileOpened, Info: h.info}, 0, nil
 }
@@ -202,6 +205,9 @@ func (v *proxyVFS) Close(_ context.Context, h server.Handle) (err error) {
 			defer v.up.mu.Unlock()
 			_ = file.CloseFile()
 		}()
+		// Drop the pin taken in Create; only file-backed handles hold one (the
+		// synthetic root handle has no upstream file), so this mirrors hold.
+		v.up.release()
 	}
 	return nil
 }

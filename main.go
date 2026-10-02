@@ -100,6 +100,32 @@ func connectFailureHint(err error) string {
 		"                            which cannot sign — re-check user/domain/credential."
 }
 
+// reapUpstreams periodically closes upstream connections that have gone idle
+// (see upstream.reapIfIdle), until stop is closed. The tick is a fraction of
+// the timeout, clamped to a sane range, so a connection is closed within about
+// one tick of crossing the threshold.
+func reapUpstreams(upstreams map[connKey]*upstream, idle time.Duration, stop <-chan struct{}) {
+	interval := idle / 2
+	if interval < time.Second {
+		interval = time.Second
+	}
+	if interval > time.Minute {
+		interval = time.Minute
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case now := <-t.C:
+			for _, up := range upstreams {
+				up.reapIfIdle(now)
+			}
+		}
+	}
+}
+
 func main() {
 	var maps multiFlag
 	flag.Var(&maps, "map",
@@ -123,6 +149,10 @@ func main() {
 	localPass := flag.String("local-pass", "guest", "password clients authenticate with")
 	allowGuest := flag.Bool("allow-guest", false, "accept any failed/unknown logon as a guest session (lets Explorer browse \\\\host, which first tries the username \"guest\")")
 	maxDialect := flag.String("max-dialect", "3.1.1", "highest SMB dialect to offer clients: 2.1, 3.0, 3.0.2 or 3.1.1 (min stays 2.1; 3.x uses AES-CMAC signing that Windows prefers over 2.1's HMAC-SHA256)")
+	idleTimeout := flag.Duration("idle-timeout", 5*time.Minute,
+		"close an upstream connection after this period with no open handles and no\n"+
+			"\tactivity; it is re-established on demand when a client next uses the share.\n"+
+			"\t0 keeps each connection (still dialed on demand) until shutdown")
 	debugLog := flag.Bool("debug", false, "enable verbose go-smb debug logging (dialect, signing, session setup, DCE/RPC)")
 	flag.Parse()
 
@@ -183,28 +213,31 @@ func main() {
 		mappings = append(mappings, m)
 	}
 
-	// ---- Open upstream connections (deduplicated by connKey) ----
+	// ---- Prepare upstreams (deduplicated by connKey; connected on demand) ----
+	// No connection is dialed here: each upstream connects when a client first
+	// touches one of its shares, and the idle reaper closes it again after
+	// -idle-timeout of inactivity. A consequence is that a bad credential or an
+	// unreachable target is reported on first use (to the client, and in the
+	// log), not at launch.
 	upstreams := map[connKey]*upstream{}
 	for _, m := range mappings {
 		k := m.key()
-		if _, ok := upstreams[k]; ok {
-			continue // already connected with these credentials
+		if _, ok := upstreams[k]; !ok {
+			upstreams[k] = newUpstream(m, *idleTimeout)
 		}
-		log.Printf("[*] connecting to \\\\%s\\%s as %s\\%s ...",
-			m.remoteHost, m.remoteShare, m.domain, m.user)
-		up, err := openUpstream(m)
-		if err != nil {
-			log.Fatalf("[!] upstream connect \\\\%s as %s\\%s failed: %v\n%s",
-				m.remoteHost, m.domain, m.user, err, connectFailureHint(err))
-		}
-		upstreams[k] = up
-		log.Printf("[+] authenticated as %s\\%s on %s", m.domain, m.user, m.remoteHost)
 	}
 	defer func() {
 		for _, up := range upstreams {
-			up.conn.Close()
+			up.close()
 		}
 	}()
+
+	// ---- Reap idle upstream connections ----
+	if *idleTimeout > 0 {
+		stopReaper := make(chan struct{})
+		defer close(stopReaper)
+		go reapUpstreams(upstreams, *idleTimeout, stopReaper)
+	}
 
 	// ---- Build the local server ----
 	auth := &server.MapAuthenticator{

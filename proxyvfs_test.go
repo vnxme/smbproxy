@@ -7,6 +7,7 @@ import (
 	"io"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jfjallid/go-smb/smb"
 	"github.com/jfjallid/go-smb/smb/server"
@@ -269,6 +270,42 @@ func TestProxyCreateReconnects(t *testing.T) {
 	}
 	if res.Handle.(*proxyHandle).file != upstreamFile(ff) {
 		t.Errorf("handle not backed by the reconnected file")
+	}
+}
+
+// An open handle (Create) must pin the connection so the reaper cannot close it
+// mid-use; Close must drop the pin so an idle connection is then reaped.
+func TestProxyHandlePinsConnectionAgainstReap(t *testing.T) {
+	ff := &fakeFile{metaVal: fileMeta{endOfFile: 3}}
+	conn := &fakeConn{openFn: func(_, _ string, _ *smb.CreateReqOpts) (upstreamFile, error) {
+		return ff, nil
+	}}
+	u := &upstream{m: mapping{remoteHost: "h"}, conn: conn, idle: time.Minute,
+		dial: func(mapping) (upstreamConn, error) { return conn, nil }}
+	v := &proxyVFS{up: u, share: "C$"}
+	ctx := context.Background()
+
+	res, status, err := v.Create(ctx, nil, server.CreateRequest{Path: "\\a.txt"})
+	if err != nil || status != 0 {
+		t.Fatalf("Create = (0x%08x, %v), want success", status, err)
+	}
+
+	// Even far past the idle window, an open handle keeps the connection.
+	u.mu.Lock()
+	u.lastUse = time.Now().Add(-time.Hour)
+	u.mu.Unlock()
+	if u.reapIfIdle(time.Now()) || u.conn == nil {
+		t.Errorf("connection reaped while a handle was open")
+	}
+
+	if err := v.Close(ctx, res.Handle); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	u.mu.Lock()
+	u.lastUse = time.Now().Add(-time.Hour)
+	u.mu.Unlock()
+	if !u.reapIfIdle(time.Now()) || u.conn != nil {
+		t.Errorf("connection not reaped after the handle closed")
 	}
 }
 

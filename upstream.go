@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/jfjallid/go-smb/smb"
 	"github.com/jfjallid/go-smb/spnego"
@@ -20,11 +21,96 @@ import (
 // access to the conn.
 // ---------------------------------------------------------------------------
 
+// upstream is connected lazily: conn stays nil until a client first touches the
+// share, and the idle reaper closes it again (resetting conn to nil) after a
+// period with no open handles and no activity. The next client access redials.
+// refs counts open upstream file handles; a connection with live handles is
+// never reaped, since closing it would invalidate those handles mid-use.
 type upstream struct {
-	m    mapping                             // retained so a dropped link can be redialed
+	m    mapping                             // retained so the link can be (re)dialed on demand
 	dial func(mapping) (upstreamConn, error) // injectable for tests; dialConn in production
-	conn upstreamConn
-	mu   sync.Mutex
+	idle time.Duration                       // reap after this much inactivity (0 = never reap)
+
+	mu      sync.Mutex
+	conn    upstreamConn // nil when not currently connected
+	refs    int          // open upstream file handles
+	lastUse time.Time    // updated on every operation and handle release
+}
+
+// newUpstream builds a lazily-connected upstream for mapping m. No network
+// connection is made until the first operation; idle bounds how long an unused
+// connection is kept before the reaper closes it.
+func newUpstream(m mapping, idle time.Duration) *upstream {
+	return &upstream{m: m, dial: dialConn, idle: idle}
+}
+
+// ensureConn dials the upstream if it is not currently connected. The caller
+// must hold u.mu. A dial failure is logged (with a cause-specific hint) and
+// returned so it surfaces to the client as the operation's status.
+func (u *upstream) ensureConn() error {
+	if u.conn != nil {
+		return nil
+	}
+	log.Printf("[*] connecting to \\\\%s\\%s as %s\\%s ...",
+		u.m.remoteHost, u.m.remoteShare, u.m.domain, u.m.user)
+	c, err := u.dial(u.m)
+	if err != nil {
+		log.Printf("[!] upstream connect \\\\%s as %s\\%s failed: %v\n%s",
+			u.m.remoteHost, u.m.domain, u.m.user, err, connectFailureHint(err))
+		return err
+	}
+	u.conn = c
+	log.Printf("[+] connected to %s as %s\\%s", u.m.remoteHost, u.m.domain, u.m.user)
+	return nil
+}
+
+// hold records that a client opened an upstream file handle, pinning the
+// connection open against the idle reaper until the matching release.
+func (u *upstream) hold() {
+	u.mu.Lock()
+	u.refs++
+	u.lastUse = time.Now()
+	u.mu.Unlock()
+}
+
+// release drops one handle recorded by hold and restarts the idle clock, so the
+// timeout is measured from the moment the last handle closed.
+func (u *upstream) release() {
+	u.mu.Lock()
+	if u.refs > 0 {
+		u.refs--
+	}
+	u.lastUse = time.Now()
+	u.mu.Unlock()
+}
+
+// reapIfIdle closes the connection when it is open, has no live handles, and has
+// been idle for at least u.idle; conn is reset to nil so the next access
+// redials. It reports whether it closed one. A non-positive idle disables it.
+func (u *upstream) reapIfIdle(now time.Time) bool {
+	if u.idle <= 0 {
+		return false
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.conn == nil || u.refs > 0 || now.Sub(u.lastUse) < u.idle {
+		return false
+	}
+	log.Printf("[*] upstream %s idle for %s; closing", u.m.remoteHost, now.Sub(u.lastUse).Round(time.Second))
+	u.conn.Close()
+	u.conn = nil
+	return true
+}
+
+// close tears the connection down (if any) at shutdown; safe to call when not
+// connected.
+func (u *upstream) close() {
+	u.mu.Lock()
+	if u.conn != nil {
+		u.conn.Close()
+		u.conn = nil
+	}
+	u.mu.Unlock()
 }
 
 // do runs a connection-level operation under the upstream lock. If fn fails
@@ -42,6 +128,11 @@ func (u *upstream) do(fn func(c upstreamConn) error) error {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 
+	if err := u.ensureConn(); err != nil {
+		return err
+	}
+	u.lastUse = time.Now()
+
 	err := fn(u.conn)
 	if !isTransportErr(err) {
 		return err
@@ -52,6 +143,7 @@ func (u *upstream) do(fn func(c upstreamConn) error) error {
 		return err // surface the original failure, not the reconnect error
 	}
 	log.Printf("[+] upstream %s reconnected", u.m.remoteHost)
+	u.lastUse = time.Now()
 	return fn(u.conn)
 }
 
@@ -157,17 +249,6 @@ func (f smbFile) meta() fileMeta {
 		lastWriteTime:  f.LastWriteTime,
 		changeTime:     f.ChangeTime,
 	}
-}
-
-// openUpstream dials the target and authenticates using the NT hash derived
-// from the mapping's credential (a supplied hash, or one computed from a
-// password at parse time).
-func openUpstream(m mapping) (*upstream, error) {
-	conn, err := dialConn(m)
-	if err != nil {
-		return nil, err
-	}
-	return &upstream{m: m, dial: dialConn, conn: conn}, nil
 }
 
 // dialConn opens one authenticated connection to the target in mapping m. It is
