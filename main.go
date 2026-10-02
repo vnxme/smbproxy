@@ -62,6 +62,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -207,8 +208,8 @@ func main() {
 		if sh.remoteSub != "" {
 			sub = "\\" + sh.remoteSub
 		}
-		log.Printf("[+] share \\\\<host>\\%s  →  %s\\%s%s  (target %s, as %s)",
-			sh.name, sh.target.addr(), sh.remoteShare, sub, sh.target.name, sh.target.account())
+		log.Printf("[+] share \\\\<host>\\%s  →  %s\\%s%s  (target %s, as %s; read: %s)",
+			sh.name, sh.target.addr(), sh.remoteShare, sub, sh.target.name, sh.target.account(), sh.readAccess)
 	}
 
 	// ---- Wire srvsvc so Explorer can enumerate shares at \\host level ----
@@ -218,13 +219,20 @@ func main() {
 	// NetrServerGetInfo (opnum 21), queried by a share's Properties > Network
 	// tab. rpcPipe adds the WRITE/READ transport and the BindAck fixup the
 	// Windows client needs (see its doc).
-	svc := newSrvsvcService(cfg, srvsvc.FromConfig(srvCfg))
+	allShares := srvsvc.FromConfig(srvCfg)
 	lsa := newLSAService(cfg)
 	srvCfg.PipeOpener = &server.MapPipeOpener{
 		Pipes: map[string]func(*server.Session) (server.PipeBackend, error){
-			"srvsvc": func(_ *server.Session) (server.PipeBackend, error) {
+			// Built per open, for the session opening it: with
+			// hide_inaccessible_shares, each client is listed only the shares
+			// its read_access lets it open.
+			"srvsvc": func(s *server.Session) (server.PipeBackend, error) {
+				shares := allShares
+				if cfg.hideInaccessibleShares {
+					shares = cfg.visibleShares(allShares, principalOf(s))
+				}
 				return &rpcPipe{
-					inner: dcesrv.NewPipeHandler("srvsvc", svc),
+					inner: dcesrv.NewPipeHandler("srvsvc", newSrvsvcService(cfg, shares)),
 				}, nil
 			},
 			// lsaService answers the domain-membership queries the same tab
@@ -238,13 +246,13 @@ func main() {
 	}
 
 	log.Printf("[*] listening on %s", cfg.listen)
-	switch {
-	case cfg.localUser == "":
-		log.Printf("[*] local login: none; guest/anonymous access only")
+	switch names := cfg.localUserNames(); {
+	case len(names) == 0:
+		log.Printf("[*] local users: none; guest/anonymous access only")
 	case cfg.localDomain != "":
-		log.Printf("[*] local login: %s\\%s", cfg.localDomain, cfg.localUser)
+		log.Printf("[*] local users (domain %s): %s", cfg.localDomain, strings.Join(names, ", "))
 	default:
-		log.Printf("[*] local login: %s (any domain)", cfg.localUser)
+		log.Printf("[*] local users (any domain): %s", strings.Join(names, ", "))
 	}
 	log.Printf("[*] server %s (domain %s)  dialects %s .. %s",
 		cfg.netbiosName, cfg.netbiosDomain, cfg.minDialectName, cfg.maxDialectName)

@@ -48,6 +48,10 @@ server:
     max_timeout: 10m         # the longest a client may ask for
 
   max_connections: 512       # concurrent clients; -1 for no limit
+  hide_inaccessible_shares: false  # list only the shares a client may open
+                             # (Samba's "access based share enum"); by
+                             # default, as on Windows, every share is listed
+                             # and opening one without access is refused
 
   # Upper bounds on waiting for clients (Go durations; 0 disables a limit).
   timeouts:
@@ -56,18 +60,28 @@ server:
 
 debug: false                 # log every SMB exchange and file-system call
 
-# The login clients use to connect to the proxy.
+# The logins clients use to connect to the proxy.
 local:
-  user: alice
-  domain: ""                 # if set, clients must log in as DOMAIN\user
-  password_file: local.pass
+  domain: ""                 # if set, every user must log in as DOMAIN\user
   allow_guest: false         # accept any failed or unknown login as a guest
                              # session (lets Explorer browse \\host, which
                              # tries "guest" first)
   allow_anonymous: false     # accept null sessions
-  # Both allow_* settings give every share (read-only) to clients that never
-  # present the login above. user and a credential may be left out only if
-  # one of them is true.
+  # Guest and anonymous sessions reach every share without a read_access
+  # list, and the shares whose list names @guests or @anonymous. users may be
+  # left out only if one of allow_* is true.
+
+  users:                     # user name (case-insensitive) → credential
+    alice:
+      password_file: local.pass
+    bob:
+      password_hash: 8846f7eaee8fb117ad06bdd830b7586c
+    carol:
+      password: S3cretP@ss
+
+  groups:                    # optional: group name → member users, for
+    finance: [alice, bob]    # read_access (where it is written @finance).
+    builders: [carol]        # Groups do not nest.
 
 # Upper bounds on waiting for targets (Go durations; 0 disables a limit).
 target_timeouts:
@@ -109,12 +123,17 @@ shares:
     read_only: true          # the only supported value for now
     encrypt: false           # require encryption for this share (needs
                              # server.encryption supported or required)
+    read_access: [alice]     # who may open it: users, @groups, and the
+                             # reserved @guests and @anonymous. Omitted:
+                             # everyone who can log in. Others are refused.
   - name: pub
     target: corp-admin
-    path: C$/Users/Public
+    path: C$/Users/Public    # no read_access: everyone who can log in
   - name: builds
     target: build
     path: Builds
+    read_access: ["@builders", alice]   # quote entries starting with @
   - name: lab
     target: lab
     path: data/projects/2024
+    read_access: ["@finance"]

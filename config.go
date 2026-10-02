@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -59,6 +60,8 @@ type serverSection struct {
 	DurableHandles durableSection        `yaml:"durable_handles"`
 	MaxConnections int                   `yaml:"max_connections"`
 	Timeouts       serverTimeoutsSection `yaml:"timeouts"`
+
+	HideInaccessibleShares bool `yaml:"hide_inaccessible_shares"`
 }
 
 type durableSection struct {
@@ -81,11 +84,11 @@ type Credential struct {
 }
 
 type localSection struct {
-	User           string `yaml:"user"`
-	Domain         string `yaml:"domain"`
-	Credential     `yaml:",inline"`
-	AllowGuest     bool `yaml:"allow_guest"`
-	AllowAnonymous bool `yaml:"allow_anonymous"`
+	Domain         string                `yaml:"domain"`
+	AllowGuest     bool                  `yaml:"allow_guest"`
+	AllowAnonymous bool                  `yaml:"allow_anonymous"`
+	Users          map[string]Credential `yaml:"users"`  // user name -> credential
+	Groups         map[string][]string   `yaml:"groups"` // group name -> member user names
 }
 
 // targetTimeoutsSection bounds waits on targets.
@@ -126,12 +129,13 @@ type targetSection struct {
 }
 
 type shareSection struct {
-	Name     string `yaml:"name"`
-	Target   string `yaml:"target"`
-	Path     string `yaml:"path"`
-	Comment  string `yaml:"comment"`
-	ReadOnly *bool  `yaml:"read_only"`
-	Encrypt  bool   `yaml:"encrypt"`
+	Name       string   `yaml:"name"`
+	Target     string   `yaml:"target"`
+	Path       string   `yaml:"path"`
+	Comment    string   `yaml:"comment"`
+	ReadOnly   *bool    `yaml:"read_only"`
+	Encrypt    bool     `yaml:"encrypt"`
+	ReadAccess []string `yaml:"read_access"` // users, @groups, @guests, @anonymous; absent = everyone
 }
 
 // config is a validated configuration, ready to run the proxy from.
@@ -154,11 +158,12 @@ type config struct {
 	clientIdleTimeout          time.Duration // 0 = no limit
 	clientWriteTimeout         time.Duration // 0 = no limit
 
-	localUser   string // "" when clients can only connect as guest or anonymous
-	localDomain string // "" accepts any domain
-	localHash   []byte // the local user's NT hash
+	localUsers  map[string]localUser // by lower-cased name; empty when only guests or anonymous log in
+	localDomain string               // "" accepts any domain
 	allowGuest  bool
 	allowAnon   bool
+
+	hideInaccessibleShares bool // list only the shares a session may open (Samba's access based share enum)
 
 	timeouts upstreamTimeouts
 	shares   []share // in file order, which is the order Explorer lists them in
@@ -189,9 +194,16 @@ func (t *target) account() string {
 type share struct {
 	name, comment string
 	target        *target
-	remoteShare   string // share on the target (e.g. "C$")
-	remoteSub     string // inner directory within it (empty = share root)
-	encrypt       bool   // require SMB 3.x encryption for this share
+	remoteShare   string      // share on the target (e.g. "C$")
+	remoteSub     string      // inner directory within it (empty = share root)
+	encrypt       bool        // require SMB 3.x encryption for this share
+	readAccess    *accessList // who may open it; nil = everyone who can log in
+}
+
+// localUser is one login clients may use to connect to the proxy.
+type localUser struct {
+	name   string // as configured
+	ntHash []byte
 }
 
 // yamlSectionNames rewrites the Go type names in yaml.v3's errors ("field x
@@ -202,6 +214,7 @@ var yamlSectionNames = strings.NewReplacer(
 	"not found in type main.durableSection", "is not a known setting under server.durable_handles",
 	"not found in type main.serverTimeoutsSection", "is not a known setting under server.timeouts",
 	"not found in type main.localSection", "is not a known setting under local",
+	"not found in type main.Credential", "is not a known setting for a user",
 	"not found in type main.targetTimeoutsSection", "is not a known setting under target_timeouts",
 	"not found in type main.targetSection", "is not a known setting for a target",
 	"not found in type main.shareSection", "is not a known setting for a share",
@@ -274,21 +287,24 @@ func parseConfig(data []byte, baseDir string) (*config, []string, error) {
 		return nil, nil, fmt.Errorf("server: %w", err)
 	}
 
-	// ---- Local login ----
+	// ---- Local logins ----
 	l := fc.Local
-	cfg.allowGuest, cfg.allowAnon = l.AllowGuest, l.AllowAnonymous
+	cfg.allowGuest, cfg.allowAnon, cfg.localDomain = l.AllowGuest, l.AllowAnonymous, l.Domain
+	users, err := resolveUsers(l.Users, baseDir)
+	if err != nil {
+		return nil, nil, fmt.Errorf("local.users: %w", err)
+	}
+	cfg.localUsers = users
 	switch {
-	case l.User != "":
-		hash, err := l.Credential.ntHash(baseDir)
-		if err != nil {
-			return nil, nil, fmt.Errorf("local: %w", err)
-		}
-		cfg.localUser, cfg.localDomain, cfg.localHash = l.User, l.Domain, hash
-	case l.Domain != "" || l.Credential.count() > 0:
-		return nil, nil, errors.New("local: a domain or credential is set but no user")
-	case !l.AllowGuest && !l.AllowAnonymous:
-		return nil, nil, errors.New("local: no way for clients to log in: set user and a credential," +
-			" or allow_guest or allow_anonymous")
+	case len(users) == 0 && !l.AllowGuest && !l.AllowAnonymous:
+		return nil, nil, errors.New("local: no way for clients to log in: define users," +
+			" or set allow_guest or allow_anonymous")
+	case len(users) == 0 && l.Domain != "":
+		return nil, nil, errors.New("local: domain is set but no users are defined")
+	}
+	groups, err := resolveGroups(l.Groups, users)
+	if err != nil {
+		return nil, nil, fmt.Errorf("local.groups: %w", err)
 	}
 
 	// Guest and anonymous sessions have no session key, so they can neither
@@ -341,6 +357,14 @@ func parseConfig(data []byte, baseDir string) (*config, []string, error) {
 		if sh.encrypt && cfg.encryption == "off" {
 			return nil, nil, fmt.Errorf("shares[%d] (%s): encrypt needs server.encryption supported or required", i, sh.name)
 		}
+		access, accessWarnings, err := resolveReadAccess(s.ReadAccess, cfg, groups)
+		if err != nil {
+			return nil, nil, fmt.Errorf("shares[%d] (%s): read_access: %w", i, sh.name, err)
+		}
+		for _, w := range accessWarnings {
+			warnings = append(warnings, fmt.Sprintf("share %s: %s", sh.name, w))
+		}
+		sh.readAccess = access
 		seen[key] = sh.name
 		used[s.Target] = true
 		cfg.shares = append(cfg.shares, sh)
@@ -449,6 +473,7 @@ func resolveServer(cfg *config, s serverSection) error {
 		return fmt.Errorf("encryption %q: use off, supported or required", s.Encryption)
 	}
 	cfg.compression = s.Compression
+	cfg.hideInaccessibleShares = s.HideInaccessibleShares
 
 	d := s.DurableHandles
 	if d.Timeout <= 0 || d.MaxTimeout <= 0 {
@@ -493,14 +518,160 @@ func checkNetBIOSName(field, name string) error {
 	return nil
 }
 
-// authenticator returns the verifier for client logins: the local user, if
-// any, and the required domain ("" accepts any).
+// authenticator returns the verifier for client logins: the local users and
+// the required domain ("" accepts any). go-smb keys accounts by lower-cased
+// user name, as localUsers is.
 func (c *config) authenticator() *server.MapAuthenticator {
 	auth := &server.MapAuthenticator{Domain: c.localDomain, Accounts: map[string]*server.Account{}}
-	if c.localUser != "" {
-		auth.Accounts[strings.ToLower(c.localUser)] = &server.Account{NTHash: c.localHash}
+	for key, u := range c.localUsers {
+		auth.Accounts[key] = &server.Account{NTHash: u.ntHash}
 	}
 	return auth
+}
+
+// treeConnectHook enforces each share's read_access when a client connects to
+// it, refusing everyone not listed with STATUS_ACCESS_DENIED.
+func (c *config) treeConnectHook(_ *server.Conn, s *server.Session, shareName string,
+	_ *smb.TreeConnectReq, _ *smb.TreeConnectRes) (*server.Status, error) {
+	if p := principalOf(s); !c.readAllowed(shareName, p) {
+		log.Printf("[!] %s may not open share %s (read_access); access denied", p, shareName)
+		return &server.Status{Code: smb.StatusAccessDenied}, nil
+	}
+	return nil, nil
+}
+
+// userNameInvalidChars are the characters Windows forbids in a user name.
+const userNameInvalidChars = `"/\[]:;|=,+*?<>`
+
+// resolveUsers validates local.users, keyed by lower-cased name: Windows
+// matches user names case-insensitively, so two that differ only in case are
+// the same user.
+func resolveUsers(in map[string]Credential, baseDir string) (map[string]localUser, error) {
+	out := map[string]localUser{}
+	for _, name := range sortedKeys(in) {
+		if err := checkUserName(name); err != nil {
+			return nil, err
+		}
+		key := strings.ToLower(name)
+		if other, dup := out[key]; dup {
+			return nil, fmt.Errorf("%q and %q are the same user (user names are case-insensitive)", other.name, name)
+		}
+		hash, err := in[name].ntHash(baseDir)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", name, err)
+		}
+		out[key] = localUser{name: name, ntHash: hash}
+	}
+	return out, nil
+}
+
+func checkUserName(name string) error {
+	switch {
+	case name == "":
+		return errors.New("a user name is empty")
+	case strings.HasPrefix(name, "@"):
+		return fmt.Errorf("user name %q: @ marks groups in read_access, so a user name cannot start with it", name)
+	}
+	for _, r := range name {
+		if r < 0x20 || strings.ContainsRune(userNameInvalidChars, r) {
+			return fmt.Errorf("user name %q contains %q, which Windows does not allow (nor any of %s)",
+				name, r, userNameInvalidChars)
+		}
+	}
+	return nil
+}
+
+// resolveGroups validates local.groups into lower-cased group name -> lower-
+// cased member names. Members must be defined users; groups do not nest.
+func resolveGroups(in map[string][]string, users map[string]localUser) (map[string][]string, error) {
+	out := map[string][]string{}
+	original := map[string]string{} // lower-cased name -> name as configured
+	for _, name := range sortedKeys(in) {
+		key := strings.ToLower(name)
+		switch {
+		case name == "":
+			return nil, errors.New("a group name is empty")
+		case strings.HasPrefix(name, "@"):
+			return nil, fmt.Errorf("group %q: write group names without @; it marks them only in read_access", name)
+		case "@"+key == accessGuests || "@"+key == accessAnonymous:
+			return nil, fmt.Errorf("group name %q is reserved: %s and %s stand for guest and anonymous sessions",
+				name, accessGuests, accessAnonymous)
+		}
+		if other, dup := original[key]; dup {
+			return nil, fmt.Errorf("%q and %q are the same group (group names are case-insensitive)", other, name)
+		}
+		if u, clash := users[key]; clash {
+			return nil, fmt.Errorf("group %q has the same name as user %q", name, u.name)
+		}
+		original[key] = name
+		members := make([]string, 0, len(in[name]))
+		for _, m := range in[name] {
+			if strings.HasPrefix(m, "@") {
+				return nil, fmt.Errorf("%s: member %q: groups cannot contain groups", name, m)
+			}
+			if _, ok := users[strings.ToLower(m)]; !ok {
+				return nil, fmt.Errorf("%s: member %q is not defined under local.users", name, m)
+			}
+			members = append(members, strings.ToLower(m))
+		}
+		out[key] = members
+	}
+	return out, nil
+}
+
+// resolveReadAccess resolves a share's read_access entries — user names,
+// @groups, @guests and @anonymous — into an access list. No read_access (a
+// nil list) means everyone who can log in, and resolves to nil. It also
+// returns warnings for entries that can never match.
+func resolveReadAccess(entries []string, cfg *config, groups map[string][]string) (*accessList, []string, error) {
+	if entries == nil {
+		return nil, nil, nil
+	}
+	a := &accessList{users: map[string]bool{}, spec: entries}
+	var warnings []string
+	if len(entries) == 0 {
+		warnings = append(warnings, "read_access is empty, so no one can open it")
+	}
+	for _, e := range entries {
+		key := strings.ToLower(e)
+		switch {
+		case key == accessGuests:
+			a.guests = true
+			if !cfg.allowGuest {
+				warnings = append(warnings, fmt.Sprintf("read_access lists %s, but local.allow_guest is off", e))
+			}
+		case key == accessAnonymous:
+			a.anonymous = true
+			if !cfg.allowAnon {
+				warnings = append(warnings, fmt.Sprintf("read_access lists %s, but local.allow_anonymous is off", e))
+			}
+		case strings.HasPrefix(key, "@"):
+			members, ok := groups[key[1:]]
+			if !ok {
+				return nil, nil, fmt.Errorf("%q is not a group defined under local.groups", e)
+			}
+			for _, m := range members {
+				a.users[m] = true
+			}
+		default:
+			if _, ok := cfg.localUsers[key]; !ok {
+				return nil, nil, fmt.Errorf("%q is not a user defined under local.users", e)
+			}
+			a.users[key] = true
+		}
+	}
+	return a, warnings, nil
+}
+
+// sortedKeys returns m's keys in order, so validation reports the same first
+// error on every run.
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	return keys
 }
 
 // serverConfig returns the go-smb server settings the configuration
@@ -528,6 +699,7 @@ func (c *config) serverConfig() *server.ServerConfig {
 		Authenticator:  c.authenticator(),
 		AllowAnonymous: c.allowAnon,
 		AllowGuest:     c.allowGuest,
+		OnTreeConnect:  c.treeConnectHook,
 	}
 }
 

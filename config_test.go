@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -17,8 +18,9 @@ import (
 // replace parts of it.
 const minimalConfig = `
 local:
-  user: alice
-  password: pw
+  users:
+    alice:
+      password: pw
 targets:
   t1:
     host: 10.0.0.5
@@ -64,8 +66,29 @@ func TestExampleConfig(t *testing.T) {
 	if len(warnings) != 0 {
 		t.Errorf("example config warnings: %v", warnings)
 	}
-	if cfg.localUser != "alice" || string(cfg.localHash) != string(ntlmssp.Ntowfv1("local-pw")) {
-		t.Errorf("local login = %q with hash %x, want alice with the hash of local.pass", cfg.localUser, cfg.localHash)
+	if names := cfg.localUserNames(); strings.Join(names, ",") != "alice,bob,carol" {
+		t.Errorf("local users = %v, want alice, bob, carol", names)
+	}
+	if string(cfg.localUsers["alice"].ntHash) != string(ntlmssp.Ntowfv1("local-pw")) ||
+		string(cfg.localUsers["carol"].ntHash) != string(ntlmssp.Ntowfv1("S3cretP@ss")) {
+		t.Error("local user hashes do not match local.pass and carol's password")
+	}
+	// read_access as the example sets it: corp_c alice; pub everyone; builds
+	// @builders (carol) and alice; lab @finance (alice, bob).
+	wantRead := map[string]string{"corp_c": "alice", "pub": "*", "builds": "alice,carol", "lab": "alice,bob"}
+	for _, s := range cfg.shares {
+		got := "*"
+		if s.readAccess != nil {
+			users := make([]string, 0, len(s.readAccess.users))
+			for u := range s.readAccess.users {
+				users = append(users, u)
+			}
+			slices.Sort(users)
+			got = strings.Join(users, ",")
+		}
+		if got != wantRead[s.name] {
+			t.Errorf("share %s read_access users = %s, want %s", s.name, got, wantRead[s.name])
+		}
 	}
 	if cfg.minDialect != smb.DialectSmb_2_1 || cfg.maxDialect != smb.DialectSmb_3_1_1 {
 		t.Errorf("dialects = %#x..%#x, want 2.1..3.1.1", cfg.minDialect, cfg.maxDialect)
@@ -170,7 +193,7 @@ func TestServerConfigDefaults(t *testing.T) {
 }
 
 func TestServerConfigOverrides(t *testing.T) {
-	cfg, _ := mustParse(t, strings.Replace(minimalConfig, "  user: alice\n", "  user: Alice\n  domain: CORP\n", 1)+`
+	cfg, _ := mustParse(t, strings.Replace(minimalConfig, "  users:\n    alice:\n", "  domain: CORP\n  users:\n    Alice:\n", 1)+`
 server:
   listen: 127.0.0.1:1445
   min_dialect: "3.0"
@@ -291,13 +314,21 @@ func TestConfigCredentials(t *testing.T) {
 
 func TestConfigLocalLogin(t *testing.T) {
 	// Guest- or anonymous-only access needs no user.
-	cfg, _ := mustParse(t, strings.Replace(minimalConfig, "  user: alice\n  password: pw\n", "  allow_guest: true\n", 1))
-	if cfg.localUser != "" || !cfg.allowGuest {
-		t.Errorf("guest-only: user=%q allowGuest=%t", cfg.localUser, cfg.allowGuest)
+	cfg, _ := mustParse(t, strings.Replace(minimalConfig, "  users:\n    alice:\n      password: pw\n", "  allow_guest: true\n", 1))
+	if len(cfg.localUsers) != 0 || !cfg.allowGuest {
+		t.Errorf("guest-only: users=%v allowGuest=%t", cfg.localUserNames(), cfg.allowGuest)
 	}
-	cfg, _ = mustParse(t, strings.Replace(minimalConfig, "  user: alice\n", "  user: alice\n  domain: CORP\n", 1))
+	cfg, _ = mustParse(t, strings.Replace(minimalConfig, "  users:\n", "  domain: CORP\n  users:\n", 1))
 	if cfg.localDomain != "CORP" {
 		t.Errorf("local domain = %q, want CORP", cfg.localDomain)
+	}
+	// Several users, each with its own credential, all accepted by the
+	// authenticator under lower-cased names.
+	cfg, _ = mustParse(t, strings.Replace(minimalConfig, "      password: pw\n",
+		"      password: pw\n    Bob:\n      password_hash: 8846f7eaee8fb117ad06bdd830b7586c\n", 1))
+	auth := cfg.authenticator()
+	if len(auth.Accounts) != 2 || auth.Accounts["alice"] == nil || auth.Accounts["bob"] == nil {
+		t.Errorf("authenticator accounts = %v, want alice and bob", auth.Accounts)
 	}
 }
 
@@ -327,14 +358,29 @@ func TestConfigErrors(t *testing.T) {
 		{"durable timeout zero", minimalConfig + "server:\n  durable_handles:\n    timeout: 0\n", "must be positive"},
 		{"zero max_connections", minimalConfig + "server:\n  max_connections: 0\n", "-1 for no limit"},
 		{"negative client timeout", minimalConfig + "server:\n  timeouts:\n    write: -1s\n", "server: timeouts"},
-		{"required signing with guest", replace("  password: pw\n", "  password: pw\n  allow_guest: true\n") +
+		{"required signing with guest", replace("      password: pw\n", "      password: pw\n  allow_guest: true\n") +
 			"server:\n  signing: required\n", "cannot provide"},
-		{"required encryption with anonymous", replace("  password: pw\n", "  password: pw\n  allow_anonymous: true\n") +
+		{"required encryption with anonymous", replace("      password: pw\n", "      password: pw\n  allow_anonymous: true\n") +
 			"server:\n  encryption: required\n", "cannot provide"},
 		{"share encrypt without server encryption", minimalConfig + "    encrypt: true\nserver:\n  encryption: off\n", "encrypt needs"},
-		{"no local login", without("  user: alice\n  password: pw\n"), "no way for clients to log in"},
-		{"local credential without user", without("  user: alice\n"), "no user"},
-		{"local user without credential", without("  password: pw\n"), "exactly one of"},
+		{"no local login", without("  users:\n    alice:\n      password: pw\n"), "no way for clients to log in"},
+		{"old single-user keys", replace("  users:\n    alice:\n      password: pw\n", "  user: alice\n  password: pw\n"),
+			"field user is not a known setting under local"},
+		{"domain without users", replace("  users:\n    alice:\n      password: pw\n", "  domain: CORP\n  allow_guest: true\n"),
+			"domain is set but no users"},
+		{"user without credential", without("      password: pw\n"), "alice: set exactly one of"},
+		{"misspelled user key", replace("      password: pw\n", "      pasword: pw\n"), "field pasword is not a known setting for a user"},
+		{"users differing in case", replace("      password: pw\n", "      password: pw\n    ALICE:\n      password: x\n"), "same user"},
+		{"user name starting with @", replace("    alice:\n", "    \"@alice\":\n"), "cannot start with"},
+		{"user name with a forbidden character", replace("    alice:\n", "    \"al/ice\":\n"), "does not allow"},
+		{"group with unknown member", replace("targets:\n", "  groups:\n    g: [alice, nobody]\ntargets:\n"), `member "nobody" is not defined`},
+		{"nested group", replace("targets:\n", "  groups:\n    g: [\"@h\"]\ntargets:\n"), "cannot contain groups"},
+		{"reserved group name", replace("targets:\n", "  groups:\n    Guests: [alice]\ntargets:\n"), "reserved"},
+		{"group named like a user", replace("targets:\n", "  groups:\n    ALICE: [alice]\ntargets:\n"), "same name as user"},
+		{"groups differing in case", replace("targets:\n", "  groups:\n    g: [alice]\n    G: [alice]\ntargets:\n"), "same group"},
+		{"group written with @", replace("targets:\n", "  groups:\n    \"@g\": [alice]\ntargets:\n"), "without @"},
+		{"read_access unknown user", minimalConfig + "    read_access: [bob]\n", `"bob" is not a user`},
+		{"read_access unknown group", minimalConfig + "    read_access: [\"@finance\"]\n", `"@finance" is not a group`},
 		{"two credentials", replace("    password: secret", "    password: secret\n    password_hash: 8846f7eaee8fb117ad06bdd830b7586c"), "exactly one of"},
 		{"bad hash", replace("    password: secret", "    password_hash: xyz"), "32 hex"},
 		{"bad lm half", replace("    password: secret", "    password_hash: zz:8846f7eaee8fb117ad06bdd830b7586c"), "LM half"},
