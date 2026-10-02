@@ -57,6 +57,31 @@ func TestParseMappingCredential(t *testing.T) {
 	}
 }
 
+func TestParseMappingSharePath(t *testing.T) {
+	cases := []struct {
+		name               string
+		field              string // the remote-share field
+		wantShare, wantSub string
+	}{
+		{"share root", "C$", "C$", ""},
+		{"inner path", "C$\\Users\\Public", "C$", "Users\\Public"},
+		{"trailing backslash trimmed", "share\\sub\\", "share", "sub"},
+		{"single inner component", "D$\\data", "D$", "data"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m, err := parseMapping("local:10.0.0.5:" + c.field + ":user:CORP:pw")
+			if err != nil {
+				t.Fatalf("parseMapping: %v", err)
+			}
+			if m.remoteShare != c.wantShare || m.remoteSub != c.wantSub {
+				t.Errorf("remoteShare/remoteSub = %q/%q, want %q/%q",
+					m.remoteShare, m.remoteSub, c.wantShare, c.wantSub)
+			}
+		})
+	}
+}
+
 func TestParseMappingErrors(t *testing.T) {
 	cases := []struct {
 		name string
@@ -65,6 +90,7 @@ func TestParseMappingErrors(t *testing.T) {
 		{"too few fields", "share:10.0.0.5:C$:Administrator:CORP"},
 		{"empty host", "share::C$:Administrator:CORP:8846f7eaee8fb117ad06bdd830b7586c"},
 		{"empty credential", "share:10.0.0.5:C$:Administrator:CORP:"},
+		{"empty share name before inner path", "share:10.0.0.5:\\Users:Administrator:CORP:pw"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

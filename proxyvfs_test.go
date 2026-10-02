@@ -86,6 +86,7 @@ type fakeConn struct {
 	treeErr    error
 	listResult []smb.SharedFile
 	listErr    error
+	listDir    string // dir arg of the most recent ListDirectory call
 	opens      []string
 	closed     bool
 }
@@ -102,7 +103,10 @@ func (c *fakeConn) OpenFileExt(tree, filepath string, opts *smb.CreateReqOpts) (
 
 func (c *fakeConn) TreeConnect(string) error { return c.treeErr }
 
-func (c *fakeConn) ListDirectory(_, _, _ string) ([]smb.SharedFile, error) {
+func (c *fakeConn) ListDirectory(_, dir, _ string) ([]smb.SharedFile, error) {
+	c.mu.Lock()
+	c.listDir = dir
+	c.mu.Unlock()
 	return c.listResult, c.listErr
 }
 
@@ -321,6 +325,64 @@ func TestProxyQueryDirectoryRootReconnects(t *testing.T) {
 	entries, status, err := v.QueryDirectory(context.Background(), ph, "*", false)
 	if err != nil || status != 0 || len(entries) != 1 || entries[0].Name != "f" {
 		t.Fatalf("root list after drop = (%d entries, 0x%08x, %v), want 1 entry 'f'", len(entries), status, err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Inner-folder (base) mappings
+// ---------------------------------------------------------------------------
+
+// With a base set, a client path must be opened under base on the target, the
+// synthetic root still represents the client root, and the root listing must
+// enumerate base.
+func TestProxyCreateWithBase(t *testing.T) {
+	ff := &fakeFile{metaVal: fileMeta{endOfFile: 1}}
+	c := &fakeConn{openFn: func(_, _ string, _ *smb.CreateReqOpts) (upstreamFile, error) {
+		return ff, nil
+	}}
+	v := &proxyVFS{up: &upstream{conn: c}, share: "C$", base: "Users\\Public"}
+	ctx := context.Background()
+
+	if _, status, err := v.Create(ctx, nil, server.CreateRequest{Path: "\\sub\\a.txt"}); err != nil || status != 0 {
+		t.Fatalf("Create under base = (0x%08x, %v), want success", status, err)
+	}
+	if c.opens[0] != "Users\\Public\\sub\\a.txt" {
+		t.Errorf("opened %q, want Users\\Public\\sub\\a.txt (base prepended)", c.opens[0])
+	}
+
+	// The client root stays synthetic (no upstream open) even with a base.
+	res, _, _ := v.Create(ctx, nil, server.CreateRequest{Path: "\\"})
+	if ph := res.Handle.(*proxyHandle); !ph.isRoot || ph.file != nil {
+		t.Errorf("root under base = %+v, want synthetic root with nil file", ph)
+	}
+	if len(c.opens) != 1 {
+		t.Errorf("root open hit the upstream (%d opens total), want it served synthetically", len(c.opens))
+	}
+}
+
+func TestProxyQueryDirectoryRootWithBase(t *testing.T) {
+	c := &fakeConn{listResult: []smb.SharedFile{{Name: "f"}}}
+	v := &proxyVFS{up: &upstream{conn: c}, share: "C$", base: "Users\\Public"}
+	ph := &proxyHandle{isRoot: true, isDir: true}
+
+	if _, status, err := v.QueryDirectory(context.Background(), ph, "*", false); err != nil || status != 0 {
+		t.Fatalf("root list with base = (0x%08x, %v), want success", status, err)
+	}
+	if c.listDir != "Users\\Public" {
+		t.Errorf("ListDirectory dir = %q, want the base Users\\Public", c.listDir)
+	}
+}
+
+func TestProxyCreateRejectsTraversal(t *testing.T) {
+	c := &fakeConn{openFn: func(_, _ string, _ *smb.CreateReqOpts) (upstreamFile, error) {
+		t.Fatal("upstream opened despite a traversal path")
+		return nil, nil
+	}}
+	v := &proxyVFS{up: &upstream{conn: c}, share: "C$", base: "Users\\Public"}
+
+	_, status, err := v.Create(context.Background(), nil, server.CreateRequest{Path: "\\..\\..\\Windows"})
+	if err != nil || status != smb.StatusAccessDenied {
+		t.Errorf("Create with .. = (0x%08x, %v), want StatusAccessDenied", status, err)
 	}
 }
 

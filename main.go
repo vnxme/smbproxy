@@ -41,6 +41,10 @@
 // the process argument list, and can be combined with -map:
 //   sudo ./smbproxy -mapfile /etc/smbproxy.maps
 //
+// Usage (map a local share to a subfolder of the target share, not its root):
+//   sudo ./smbproxy \
+//     -map "pub:10.0.0.5:C$\Users\Public:Administrator:CORP:S3cretP@ss"
+//
 // The credential field is the secret used to reach that target. It accepts a
 // plaintext password (the usual case), "pass:<password>" to force password
 // mode when the password is itself 32 hex characters, a 32-character NTLM hash,
@@ -130,6 +134,8 @@ func main() {
 	var maps multiFlag
 	flag.Var(&maps, "map",
 		"share mapping: local_share:host:remote_share:user:domain:credential\n"+
+			"\t  remote_share may include an inner path, e.g. C$\\Users\\Public, to map\n"+
+			"\t               the local share to a subfolder instead of the share root\n"+
 			"\t  credential = a password, pass:<password> to force password mode\n"+
 			"\t               (use pass: for a password that is itself 32 hex chars),\n"+
 			"\t               a 32-hex-char NTLM hash, or an lmhash:nthash pair\n"+
@@ -271,15 +277,19 @@ func main() {
 	// ---- Register each proxied share ----
 	for _, m := range mappings {
 		up := upstreams[m.key()]
-		vfs := &proxyVFS{up: up, share: m.remoteShare}
+		vfs := &proxyVFS{up: up, share: m.remoteShare, base: m.remoteSub}
 		srv.RegisterShare(m.localShare, server.Share{
 			Name:          m.localShare,
 			Type:          smb.ShareTypeDisk,
 			VFS:           vfs,
 			MaximalAccess: 0x001f01ff,
 		})
-		log.Printf("[+] share \\\\<host>\\%s  →  \\\\%s\\%s  (as %s\\%s)",
-			m.localShare, m.remoteHost, m.remoteShare, m.domain, m.user)
+		sub := ""
+		if m.remoteSub != "" {
+			sub = "\\" + m.remoteSub
+		}
+		log.Printf("[+] share \\\\<host>\\%s  →  \\\\%s\\%s%s  (as %s\\%s)",
+			m.localShare, m.remoteHost, m.remoteShare, sub, m.domain, m.user)
 	}
 
 	// ---- Wire srvsvc so Explorer can enumerate shares at \\host level ----

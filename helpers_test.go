@@ -81,6 +81,39 @@ func TestRemotePath(t *testing.T) {
 	}
 }
 
+func TestJoinRemote(t *testing.T) {
+	cases := []struct{ base, rel, want string }{
+		{"", "", ""},
+		{"", "a\\b", "a\\b"},
+		{"Users\\Public", "", "Users\\Public"},
+		{"Users\\Public", "sub\\f.txt", "Users\\Public\\sub\\f.txt"},
+	}
+	for _, c := range cases {
+		if got := joinRemote(c.base, c.rel); got != c.want {
+			t.Errorf("joinRemote(%q, %q) = %q, want %q", c.base, c.rel, got, c.want)
+		}
+	}
+}
+
+func TestHasDotDot(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"", false},
+		{"dir\\file.txt", false},
+		{"..", true},
+		{"..\\..\\Windows", true},
+		{"dir\\..\\other", true},
+		{"dir\\..hidden\\file", false}, // "..hidden" is not a traversal component
+	}
+	for _, c := range cases {
+		if got := hasDotDot(c.in); got != c.want {
+			t.Errorf("hasDotDot(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
 func TestErrToStatus(t *testing.T) {
 	denied := smb.StatusMap[smb.StatusAccessDenied]
 	cases := []struct {

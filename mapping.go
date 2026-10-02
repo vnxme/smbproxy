@@ -28,9 +28,26 @@ type mapping struct {
 	localShare  string // name exposed to clients (e.g. "corp_c")
 	remoteHost  string // target IP or hostname
 	remoteShare string // share on the target (e.g. "C$")
+	remoteSub   string // optional inner directory within the share (empty = share root)
 	user        string
 	domain      string
 	ntHex       string // normalized 32-char NTLM hash (lowercase)
+}
+
+// splitSharePath separates the remote-share field into the SMB share name and
+// an optional inner directory, split on the first backslash:
+//
+//	"C$"               → ("C$", "")
+//	"C$\Users\Public"  → ("C$", "Users\Public")
+//
+// This lets a local share map to a subfolder of the target share rather than
+// its root. Surrounding backslashes on the subpath are trimmed; SMB share names
+// contain no backslash, so the first one always begins the subpath.
+func splitSharePath(s string) (share, sub string) {
+	if i := strings.IndexByte(s, '\\'); i >= 0 {
+		return s[:i], strings.Trim(s[i+1:], "\\")
+	}
+	return s, ""
 }
 
 // isNTHash reports whether s is exactly 32 hexadecimal characters — i.e. a
@@ -45,6 +62,10 @@ func isNTHash(s string) bool {
 
 // parseMapping parses one -map value: local:host:share:user:domain:credential
 // SplitN with n=6 keeps any colon inside the credential field intact.
+//
+// The share field may carry an inner directory after the share name, e.g.
+// "C$\Users\Public", which maps the local share to that subfolder of the target
+// share instead of its root (see splitSharePath).
 //
 // The credential is the secret used to reach that target, interpreted as:
 //   - "pass:<password>"   → explicit password (everything after the first
@@ -93,10 +114,16 @@ func parseMapping(s string) (mapping, error) {
 		}
 	}
 
+	rshare, rsub := splitSharePath(parts[2])
+	if rshare == "" {
+		return mapping{}, fmt.Errorf("-map remote share name is empty in %q", s)
+	}
+
 	return mapping{
 		localShare:  parts[0],
 		remoteHost:  parts[1],
-		remoteShare: parts[2],
+		remoteShare: rshare,
+		remoteSub:   rsub,
 		user:        parts[3],
 		domain:      parts[4],
 		ntHex:       ntHex,

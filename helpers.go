@@ -44,6 +44,32 @@ func smbBase(p string) string {
 
 func remotePath(p string) string { return strings.TrimLeft(p, "\\") }
 
+// joinRemote joins a mapping's inner base directory with a client-relative path
+// (both already stripped of surrounding backslashes) into one share-relative
+// remote path. Either part may be empty.
+func joinRemote(base, rel string) string {
+	switch {
+	case base == "":
+		return rel
+	case rel == "":
+		return base
+	default:
+		return base + "\\" + rel
+	}
+}
+
+// hasDotDot reports whether any component of a backslash-separated path is "..".
+// It is used to reject attempts to traverse above a mapping's inner base
+// directory, keeping that directory a boundary rather than just a start point.
+func hasDotDot(p string) bool {
+	for _, part := range strings.Split(p, "\\") {
+		if part == ".." {
+			return true
+		}
+	}
+	return false
+}
+
 func errToStatus(err error) uint32 {
 	if err == nil {
 		return 0

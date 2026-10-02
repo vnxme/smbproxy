@@ -53,7 +53,8 @@ func (h *proxyHandle) IsDir() bool                    { return h.isDir }
 
 type proxyVFS struct {
 	up    *upstream // shared across all VFS instances on the same connection
-	share string
+	share string    // target SMB share (e.g. "C$")
+	base  string    // inner directory within the share this local share maps to (empty = root)
 }
 
 func openDirOpts() *smb.CreateReqOpts {
@@ -132,11 +133,18 @@ func (v *proxyVFS) Create(_ context.Context, _ *server.Session, req server.Creat
 		}
 	}()
 
-	remote := remotePath(req.Path)
-	if remote == "" {
+	rel := remotePath(req.Path)
+	if rel == "" {
+		// The client's root is synthetic; its contents are the mapping's base
+		// directory, listed by QueryDirectory.
 		h := syntheticRootHandle(v.share)
 		return server.CreateResult{Handle: h, CreateAction: smb.FileOpened, Info: h.info}, 0, nil
 	}
+	if hasDotDot(rel) {
+		// Keep the mapping's base directory a boundary: no traversal above it.
+		return server.CreateResult{}, smb.StatusAccessDenied, nil
+	}
+	remote := joinRemote(v.base, rel)
 
 	wantsDir := (req.CreateOptions&smb.FileDirectoryFile) != 0 ||
 		(req.FileAttributes&smb.FileAttrDirectory) != 0
@@ -417,7 +425,7 @@ func (v *proxyVFS) QueryDirectory(_ context.Context, h server.Handle, pattern st
 					return tcErr
 				}
 				var e error
-				raw, e = c.ListDirectory(v.share, "", pattern)
+				raw, e = c.ListDirectory(v.share, v.base, pattern)
 				return e
 			})
 		} else {
