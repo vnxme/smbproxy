@@ -53,7 +53,7 @@ func (h *proxyHandle) IsDir() bool                    { return h.isDir }
 
 type proxyVFS struct {
 	up    *upstream // shared across all VFS instances on the same connection
-	share string    // target SMB share (e.g. "C$")
+	share string    // target SMB share (e.g. "C$", or a Samba share like "data")
 	base  string    // inner directory within the share this local share maps to (empty = root)
 }
 

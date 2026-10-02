@@ -41,9 +41,12 @@
 // the process argument list, and can be combined with -map:
 //   sudo ./smbproxy -mapfile /etc/smbproxy.maps
 //
-// Usage (map a local share to a subfolder of the target share, not its root):
+// Usage (map a local share to a subfolder of the target share, not its root;
+// forward or back slashes both work, which is handy on non-Windows hosts and
+// for Samba targets):
 //   sudo ./smbproxy \
-//     -map "pub:10.0.0.5:C$\Users\Public:Administrator:CORP:S3cretP@ss"
+//     -map "pub:10.0.0.5:C$/Users/Public:Administrator:CORP:S3cretP@ss" \
+//     -map "proj:10.0.0.7:data/projects/2024:alice:WORKGROUP:S3cretP@ss"
 //
 // The credential field is the secret used to reach that target. It accepts a
 // plaintext password (the usual case), "pass:<password>" to force password
@@ -134,8 +137,9 @@ func main() {
 	var maps multiFlag
 	flag.Var(&maps, "map",
 		"share mapping: local_share:host:remote_share:user:domain:credential\n"+
-			"\t  remote_share may include an inner path, e.g. C$\\Users\\Public, to map\n"+
-			"\t               the local share to a subfolder instead of the share root\n"+
+			"\t  remote_share may include an inner path (either slash works), e.g.\n"+
+			"\t               C$\\Users\\Public or data/projects, to map the local share\n"+
+			"\t               to a subfolder instead of the share root\n"+
 			"\t  credential = a password, pass:<password> to force password mode\n"+
 			"\t               (use pass: for a password that is itself 32 hex chars),\n"+
 			"\t               a 32-hex-char NTLM hash, or an lmhash:nthash pair\n"+

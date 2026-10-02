@@ -67,6 +67,9 @@ func TestParseMappingSharePath(t *testing.T) {
 		{"inner path", "C$\\Users\\Public", "C$", "Users\\Public"},
 		{"trailing backslash trimmed", "share\\sub\\", "share", "sub"},
 		{"single inner component", "D$\\data", "D$", "data"},
+		{"forward slashes", "data/projects/2024", "data", "projects\\2024"},
+		{"mixed slashes", "C$/Users\\Public", "C$", "Users\\Public"},
+		{"trailing forward slash trimmed", "media/clips/", "media", "clips"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

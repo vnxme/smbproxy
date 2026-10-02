@@ -27,7 +27,7 @@ func (f *multiFlag) Set(s string) error { *f = append(*f, s); return nil }
 type mapping struct {
 	localShare  string // name exposed to clients (e.g. "corp_c")
 	remoteHost  string // target IP or hostname
-	remoteShare string // share on the target (e.g. "C$")
+	remoteShare string // share on the target (e.g. "C$", or a Samba share like "data")
 	remoteSub   string // optional inner directory within the share (empty = share root)
 	user        string
 	domain      string
@@ -35,15 +35,19 @@ type mapping struct {
 }
 
 // splitSharePath separates the remote-share field into the SMB share name and
-// an optional inner directory, split on the first backslash:
+// an optional inner directory, split on the first path separator. Forward and
+// back slashes are both accepted (so slash-style paths work on any platform);
+// the returned subpath uses backslashes:
 //
 //	"C$"               → ("C$", "")
 //	"C$\Users\Public"  → ("C$", "Users\Public")
+//	"data/projects"    → ("data", "projects")
 //
 // This lets a local share map to a subfolder of the target share rather than
-// its root. Surrounding backslashes on the subpath are trimmed; SMB share names
-// contain no backslash, so the first one always begins the subpath.
+// its root. Surrounding separators on the subpath are trimmed; SMB share names
+// contain no separator, so the first one always begins the subpath.
 func splitSharePath(s string) (share, sub string) {
+	s = normSlashes(s)
 	if i := strings.IndexByte(s, '\\'); i >= 0 {
 		return s[:i], strings.Trim(s[i+1:], "\\")
 	}
@@ -64,8 +68,9 @@ func isNTHash(s string) bool {
 // SplitN with n=6 keeps any colon inside the credential field intact.
 //
 // The share field may carry an inner directory after the share name, e.g.
-// "C$\Users\Public", which maps the local share to that subfolder of the target
-// share instead of its root (see splitSharePath).
+// "C$\Users\Public" or "data/projects" (either slash works), which maps the
+// local share to that subfolder of the target share instead of its root (see
+// splitSharePath).
 //
 // The credential is the secret used to reach that target, interpreted as:
 //   - "pass:<password>"   → explicit password (everything after the first

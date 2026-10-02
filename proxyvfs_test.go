@@ -360,6 +360,23 @@ func TestProxyCreateWithBase(t *testing.T) {
 	}
 }
 
+// A client path written with forward slashes must be normalized to backslashes
+// before being joined onto the base and sent upstream.
+func TestProxyCreateNormalizesClientSlashes(t *testing.T) {
+	ff := &fakeFile{metaVal: fileMeta{endOfFile: 1}}
+	c := &fakeConn{openFn: func(_, _ string, _ *smb.CreateReqOpts) (upstreamFile, error) {
+		return ff, nil
+	}}
+	v := &proxyVFS{up: &upstream{conn: c}, share: "data", base: "Users\\Public"}
+
+	if _, status, err := v.Create(context.Background(), nil, server.CreateRequest{Path: "/sub/a.txt"}); err != nil || status != 0 {
+		t.Fatalf("Create with slash path = (0x%08x, %v), want success", status, err)
+	}
+	if c.opens[0] != "Users\\Public\\sub\\a.txt" {
+		t.Errorf("opened %q, want Users\\Public\\sub\\a.txt (slashes normalized, base prepended)", c.opens[0])
+	}
+}
+
 func TestProxyQueryDirectoryRootWithBase(t *testing.T) {
 	c := &fakeConn{listResult: []smb.SharedFile{{Name: "f"}}}
 	v := &proxyVFS{up: &upstream{conn: c}, share: "C$", base: "Users\\Public"}

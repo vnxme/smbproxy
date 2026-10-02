@@ -42,7 +42,15 @@ func smbBase(p string) string {
 	return p
 }
 
-func remotePath(p string) string { return strings.TrimLeft(p, "\\") }
+// normSlashes converts forward slashes to the SMB path separator (backslash),
+// so paths written either way — by non-Windows clients or in config — behave
+// the same. '/' is not a legal character in an SMB file name, so this never
+// alters a real name.
+func normSlashes(p string) string { return strings.ReplaceAll(p, "/", "\\") }
+
+// remotePath converts a client path to a share-relative remote path: slashes are
+// normalized to backslashes and leading separators are trimmed.
+func remotePath(p string) string { return strings.TrimLeft(normSlashes(p), "\\") }
 
 // joinRemote joins a mapping's inner base directory with a client-relative path
 // (both already stripped of surrounding backslashes) into one share-relative

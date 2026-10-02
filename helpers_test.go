@@ -73,6 +73,9 @@ func TestRemotePath(t *testing.T) {
 		{"\\", ""},
 		{"\\\\dir\\file", "dir\\file"},
 		{"dir\\file\\", "dir\\file\\"},
+		{"/", ""},                           // leading forward slash trimmed
+		{"/dir/file", "dir\\file"},          // forward slashes normalized
+		{"dir/sub\\file", "dir\\sub\\file"}, // mixed slashes
 	}
 	for _, c := range cases {
 		if got := remotePath(c.in); got != c.want {
