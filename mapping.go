@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/jfjallid/go-smb/ntlmssp"
 )
@@ -83,21 +84,25 @@ func isNTHash(s string) bool {
 // Passwords are converted to their NT hash via NTOWFv1 up front, so the rest
 // of the proxy (dedup keying, openUpstream) only ever handles a 32-char NT
 // hash; every credential form is equivalent from the target's point of view.
+//
+// Errors never quote s: it holds the credential. Callers show redactMapping(s).
 func parseMapping(s string) (mapping, error) {
 	parts := strings.SplitN(s, ":", 6)
 	if len(parts) != 6 {
 		return mapping{}, fmt.Errorf(
-			"-map value must be local_share:host:share:user:domain:credential, got %q", s)
+			"-map value must be local_share:host:share:user:domain:credential (6 fields), got %d", len(parts))
 	}
 	for i, p := range parts[:5] {
 		if p == "" {
-			return mapping{}, fmt.Errorf(
-				"-map field %d is empty in %q", i, s)
+			return mapping{}, fmt.Errorf("-map %s field is empty", mapFieldNames[i])
 		}
+	}
+	if err := checkLocalShareName(parts[0]); err != nil {
+		return mapping{}, err
 	}
 	cred := parts[5]
 	if cred == "" {
-		return mapping{}, fmt.Errorf("-map credential field is empty in %q", s)
+		return mapping{}, fmt.Errorf("-map credential field is empty")
 	}
 
 	var ntHex string
@@ -121,7 +126,7 @@ func parseMapping(s string) (mapping, error) {
 
 	rshare, rsub := splitSharePath(parts[2])
 	if rshare == "" {
-		return mapping{}, fmt.Errorf("-map remote share name is empty in %q", s)
+		return mapping{}, fmt.Errorf("-map remote share name is empty")
 	}
 
 	return mapping{
@@ -133,6 +138,66 @@ func parseMapping(s string) (mapping, error) {
 		domain:      parts[4],
 		ntHex:       ntHex,
 	}, nil
+}
+
+// mapFieldNames names the -map fields before the credential, for errors.
+var mapFieldNames = [5]string{"local_share", "host", "share", "user", "domain"}
+
+// redactMapping returns a -map value fit for logs and error messages: the
+// credential (sixth field) is masked. A malformed value keeps only its first
+// field, the local share name, since a misplaced credential could be in any
+// of the rest.
+func redactMapping(s string) string {
+	parts := strings.SplitN(s, ":", 6)
+	switch len(parts) {
+	case 6:
+		return strings.Join(parts[:5], ":") + ":***"
+	case 1:
+		return "***"
+	}
+	return parts[0] + ":***"
+}
+
+// maxShareNameLen is the longest share name Windows accepts (NNLEN).
+const maxShareNameLen = 80
+
+// shareNameInvalidChars are the characters Windows forbids in a share name.
+const shareNameInvalidChars = `"/\[]:|<>+=;,*?`
+
+// checkLocalShareName rejects a local share name clients could not connect to:
+// one too long, containing a character Windows forbids, or IPC$, which the
+// proxy registers itself for its RPC pipes.
+func checkLocalShareName(name string) error {
+	if strings.EqualFold(name, "IPC$") {
+		return fmt.Errorf("local share name %q is reserved for the proxy's IPC$ share", name)
+	}
+	if n := utf8.RuneCountInString(name); n > maxShareNameLen {
+		return fmt.Errorf("local share name %q is %d characters long; Windows allows at most %d",
+			name, n, maxShareNameLen)
+	}
+	for _, r := range name {
+		if r < 0x20 || strings.ContainsRune(shareNameInvalidChars, r) {
+			return fmt.Errorf("local share name %q contains %q, which Windows does not allow (nor any of %s)",
+				name, r, shareNameInvalidChars)
+		}
+	}
+	return nil
+}
+
+// readPassFile reads the local password from the first line of the file given
+// by -local-pass-file, so it stays out of the process argument list. Only the
+// line ending is stripped, since a password may begin or end with spaces.
+func readPassFile(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	line, _, _ := strings.Cut(string(data), "\n")
+	line = strings.TrimSuffix(line, "\r")
+	if line == "" {
+		return "", fmt.Errorf("the first line is empty")
+	}
+	return line, nil
 }
 
 // readMapFile reads map-formatted lines from a file supplied via -mapfile.

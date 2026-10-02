@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/jfjallid/go-smb/ntlmssp"
@@ -94,6 +95,11 @@ func TestParseMappingErrors(t *testing.T) {
 		{"empty host", "share::C$:Administrator:CORP:8846f7eaee8fb117ad06bdd830b7586c"},
 		{"empty credential", "share:10.0.0.5:C$:Administrator:CORP:"},
 		{"empty share name before inner path", "share:10.0.0.5:\\Users:Administrator:CORP:pw"},
+		{"reserved IPC$", "IPC$:10.0.0.5:C$:Administrator:CORP:pw"},
+		{"reserved ipc$, any case", "ipc$:10.0.0.5:C$:Administrator:CORP:pw"},
+		{"forbidden character", "my*share:10.0.0.5:C$:Administrator:CORP:pw"},
+		{"control character", "my\tshare:10.0.0.5:C$:Administrator:CORP:pw"},
+		{"name too long", strings.Repeat("s", maxShareNameLen+1) + ":10.0.0.5:C$:Administrator:CORP:pw"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -101,6 +107,73 @@ func TestParseMappingErrors(t *testing.T) {
 				t.Errorf("parseMapping(%q) = nil error, want error", tc.raw)
 			}
 		})
+	}
+}
+
+// Errors from parseMapping are logged, so they must never echo the
+// credential, wherever a malformed value puts it.
+func TestParseMappingErrorsHideCredential(t *testing.T) {
+	const secret = "S3cretP@ss"
+	for _, raw := range []string{
+		"share:10.0.0.5:C$:Administrator:" + secret,           // domain missing
+		"share::C$:Administrator:CORP:" + secret,              // empty host
+		"share:10.0.0.5:\\Users:Administrator:CORP:" + secret, // empty share name
+		"IPC$:10.0.0.5:C$:Administrator:CORP:" + secret,       // reserved name
+	} {
+		_, err := parseMapping(raw)
+		if err == nil {
+			t.Fatalf("parseMapping(%q) = nil error, want error", raw)
+		}
+		if strings.Contains(err.Error(), secret) {
+			t.Errorf("error for %q reveals the credential: %v", raw, err)
+		}
+	}
+}
+
+func TestRedactMapping(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"share:10.0.0.5:C$:Administrator:CORP:S3cret:with:colons", "share:10.0.0.5:C$:Administrator:CORP:***"},
+		{"share:10.0.0.5:C$:Administrator:S3cret", "share:***"},
+		{"share:S3cret", "share:***"},
+		{"S3cret", "***"},
+	}
+	for _, c := range cases {
+		if got := redactMapping(c.in); got != c.want {
+			t.Errorf("redactMapping(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestCheckLocalShareName(t *testing.T) {
+	for _, ok := range []string{"corp_c", "Data-2024", "hidden$", "имя", strings.Repeat("s", maxShareNameLen)} {
+		if err := checkLocalShareName(ok); err != nil {
+			t.Errorf("checkLocalShareName(%q) = %v, want nil", ok, err)
+		}
+	}
+}
+
+func TestReadPassFile(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, content string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	// Only the line ending is stripped: surrounding spaces belong to the password.
+	if got, err := readPassFile(write("crlf", " pa ss \r\nignored\r\n")); err != nil || got != " pa ss " {
+		t.Errorf("CRLF file = (%q, %v), want (\" pa ss \", nil)", got, err)
+	}
+	if got, err := readPassFile(write("bare", "secret")); err != nil || got != "secret" {
+		t.Errorf("file without newline = (%q, %v), want (\"secret\", nil)", got, err)
+	}
+	if _, err := readPassFile(write("empty", "\nsecret\n")); err == nil {
+		t.Error("empty first line accepted, want error")
+	}
+	if _, err := readPassFile(filepath.Join(dir, "missing")); err == nil {
+		t.Error("missing file accepted, want error")
 	}
 }
 

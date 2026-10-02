@@ -17,7 +17,8 @@
 // Architecture:
 //   SMB client → [local SMB server (this tool), upstream auth] → target(s)
 //
-// Clients connect using the proxy's own -local-user / -local-pass. Each mapping
+// Clients connect using the proxy's own -local-user / -local-pass (or
+// -local-pass-file, which keeps the password off the command line). Each mapping
 // carries the credentials used to reach its own target, so one proxy can front
 // shares that require different accounts. Mappings that share the same
 // (host, user, domain, credential) tuple reuse a single upstream SMB
@@ -90,6 +91,12 @@ import (
 	"github.com/jfjallid/golog"
 )
 
+// readOnlyAccess is the maximal access advertised for proxied shares:
+// FILE_GENERIC_READ | FILE_GENERIC_EXECUTE. The proxy refuses every write, so
+// advertising full control (the go-smb default) only led Explorer to offer
+// edits that then failed.
+const readOnlyAccess = 0x001200a9
+
 // connectFailureHint returns the guidance printed under an upstream connect
 // failure, tailored to the kind of error: a TCP-level failure points at
 // reachability (SMB off / wrong host or port / firewall), anything else at
@@ -155,6 +162,9 @@ func main() {
 	listen := flag.String("l", "0.0.0.0:445", "local listen addr:port (port 445 needs root/CAP_NET_BIND_SERVICE)")
 	localUser := flag.String("local-user", "guest", "username clients authenticate with")
 	localPass := flag.String("local-pass", "guest", "password clients authenticate with")
+	localPassFile := flag.String("local-pass-file", "",
+		"read the password clients authenticate with from the first line of this file,\n"+
+			"\tkeeping it out of the process argument list (instead of -local-pass)")
 	allowGuest := flag.Bool("allow-guest", false, "accept any failed/unknown logon as a guest session (lets Explorer browse \\\\host, which first tries the username \"guest\")")
 	allowAnon := flag.Bool("allow-anonymous", false, "accept null (anonymous) sessions; like -allow-guest, this exposes every\n"+
 		"\tproxied share (read-only) to clients that never present the local credentials")
@@ -178,6 +188,20 @@ func main() {
 	maxDialectID, ok := dialectByName[*maxDialect]
 	if !ok {
 		log.Fatalf("[!] invalid -max-dialect %q: use one of 2.1, 3.0, 3.0.2, 3.1.1", *maxDialect)
+	}
+
+	// ---- Local login ----
+	passSet := false
+	flag.Visit(func(f *flag.Flag) { passSet = passSet || f.Name == "local-pass" })
+	pass := *localPass
+	if *localPassFile != "" {
+		if passSet {
+			log.Fatal("[!] use either -local-pass or -local-pass-file, not both")
+		}
+		var err error
+		if pass, err = readPassFile(*localPassFile); err != nil {
+			log.Fatalf("[!] -local-pass-file %q: %v", *localPassFile, err)
+		}
 	}
 
 	// Verbose go-smb logging. Every go-smb package registers its own named
@@ -219,16 +243,19 @@ func main() {
 
 	// ---- Parse and validate all mappings ----
 	mappings := make([]mapping, 0, len(rawMaps))
-	seen := map[string]bool{}
+	seen := map[string]string{} // lower-cased name -> name as first given
 	for _, raw := range rawMaps {
 		m, err := parseMapping(raw)
 		if err != nil {
-			log.Fatalf("[!] invalid mapping %q: %v", raw, err)
+			log.Fatalf("[!] invalid mapping %q: %v", redactMapping(raw), err)
 		}
-		if seen[m.localShare] {
-			log.Fatalf("[!] duplicate local share name %q", m.localShare)
+		// SMB share names are case-insensitive, so "Data" and "data" collide.
+		key := strings.ToLower(m.localShare)
+		if first, dup := seen[key]; dup {
+			log.Fatalf("[!] duplicate local share name %q (share names are case-insensitive; %q is already mapped)",
+				m.localShare, first)
 		}
-		seen[m.localShare] = true
+		seen[key] = m.localShare
 		mappings = append(mappings, m)
 	}
 
@@ -265,7 +292,7 @@ func main() {
 	// ---- Build the local server ----
 	auth := &server.MapAuthenticator{
 		Accounts: map[string]*server.Account{
-			strings.ToLower(*localUser): {NTHash: ntlmssp.Ntowfv1(*localPass)},
+			strings.ToLower(*localUser): {NTHash: ntlmssp.Ntowfv1(pass)},
 		},
 	}
 
@@ -302,7 +329,7 @@ func main() {
 			Name:          m.localShare,
 			Type:          smb.ShareTypeDisk,
 			VFS:           vfs,
-			MaximalAccess: 0x001f01ff,
+			MaximalAccess: readOnlyAccess,
 		})
 		sub := ""
 		if m.remoteSub != "" {
@@ -330,7 +357,11 @@ func main() {
 	}
 
 	log.Printf("[*] listening on %s", *listen)
-	log.Printf("[*] local credentials: user=%s  pass=%s", *localUser, *localPass)
+	log.Printf("[*] local login: user=%s", *localUser)
+	if strings.EqualFold(*localUser, "guest") && pass == "guest" {
+		log.Printf("[!] clients log in with the default guest/guest, which anyone can guess;" +
+			" set -local-user and -local-pass (or -local-pass-file) to restrict access")
+	}
 	log.Printf("[*] dialect range: 2.1 .. %s  allow-guest=%t  allow-anonymous=%t", *maxDialect, *allowGuest, *allowAnon)
 	log.Printf("[*] browse \\\\<this-host>  or connect directly to \\\\<this-host>\\<share>")
 
