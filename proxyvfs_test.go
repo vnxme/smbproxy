@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"testing"
@@ -24,7 +25,9 @@ type fakeFile struct {
 	data    []byte           // backing bytes served by ReadFile
 	readErr error            // if set, ReadFile returns (0, readErr)
 	reads   int              // ReadFile call count
-	dirs    []smb.SharedFile // entries QueryDirectory returns (once)
+	dirs    []smb.SharedFile // entries the directory enumeration yields
+	dirPage int              // entries per QueryDirectory batch (0 = all in one)
+	dirPos  int              // enumeration cursor into dirs
 	dirErr  error            // if set, QueryDirectory returns it
 	dirCall int              // QueryDirectory call count
 	secData []byte           // security descriptor QuerySecurity returns
@@ -53,12 +56,20 @@ func (f *fakeFile) QueryDirectory(_ string, flags byte, _ uint32, _ uint32) ([]s
 	defer f.mu.Unlock()
 	f.dirCall++
 	if flags&smb.RestartScans != 0 {
-		f.dirCall = 1
+		f.dirPos = 0
 	}
 	if f.dirErr != nil {
 		return nil, f.dirErr
 	}
-	return f.dirs, nil
+	// Like a real target: each call yields the next batch, and an exhausted
+	// enumeration yields nothing until restarted.
+	end := len(f.dirs)
+	if f.dirPage > 0 {
+		end = min(f.dirPos+f.dirPage, end)
+	}
+	batch := f.dirs[f.dirPos:end]
+	f.dirPos = end
+	return batch, nil
 }
 
 func (f *fakeFile) CloseFile() error {
@@ -136,12 +147,7 @@ func newVFS(c *fakeConn) *proxyVFS {
 // drainPrefetch blocks until any in-flight prefetch goroutine has finished, so
 // a test can mutate the fake without racing it.
 func drainPrefetch(ph *proxyHandle) {
-	ph.prefMu.Lock()
-	done := ph.prefDone
-	ph.prefMu.Unlock()
-	if done != nil {
-		<-done
-	}
+	ph.prefWG.Wait()
 }
 
 // ---------------------------------------------------------------------------
@@ -503,6 +509,42 @@ func TestProxyReadPrefetchData(t *testing.T) {
 	drainPrefetch(ph)
 }
 
+// After a seek away from the queued read-ahead, the stale prefetch is replaced
+// by one following the new position, so sequential reads from there are
+// prefetched again rather than all falling through to synchronous fetches.
+func TestProxyReadPrefetchFollowsSeek(t *testing.T) {
+	data := make([]byte, 3*readAheadSize)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	ff := &fakeFile{data: data}
+	v := newVFS(&fakeConn{})
+	ph := &proxyHandle{file: ff}
+	ctx := context.Background()
+	buf := make([]byte, 4096)
+
+	// Sequential start: the cache holds [0, R) and a prefetch is queued at R.
+	if _, status, _ := v.Read(ctx, ph, 0, buf); status != smb.StatusOk {
+		t.Fatalf("first read status 0x%08x", status)
+	}
+	drainPrefetch(ph)
+
+	// Seek past both the cache and the queued prefetch.
+	seek := int64(2 * readAheadSize)
+	n, status, _ := v.Read(ctx, ph, seek, buf)
+	if status != smb.StatusOk || n != len(buf) || !bytes.Equal(buf, data[seek:seek+int64(n)]) {
+		t.Fatalf("seek read = (%d, 0x%08x), want (%d, Ok) with matching bytes", n, status, len(buf))
+	}
+	drainPrefetch(ph)
+
+	ph.prefMu.Lock()
+	p := ph.pref
+	ph.prefMu.Unlock()
+	if want := seek + readAheadSize; p == nil || p.off != want {
+		t.Fatalf("queued prefetch = %+v, want one at offset %d", p, want)
+	}
+}
+
 // A cached region must be served without touching the upstream again.
 func TestProxyReadServesFromCache(t *testing.T) {
 	data := []byte("0123456789")
@@ -591,17 +633,46 @@ func TestProxyQueryDirectoryFile(t *testing.T) {
 	if entries, status, _ := v.QueryDirectory(ctx, ph, "*", false); status != smb.StatusNoMoreFiles || entries != nil {
 		t.Errorf("exhausted list = (%v, 0x%08x), want (nil, StatusNoMoreFiles)", entries, status)
 	}
-	if ff.dirCall != 1 {
-		t.Errorf("upstream QueryDirectory called %d times, want 1 (second served from cache)", ff.dirCall)
+	// One batch, then the empty batch that ends the enumeration; the second
+	// client call is served from the handle without touching the upstream.
+	if ff.dirCall != 2 {
+		t.Errorf("upstream QueryDirectory called %d times, want 2", ff.dirCall)
 	}
 
-	// A restart re-queries the upstream.
-	if _, _, err := v.QueryDirectory(ctx, ph, "*", true); err != nil {
-		t.Fatalf("restart list: %v", err)
+	// A restart re-lists from the beginning.
+	entries, _, err = v.QueryDirectory(ctx, ph, "*", true)
+	if err != nil || len(entries) != 1 || entries[0].Name != "x" {
+		t.Fatalf("restart list = (%d entries, %v), want 1 entry 'x'", len(entries), err)
 	}
-	if ff.dirCall != 1 {
-		// RestartScans resets the fake's counter to 1 on that call.
-		t.Errorf("restart dirCall = %d, want 1", ff.dirCall)
+}
+
+// A directory larger than one upstream batch is listed in full, not truncated
+// to the first batch.
+func TestProxyQueryDirectoryAllBatches(t *testing.T) {
+	dirs := make([]smb.SharedFile, 25)
+	for i := range dirs {
+		dirs[i] = smb.SharedFile{Name: fmt.Sprintf("f%02d", i)}
+	}
+	ff := &fakeFile{isDir: true, dirs: dirs, dirPage: 10}
+	v := newVFS(&fakeConn{})
+	ph := &proxyHandle{file: ff, isDir: true, path: "\big"}
+	ctx := context.Background()
+
+	entries, status, err := v.QueryDirectory(ctx, ph, "*", false)
+	if err != nil || status != 0 || len(entries) != len(dirs) {
+		t.Fatalf("list = (%d entries, 0x%08x, %v), want %d entries", len(entries), status, err, len(dirs))
+	}
+	for i, e := range entries {
+		if e.Name != dirs[i].Name {
+			t.Fatalf("entry %d = %q, want %q", i, e.Name, dirs[i].Name)
+		}
+	}
+
+	// A new pattern without restart still lists everything: the exhausted
+	// upstream enumeration is restarted, not resumed.
+	entries, _, _ = v.QueryDirectory(ctx, ph, "f*", false)
+	if len(entries) != len(dirs) {
+		t.Errorf("re-list under new pattern = %d entries, want %d", len(entries), len(dirs))
 	}
 }
 
@@ -650,9 +721,9 @@ func TestProxyClose(t *testing.T) {
 	ff.mu.Lock()
 	closed := ff.closed
 	ff.mu.Unlock()
-	if !closed || ph.file != nil || ph.cacheData != nil || ph.prefDone != nil {
+	if !closed || ph.file != nil || ph.cacheData != nil || ph.pref != nil {
 		t.Errorf("after Close: fileClosed=%v file=%v cache=%v pref=%v, want closed and all cleared",
-			closed, ph.file, ph.cacheData, ph.prefDone)
+			closed, ph.file, ph.cacheData, ph.pref)
 	}
 }
 

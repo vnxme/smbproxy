@@ -154,6 +154,8 @@ func main() {
 	localUser := flag.String("local-user", "guest", "username clients authenticate with")
 	localPass := flag.String("local-pass", "guest", "password clients authenticate with")
 	allowGuest := flag.Bool("allow-guest", false, "accept any failed/unknown logon as a guest session (lets Explorer browse \\\\host, which first tries the username \"guest\")")
+	allowAnon := flag.Bool("allow-anonymous", false, "accept null (anonymous) sessions; like -allow-guest, this exposes every\n"+
+		"\tproxied share (read-only) to clients that never present the local credentials")
 	maxDialect := flag.String("max-dialect", "3.1.1", "highest SMB dialect to offer clients: 2.1, 3.0, 3.0.2 or 3.1.1 (min stays 2.1; 3.x uses AES-CMAC signing that Windows prefers over 2.1's HMAC-SHA256)")
 	idleTimeout := flag.Duration("idle-timeout", 5*time.Minute,
 		"close an upstream connection after this period with no open handles and no\n"+
@@ -257,7 +259,7 @@ func main() {
 		MinDialect:     smb.DialectSmb_2_1,
 		MaxDialect:     maxDialectID,
 		Authenticator:  auth,
-		AllowAnonymous: true,
+		AllowAnonymous: *allowAnon,
 		AllowGuest:     *allowGuest,
 		MaxReadSize:    readAheadSize,
 	}
@@ -309,7 +311,7 @@ func main() {
 
 	log.Printf("[*] listening on %s", *listen)
 	log.Printf("[*] local credentials: user=%s  pass=%s", *localUser, *localPass)
-	log.Printf("[*] dialect range: 2.1 .. %s  allow-guest=%t", *maxDialect, *allowGuest)
+	log.Printf("[*] dialect range: 2.1 .. %s  allow-guest=%t  allow-anonymous=%t", *maxDialect, *allowGuest, *allowAnon)
 	log.Printf("[*] browse \\\\<this-host>  or connect directly to \\\\<this-host>\\<share>")
 
 	// ---- Graceful shutdown ----

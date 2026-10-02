@@ -30,17 +30,26 @@ type proxyHandle struct {
 	cacheOff  int64
 	cacheData []byte
 
-	prefMu   sync.Mutex
-	prefOff  int64
-	prefData []byte
-	prefErr  error
-	prefDone chan struct{}
+	prefMu sync.Mutex
+	pref   *prefetch      // the current read-ahead; nil when none is queued
+	prefWG sync.WaitGroup // every prefetch goroutine, including discarded ones
 
 	mu          sync.Mutex
 	entries     []server.DirEntry
 	pos         int
 	listed      bool
 	lastPattern string
+}
+
+// prefetch is one background read-ahead of up to readAheadSize bytes at off.
+// Its goroutine sets data and err before closing done, so they are safe to
+// read once done is closed. Each prefetch owns its result, so a stale one can
+// be discarded while still running without clobbering its replacement.
+type prefetch struct {
+	off  int64
+	done chan struct{}
+	data []byte
+	err  error
 }
 
 func (h *proxyHandle) Stat() (server.FileInfo, error) { return h.info, nil }
@@ -196,16 +205,11 @@ func (v *proxyVFS) Close(_ context.Context, h server.Handle) (err error) {
 	ph.cacheMu.Unlock()
 
 	ph.prefMu.Lock()
-	done := ph.prefDone
+	ph.pref = nil
 	ph.prefMu.Unlock()
-	if done != nil {
-		<-done
-	}
-	ph.prefMu.Lock()
-	ph.prefData = nil
-	ph.prefDone = nil
-	ph.prefOff = -1
-	ph.prefMu.Unlock()
+	// Wait out every read-ahead, including discarded ones still running, so
+	// none touches the upstream file after it is closed below.
+	ph.prefWG.Wait()
 
 	if file != nil {
 		func() {
@@ -269,16 +273,11 @@ func (v *proxyVFS) Read(_ context.Context, h server.Handle, offset int64, buf []
 
 	// ---- tier 2: prefetch hit ----
 	ph.prefMu.Lock()
-	if ph.prefDone != nil && ph.prefOff == offset {
-		done := ph.prefDone
+	if p := ph.pref; p != nil && p.off == offset {
+		ph.pref = nil
 		ph.prefMu.Unlock()
-		<-done
-		ph.prefMu.Lock()
-		data, pErr := ph.prefData, ph.prefErr
-		ph.prefData = nil
-		ph.prefOff = -1
-		ph.prefDone = nil
-		ph.prefMu.Unlock()
+		<-p.done
+		data, pErr := p.data, p.err
 
 		isEOF := errors.Is(pErr, io.EOF) ||
 			errors.Is(pErr, smb.StatusMap[smb.StatusEndOfFile])
@@ -338,26 +337,30 @@ func (v *proxyVFS) Read(_ context.Context, h server.Handle, offset int64, buf []
 	return serve, smb.StatusOk, nil
 }
 
+// startPrefetch queues a background read-ahead at off. A read-ahead already
+// queued for off is kept; one for any other offset is stale (the client has
+// moved elsewhere in the file) and is replaced, so a seek does not leave
+// read-ahead stuck on a region that will never be read.
+//
+// The caller must hold ph.fileMu.RLock with ph.file non-nil. The goroutine is
+// handed the file rather than taking fileMu itself: a pending Close's Lock
+// would block that RLock while Read, holding its own RLock, waits for the
+// prefetch to finish — a deadlock.
 func (v *proxyVFS) startPrefetch(ph *proxyHandle, off int64) {
 	ph.prefMu.Lock()
-	if ph.prefDone != nil {
+	if ph.pref != nil && ph.pref.off == off {
 		ph.prefMu.Unlock()
 		return
 	}
-	ch := make(chan struct{})
-	ph.prefDone = ch
-	ph.prefOff = off
+	p := &prefetch{off: off, done: make(chan struct{})}
+	ph.pref = p
+	file := ph.file
+	ph.prefWG.Add(1)
 	ph.prefMu.Unlock()
 
 	go func() {
-		defer close(ch)
-
-		ph.fileMu.RLock()
-		file := ph.file
-		ph.fileMu.RUnlock()
-		if file == nil {
-			return
-		}
+		defer ph.prefWG.Done()
+		defer close(p.done)
 
 		upBuf := make([]byte, readAheadSize)
 		totalN := 0
@@ -383,12 +386,10 @@ func (v *proxyVFS) startPrefetch(ph *proxyHandle, off int64) {
 		}
 		v.up.mu.Unlock()
 
-		ph.prefMu.Lock()
 		if totalN > 0 {
-			ph.prefData = upBuf[:totalN]
+			p.data = upBuf[:totalN]
 		}
-		ph.prefErr = fetchErr
-		ph.prefMu.Unlock()
+		p.err = fetchErr
 	}()
 }
 
@@ -432,14 +433,10 @@ func (v *proxyVFS) QueryDirectory(_ context.Context, h server.Handle, pattern st
 			if ph.file == nil {
 				return nil, smb.StatusFileClosed, nil
 			}
-			var flags byte
-			if restart {
-				flags = smb.RestartScans
-			}
 			func() {
 				v.up.mu.Lock()
 				defer v.up.mu.Unlock()
-				raw, err = ph.file.QueryDirectory(pattern, flags, 0, 65536)
+				raw, err = queryDirAll(ph.file, pattern)
 			}()
 		}
 
@@ -464,6 +461,34 @@ func (v *proxyVFS) QueryDirectory(_ context.Context, h server.Handle, pattern st
 	result := ph.entries[ph.pos:]
 	ph.pos = len(ph.entries)
 	return result, 0, nil
+}
+
+// queryDirAll lists every entry of the open directory f matching pattern. One
+// upstream QUERY_DIRECTORY returns only as many entries as fit its output
+// buffer, so it keeps asking until the target reports no more files. The first
+// request always restarts the scan: a handle that was listed before (or under
+// another pattern) has an exhausted upstream enumeration that would otherwise
+// yield nothing.
+func queryDirAll(f upstreamFile, pattern string) ([]smb.SharedFile, error) {
+	var all []smb.SharedFile
+	flags := smb.RestartScans
+	for {
+		batch, err := f.QueryDirectory(pattern, flags, 0, 65536)
+		if errors.Is(err, smb.StatusMap[smb.StatusNoMoreFiles]) && len(all) > 0 {
+			return all, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if len(batch) == 0 {
+			if len(all) == 0 {
+				return nil, smb.StatusMap[smb.StatusNoMoreFiles]
+			}
+			return all, nil
+		}
+		all = append(all, batch...)
+		flags = 0
+	}
 }
 
 // QueryFileInfo returns StatusNotSupported on purpose: the library then
