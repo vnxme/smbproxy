@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -846,5 +847,200 @@ func TestProxyQuerySecurityFallbacks(t *testing.T) {
 	buf, status, err := v.QuerySecurity(context.Background(), ph, 0)
 	if err != nil || status != smb.StatusNotSupported || buf != nil {
 		t.Errorf("QuerySecurity upstream error = (%x, 0x%08x, %v), want (nil, StatusNotSupported, nil)", buf, status, err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// QueryFileInfo classes answered by the proxy, and synthetic file IDs
+// ---------------------------------------------------------------------------
+
+// openFile opens path through v, backed by ff, and returns its handle.
+func openFile(t *testing.T, v *proxyVFS, path string) *proxyHandle {
+	t.Helper()
+	res, status, err := v.Create(context.Background(), nil, server.CreateRequest{Path: path})
+	if err != nil || status != 0 {
+		t.Fatalf("Create %q: status=0x%08x err=%v", path, status, err)
+	}
+	return res.Handle.(*proxyHandle)
+}
+
+func TestProxyQueryFileInfoInternal(t *testing.T) {
+	ff := &fakeFile{metaVal: fileMeta{endOfFile: 10}}
+	c := &fakeConn{openFn: func(_, _ string, _ *smb.CreateReqOpts) (upstreamFile, error) { return ff, nil }}
+	v := newVFS(c)
+	ctx := context.Background()
+
+	idOf := func(ph *proxyHandle) uint64 {
+		t.Helper()
+		out, status, err := v.QueryFileInfo(ctx, ph, smb.FileInternalInformation)
+		buf, _ := out.([]byte)
+		if err != nil || status != smb.StatusOk || len(buf) != 8 {
+			t.Fatalf("FileInternalInformation = (%v, 0x%08x, %v), want 8 bytes, Ok", out, status, err)
+		}
+		return binary.LittleEndian.Uint64(buf)
+	}
+
+	a := idOf(openFile(t, v, "\\dir\\a.txt"))
+	if a == 0 {
+		t.Fatal("file ID is 0, want nonzero")
+	}
+	if again := idOf(openFile(t, v, "/DIR/A.TXT")); again != a {
+		t.Errorf("same file under another case/slash style: ID %x, want %x", again, a)
+	}
+	if b := idOf(openFile(t, v, "\\dir\\b.txt")); b == a {
+		t.Errorf("different files share ID %x", a)
+	}
+	if root := idOf(openFile(t, v, "\\")); root != v.fileID("") || root == a {
+		t.Errorf("root ID = %x, want fileID(\"\") = %x, distinct from a file's", root, v.fileID(""))
+	}
+}
+
+// A file's ID in a directory listing matches the one its open handle reports,
+// and "." / ".." resolve to the directory and its parent.
+func TestProxyQueryDirectoryFileIDs(t *testing.T) {
+	ff := &fakeFile{isDir: true, dirs: []smb.SharedFile{{Name: "."}, {Name: ".."}, {Name: "a.txt"}}}
+	c := &fakeConn{openFn: func(_, _ string, _ *smb.CreateReqOpts) (upstreamFile, error) { return ff, nil }}
+	v := newVFS(c)
+
+	dir := openFile(t, v, "\\top\\dir")
+	entries, status, err := v.QueryDirectory(context.Background(), dir, "*", false)
+	if err != nil || status != 0 || len(entries) != 3 {
+		t.Fatalf("list = (%d entries, 0x%08x, %v), want 3", len(entries), status, err)
+	}
+	want := map[string]uint64{
+		".":     v.fileID("top\\dir"),
+		"..":    v.fileID("top"),
+		"a.txt": v.fileID("top\\dir\\a.txt"),
+	}
+	for _, e := range entries {
+		if e.FileID != want[e.Name] {
+			t.Errorf("entry %q FileID = %x, want %x", e.Name, e.FileID, want[e.Name])
+		}
+	}
+	if got := openFile(t, v, "\\top\\dir\\a.txt").info.FileID; got != want["a.txt"] {
+		t.Errorf("handle FileID = %x, listing FileID = %x; want equal", got, want["a.txt"])
+	}
+}
+
+func TestProxyQueryFileInfoStreams(t *testing.T) {
+	v := newVFS(&fakeConn{})
+	ctx := context.Background()
+
+	file := &proxyHandle{info: server.FileInfo{Size: 1000, AllocationSize: 4096}}
+	out, status, err := v.QueryFileInfo(ctx, file, smb.FileStreamInformation)
+	buf, _ := out.([]byte)
+	if err != nil || status != smb.StatusOk {
+		t.Fatalf("file streams = (0x%08x, %v), want Ok", status, err)
+	}
+	name := "::$DATA"
+	if len(buf) != 24+2*len(name) {
+		t.Fatalf("stream info is %d bytes, want %d", len(buf), 24+2*len(name))
+	}
+	le := binary.LittleEndian
+	if next, nameLen := le.Uint32(buf[0:]), le.Uint32(buf[4:]); next != 0 || nameLen != uint32(2*len(name)) {
+		t.Errorf("NextEntryOffset/StreamNameLength = %d/%d, want 0/%d", next, nameLen, 2*len(name))
+	}
+	if size, alloc := le.Uint64(buf[8:]), le.Uint64(buf[16:]); size != 1000 || alloc != 4096 {
+		t.Errorf("StreamSize/AllocationSize = %d/%d, want 1000/4096", size, alloc)
+	}
+	for i, r := range name {
+		if got := le.Uint16(buf[24+2*i:]); got != uint16(r) {
+			t.Fatalf("stream name char %d = %q, want %q", i, rune(got), r)
+		}
+	}
+
+	dir := &proxyHandle{isDir: true}
+	out, status, _ = v.QueryFileInfo(ctx, dir, smb.FileStreamInformation)
+	if b, _ := out.([]byte); status != smb.StatusOk || len(b) != 0 {
+		t.Errorf("dir streams = (%d bytes, 0x%08x), want (0 bytes, Ok)", len(b), status)
+	}
+}
+
+func TestProxyQueryFSInfo(t *testing.T) {
+	v := newVFS(&fakeConn{})
+	le := binary.LittleEndian
+	query := func(class byte, size int) []byte {
+		t.Helper()
+		out, status, err := v.QueryFSInfo(context.Background(), class)
+		buf, _ := out.([]byte)
+		if err != nil || status != smb.StatusOk || len(buf) != size {
+			t.Fatalf("class 0x%02x = (%d bytes, 0x%08x, %v), want (%d bytes, Ok)", class, len(buf), status, err, size)
+		}
+		return buf
+	}
+
+	if dev := query(fsDeviceInformation, 8); le.Uint32(dev[0:]) != 7 {
+		t.Errorf("DeviceType = %d, want FILE_DEVICE_DISK (7)", le.Uint32(dev[0:]))
+	}
+	full := query(fsFullSizeInformation, 32)
+	if le.Uint64(full[0:]) != fsTotalUnits || le.Uint64(full[8:]) != fsFreeUnits ||
+		le.Uint32(full[24:]) != fsSectorsPerUnit || le.Uint32(full[28:]) != fsBytesPerSector {
+		t.Errorf("full size info = % x, want total/free/sectors/bytes %d/%d/%d/%d",
+			full, fsTotalUnits, fsFreeUnits, fsSectorsPerUnit, fsBytesPerSector)
+	}
+	// The volume object ID is the BirthVolumeId in every file's object ID.
+	if obj := query(fsObjectIDInformation, 64); !bytes.Equal(obj[0:16], v.objectID("x")[16:32]) {
+		t.Errorf("volume ObjectId = %x, want the files' BirthVolumeId %x", obj[0:16], v.objectID("x")[16:32])
+	}
+	if sec := query(fsSectorSizeInformation, 28); le.Uint32(sec[0:]) != fsBytesPerSector {
+		t.Errorf("LogicalBytesPerSector = %d, want %d", le.Uint32(sec[0:]), fsBytesPerSector)
+	}
+
+	// Volume info must fit the 24-byte buffer GetFileInformationByHandle
+	// passes: the 18-byte fixed part, an empty label, a per-share serial.
+	vol := query(fsVolumeInformation, 18)
+	if le.Uint32(vol[12:]) != 0 {
+		t.Errorf("VolumeLabelLength = %d, want 0", le.Uint32(vol[12:]))
+	}
+	if !bytes.Equal(vol[8:12], v.objectID("")[16:20]) || bytes.Equal(vol[8:12], make([]byte, 4)) {
+		t.Errorf("VolumeSerialNumber = %x, want the nonzero per-share volume ID prefix", vol[8:12])
+	}
+	other := &proxyVFS{up: &upstream{conn: &fakeConn{}}, share: "D$"}
+	if otherVol, _, _ := other.QueryFSInfo(context.Background(), fsVolumeInformation); bytes.Equal(otherVol.([]byte)[8:12], vol[8:12]) {
+		t.Errorf("shares C$ and D$ report the same volume serial %x", vol[8:12])
+	}
+
+	// Classes go-smb serializes safely itself are left to its fallback.
+	if _, status, _ := v.QueryFSInfo(context.Background(), 0x03); status != smb.StatusNotSupported {
+		t.Errorf("size info (0x03) = 0x%08x, want StatusNotSupported (library fallback)", status)
+	}
+}
+
+func TestProxyIoctlObjectID(t *testing.T) {
+	v := newVFS(&fakeConn{})
+	ctx := context.Background()
+	objID := func(path string, code, maxOut uint32) ([]byte, uint32) {
+		t.Helper()
+		out, status, err := v.Ioctl(ctx, &proxyHandle{path: path}, code, nil, maxOut)
+		if err != nil {
+			t.Fatalf("Ioctl 0x%08x: %v", code, err)
+		}
+		return out, status
+	}
+
+	a, status := objID("dir\\a.txt", fsctlCreateOrGetObjectID, 64)
+	if status != smb.StatusOk || len(a) != 64 {
+		t.Fatalf("CREATE_OR_GET_OBJECT_ID = (%d bytes, 0x%08x), want (64, Ok)", len(a), status)
+	}
+	if !bytes.Equal(a[0:16], a[32:48]) || bytes.Equal(a[0:16], make([]byte, 16)) {
+		t.Errorf("ObjectId %x / BirthObjectId %x: want equal and nonzero", a[0:16], a[32:48])
+	}
+	if !bytes.Equal(a[48:64], make([]byte, 16)) {
+		t.Errorf("DomainId = %x, want zero", a[48:64])
+	}
+
+	if same, _ := objID("DIR/A.TXT", fsctlGetObjectID, 64); !bytes.Equal(same, a) {
+		t.Errorf("same file via GET_OBJECT_ID under another case/slash style: %x, want %x", same, a)
+	}
+	b, _ := objID("dir\\b.txt", fsctlCreateOrGetObjectID, 64)
+	if bytes.Equal(b[0:16], a[0:16]) {
+		t.Errorf("different files share ObjectId %x", a[0:16])
+	}
+	if !bytes.Equal(b[16:32], a[16:32]) {
+		t.Errorf("files on one share have BirthVolumeId %x and %x, want equal", a[16:32], b[16:32])
+	}
+
+	if _, status := objID("dir\\a.txt", fsctlCreateOrGetObjectID, 16); status != smb.StatusBufferTooSmall {
+		t.Errorf("maxOut 16 -> 0x%08x, want StatusBufferTooSmall", status)
 	}
 }

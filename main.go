@@ -66,6 +66,7 @@
 //   noopvfs.go   — the no-op VFS registered for IPC$
 //   tracevfs.go  — the -debug wrapper logging every VFS call and its result
 //   rpcpipe.go   — the srvsvc DCE/RPC pipe wrapper and BindAck fixup
+//   srvsvc.go    — the srvsvc service: the library's plus NetrShareGetInfo
 //   main.go      — flag wiring and server startup (this file)
 
 package main
@@ -301,9 +302,11 @@ func main() {
 
 	// ---- Wire srvsvc so Explorer can enumerate shares at \\host level ----
 	// The library's srvsvc.Service answers NetShareEnumAll (opnum 15), which is
-	// all Explorer calls to list shares. rpcPipe adds the WRITE/READ transport
-	// and the BindAck fixup the Windows client needs (see its doc).
-	svc := &srvsvc.Service{Shares: srvsvc.FromConfig(cfg)}
+	// all Explorer calls to list shares; shareService adds NetrShareGetInfo
+	// (opnum 16), queried when a file is opened in an application. rpcPipe adds
+	// the WRITE/READ transport and the BindAck fixup the Windows client needs
+	// (see its doc).
+	svc := &shareService{&srvsvc.Service{Shares: srvsvc.FromConfig(cfg)}}
 	cfg.PipeOpener = &server.MapPipeOpener{
 		Pipes: map[string]func(*server.Session) (server.PipeBackend, error){
 			"srvsvc": func(_ *server.Session) (server.PipeBackend, error) {

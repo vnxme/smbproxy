@@ -2,12 +2,16 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
+	"hash/fnv"
 	"io"
 	"log"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
 
 	"github.com/jfjallid/go-smb/smb"
 	"github.com/jfjallid/go-smb/smb/server"
@@ -147,6 +151,7 @@ func (v *proxyVFS) Create(_ context.Context, _ *server.Session, req server.Creat
 		// The client's root is synthetic; its contents are the mapping's base
 		// directory, listed by QueryDirectory.
 		h := syntheticRootHandle(v.share)
+		h.info.FileID = v.fileID("")
 		return server.CreateResult{Handle: h, CreateAction: smb.FileOpened, Info: h.info}, 0, nil
 	}
 	if hasDotDot(rel) {
@@ -184,6 +189,7 @@ func (v *proxyVFS) Create(_ context.Context, _ *server.Session, req server.Creat
 	// reaper cannot close it mid-use; Close drops the pin.
 	v.up.hold()
 	h := handleFromFile(req, upFile, v.share)
+	h.info.FileID = v.fileID(rel)
 	return server.CreateResult{Handle: h, CreateAction: smb.FileOpened, Info: h.info}, 0, nil
 }
 
@@ -473,9 +479,11 @@ func (v *proxyVFS) QueryDirectory(_ context.Context, h server.Handle, pattern st
 			return nil, errToStatus(err), nil
 		}
 
+		dirRel := remotePath(ph.path)
 		converted := make([]server.DirEntry, len(raw))
 		for i, sf := range raw {
 			converted[i] = sharedFileToDirEntry(sf)
+			converted[i].FileID = v.fileID(entryRel(dirRel, sf.Name))
 		}
 		ph.entries, ph.pos, ph.listed, ph.lastPattern = converted, 0, true, pattern
 	}
@@ -516,22 +524,153 @@ func queryDirAll(f upstreamFile, pattern string) ([]smb.SharedFile, error) {
 	}
 }
 
-// QueryFileInfo returns StatusNotSupported on purpose: the library then
+// QueryFileInfo mostly returns StatusNotSupported on purpose: the library then
 // serializes the info class from the handle's Stat() snapshot, which already
 // holds the target's real metadata (size, attributes, all four timestamps)
 // captured when the file was opened. go-smb exposes no raw per-class file-info
 // query to forward, and the snapshot is current for Explorer's Properties,
-// which opens a fresh handle before querying — so this is already served from
-// upstream data; there is nothing further to proxy here.
-func (v *proxyVFS) QueryFileInfo(_ context.Context, _ server.Handle, _ byte) (any, uint32, error) {
+// which opens a fresh handle before querying.
+//
+// It answers, from the same snapshot, the classes Windows clients need that
+// the library's fallback cannot serialize:
+//   - FileInternalInformation (the file ID), which Win32
+//     GetFileInformationByHandle queries; applications such as Notepad fail
+//     to open a file when it is unsupported.
+//   - FileStreamInformation: a file's single unnamed data stream. Alternate
+//     data streams are not enumerated, though they can still be opened by name.
+func (v *proxyVFS) QueryFileInfo(_ context.Context, h server.Handle, class byte) (any, uint32, error) {
+	switch class {
+	case smb.FileInternalInformation:
+		info, _ := h.Stat()
+		buf := make([]byte, 8)
+		binary.LittleEndian.PutUint64(buf, info.FileID)
+		return buf, smb.StatusOk, nil
+	case smb.FileStreamInformation:
+		if h.IsDir() {
+			return []byte{}, smb.StatusOk, nil // a directory has no unnamed data stream
+		}
+		info, _ := h.Stat()
+		return streamInfo(info), smb.StatusOk, nil
+	}
 	return nil, smb.StatusNotSupported, nil
+}
+
+// streamInfo serializes a FILE_STREAM_INFORMATION list (MS-FSCC 2.4.43)
+// holding the file's unnamed data stream, "::$DATA".
+func streamInfo(info server.FileInfo) []byte {
+	name := utf16.Encode([]rune("::$DATA"))
+	buf := make([]byte, 24+2*len(name))
+	// NextEntryOffset (0 = last entry) stays zero.
+	binary.LittleEndian.PutUint32(buf[4:], uint32(2*len(name)))
+	binary.LittleEndian.PutUint64(buf[8:], uint64(info.Size))
+	binary.LittleEndian.PutUint64(buf[16:], uint64(info.AllocationSize))
+	for i, c := range name {
+		binary.LittleEndian.PutUint16(buf[24+2*i:], c)
+	}
+	return buf
+}
+
+// fileID returns a stable, nonzero ID for the file at the client-relative path
+// rel ("" for the share root), for FileInternalInformation and the FileId of
+// directory entries. go-smb does not expose the target's own file IDs, so it
+// is a hash of the share-relative remote path, case-folded as Windows paths
+// are case-insensitive. The same file thus reports the same ID from every
+// handle and listing, which clients use to tell files apart.
+func (v *proxyVFS) fileID(rel string) uint64 {
+	h := fnv.New64a()
+	h.Write([]byte(strings.ToLower(v.share + "\\" + joinRemote(v.base, rel))))
+	if id := h.Sum64(); id != 0 {
+		return id
+	}
+	return 1
+}
+
+// entryRel returns the client-relative path of the entry named name in the
+// directory at dirRel, resolving the "." and ".." entries to the directory
+// itself and its parent.
+func entryRel(dirRel, name string) string {
+	switch name {
+	case ".":
+		return dirRel
+	case "..":
+		if i := strings.LastIndexByte(dirRel, '\\'); i >= 0 {
+			return dirRel[:i]
+		}
+		return ""
+	}
+	return joinRemote(dirRel, name)
 }
 
 func (v *proxyVFS) SetFileInfo(_ context.Context, _ server.Handle, _ byte, _ []byte) (uint32, error) {
 	return smb.StatusAccessDenied, nil
 }
 
-func (v *proxyVFS) QueryFSInfo(_ context.Context, _ byte) (any, uint32, error) {
+// Filesystem information classes answered by QueryFSInfo (MS-FSCC 2.5).
+const (
+	fsVolumeInformation     = 0x01
+	fsDeviceInformation     = 0x04
+	fsFullSizeInformation   = 0x07
+	fsObjectIDInformation   = 0x08
+	fsSectorSizeInformation = 0x0b
+)
+
+// Synthetic volume geometry. It matches what go-smb's fallback reports for
+// FileFsSizeInformation (0x03), so every size class describes the same volume:
+// 16M units of 8 x 512-byte sectors, half of them free.
+const (
+	fsTotalUnits     = 1 << 24
+	fsFreeUnits      = 1 << 23
+	fsSectorsPerUnit = 8
+	fsBytesPerSector = 512
+)
+
+// QueryFSInfo answers the filesystem classes Windows clients query that
+// go-smb's fallback cannot serialize, or serializes unsafely; the rest (size
+// and attribute information) are left to that fallback. go-smb cannot query
+// the target's volume, so the values are synthetic but self-consistent.
+func (v *proxyVFS) QueryFSInfo(_ context.Context, class byte) (any, uint32, error) {
+	le := binary.LittleEndian
+	switch class {
+	case fsVolumeInformation:
+		// go-smb's fallback appends the share name as the volume label and
+		// never trims a reply to the client's OutputBufferLength, which this
+		// method is not told. Win32 GetFileInformationByHandle asks with a
+		// 24-byte buffer, the bare structure size, and rejects a longer reply,
+		// so Notepad, among others, fails to open any file. With an empty
+		// label the reply is the 18-byte fixed part, which always fits.
+		buf := make([]byte, 18)
+		// VolumeCreationTime stays zero; the serial number is per share, so
+		// two shares never look like one volume.
+		copy(buf[8:12], v.objectID("")[16:20])
+		// VolumeLabelLength 0, SupportsObjects 0 (no label follows).
+		return buf, smb.StatusOk, nil
+	case fsDeviceInformation:
+		buf := make([]byte, 8)
+		le.PutUint32(buf[0:], 0x00000007) // DeviceType: FILE_DEVICE_DISK
+		le.PutUint32(buf[4:], 0x00000020) // Characteristics: FILE_DEVICE_IS_MOUNTED
+		return buf, smb.StatusOk, nil
+	case fsFullSizeInformation:
+		buf := make([]byte, 32)
+		le.PutUint64(buf[0:], fsTotalUnits)
+		le.PutUint64(buf[8:], fsFreeUnits)  // CallerAvailableAllocationUnits
+		le.PutUint64(buf[16:], fsFreeUnits) // ActualAvailableAllocationUnits
+		le.PutUint32(buf[24:], fsSectorsPerUnit)
+		le.PutUint32(buf[28:], fsBytesPerSector)
+		return buf, smb.StatusOk, nil
+	case fsObjectIDInformation:
+		// ObjectId is the volume ID objectID reports as BirthVolumeId;
+		// ExtendedInfo (48 bytes) stays zero.
+		buf := make([]byte, 64)
+		copy(buf, v.objectID("")[16:32])
+		return buf, smb.StatusOk, nil
+	case fsSectorSizeInformation:
+		buf := make([]byte, 28)
+		for i := range 4 { // logical, physical (atomicity, performance), effective
+			le.PutUint32(buf[4*i:], fsBytesPerSector)
+		}
+		le.PutUint32(buf[16:], 0x00000003) // SSINFO_FLAGS_ALIGNED_DEVICE | _PARTITION_ALIGNED_ON_DEVICE
+		return buf, smb.StatusOk, nil
+	}
 	return nil, smb.StatusNotSupported, nil
 }
 
@@ -571,6 +710,43 @@ func (v *proxyVFS) QuerySecurity(_ context.Context, h server.Handle, additionalI
 	return sd, smb.StatusOk, nil
 }
 
-func (v *proxyVFS) Ioctl(_ context.Context, _ server.Handle, _ uint32, _ []byte, _ uint32) ([]byte, uint32, error) {
+// FSCTL codes answered by Ioctl (MS-FSCC 2.3).
+const (
+	fsctlGetObjectID         = 0x0009009c
+	fsctlCreateOrGetObjectID = 0x000900c0
+)
+
+// Ioctl answers the object-ID FSCTLs and refuses the rest. Windows asks for a
+// file's object ID (for distributed link tracking) when the shell hands a
+// file to an application such as Notepad, and the open can fail when it is
+// unsupported. go-smb cannot forward FSCTLs to the target, so, like Samba,
+// the ID is synthesized: stable for a given file and distinct between files.
+func (v *proxyVFS) Ioctl(_ context.Context, h server.Handle, ctlCode uint32, _ []byte, maxOut uint32) ([]byte, uint32, error) {
+	switch ctlCode {
+	case fsctlGetObjectID, fsctlCreateOrGetObjectID:
+		if maxOut < 64 {
+			return nil, smb.StatusBufferTooSmall, nil
+		}
+		return v.objectID(h.Path()), smb.StatusOk, nil
+	}
 	return nil, smb.StatusNotSupported, nil
+}
+
+// objectID serializes a FILE_OBJECTID_BUFFER (MS-FSCC 2.1.3.1) for the file at
+// the client path p: ObjectId and BirthObjectId are a 128-bit hash of the
+// file's location on the target, BirthVolumeId one of the target share, and
+// DomainId is zero.
+func (v *proxyVFS) objectID(p string) []byte {
+	volume := strings.ToLower(v.up.m.remoteHost + "\\" + v.share)
+	file := volume + "\\" + strings.ToLower(joinRemote(v.base, remotePath(p)))
+	sum := func(s string) []byte {
+		h := fnv.New128a()
+		h.Write([]byte(s))
+		return h.Sum(nil)
+	}
+	buf := make([]byte, 64)
+	copy(buf[0:], sum(file))
+	copy(buf[16:], sum(volume))
+	copy(buf[32:], buf[0:16])
+	return buf
 }
