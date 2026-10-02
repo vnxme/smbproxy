@@ -36,7 +36,7 @@ type mapping struct {
 
 // splitSharePath separates the remote-share field into the SMB share name and
 // an optional inner directory, split on the first path separator. Forward and
-// back slashes are both accepted (so slash-style paths work on any platform);
+// backslashes are both accepted (so slash-style paths work on any platform);
 // the returned subpath uses backslashes:
 //
 //	"C$"               → ("C$", "")
@@ -153,7 +153,7 @@ func readMapFile(path string) ([]string, error) {
 // since a password may legitimately contain one.
 func parseMapLines(content string) []string {
 	var out []string
-	for _, line := range strings.Split(content, "\n") {
+	for line := range strings.SplitSeq(content, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue

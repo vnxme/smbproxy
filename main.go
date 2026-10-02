@@ -42,7 +42,7 @@
 //   sudo ./smbproxy -mapfile /etc/smbproxy.maps
 //
 // Usage (map a local share to a subfolder of the target share, not its root;
-// forward or back slashes both work, which is handy on non-Windows hosts and
+// forward or backslashes both work, which is handy on non-Windows hosts and
 // for Samba targets):
 //   sudo ./smbproxy \
 //     -map "pub:10.0.0.5:C$/Users/Public:Administrator:CORP:S3cretP@ss" \
@@ -51,7 +51,7 @@
 // The credential field is the secret used to reach that target. It accepts a
 // plaintext password (the usual case), "pass:<password>" to force password
 // mode when the password is itself 32 hex characters, a 32-character NTLM hash,
-// or an "lmhash:nthash" pair (only the NT half is used). A password is
+// or a "lmhash:nthash" pair (only the NT half is used). A password is
 // converted to its NT hash internally, so every form behaves identically from
 // the target's point of view.
 //
@@ -113,12 +113,8 @@ func connectFailureHint(err error) string {
 // one tick of crossing the threshold.
 func reapUpstreams(upstreams map[connKey]*upstream, idle time.Duration, stop <-chan struct{}) {
 	interval := idle / 2
-	if interval < time.Second {
-		interval = time.Second
-	}
-	if interval > time.Minute {
-		interval = time.Minute
-	}
+	interval = max(interval, time.Second)
+	interval = min(interval, time.Minute)
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {

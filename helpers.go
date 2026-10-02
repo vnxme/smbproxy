@@ -70,7 +70,7 @@ func joinRemote(base, rel string) string {
 // It is used to reject attempts to traverse above a mapping's inner base
 // directory, keeping that directory a boundary rather than just a start point.
 func hasDotDot(p string) bool {
-	for _, part := range strings.Split(p, "\\") {
+	for part := range strings.SplitSeq(p, "\\") {
 		if part == ".." {
 			return true
 		}
