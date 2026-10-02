@@ -1,10 +1,13 @@
 package main
 
 import (
+	"context"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"log"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -27,9 +30,10 @@ import (
 // refs counts open upstream file handles; a connection with live handles is
 // never reaped, since closing it would invalidate those handles mid-use.
 type upstream struct {
-	m    mapping                             // retained so the link can be (re)dialed on demand
-	dial func(mapping) (upstreamConn, error) // injectable for tests; dialConn in production
-	idle time.Duration                       // reap after this much inactivity (0 = never reap)
+	m         mapping                             // retained so the link can be (re)dialed on demand
+	dial      func(mapping) (upstreamConn, error) // injectable for tests; dialConn in production
+	idle      time.Duration                       // reap after this much inactivity (0 = never reap)
+	ioTimeout time.Duration                       // bound on one request on an open file (0 = none)
 
 	mu      sync.Mutex
 	conn    upstreamConn // nil when not currently connected
@@ -37,16 +41,50 @@ type upstream struct {
 	lastUse time.Time    // updated on every operation and handle release
 }
 
-// newUpstream builds a lazily-connected upstream for mapping m. No network
-// connection is made until the first operation; idle bounds how long an unused
-// connection is kept before the reaper closes it.
-func newUpstream(m mapping, idle time.Duration) *upstream {
-	return &upstream{m: m, dial: dialConn, idle: idle}
+// upstreamTimeouts bounds how long the proxy waits on a target. A zero value
+// disables the corresponding limit.
+type upstreamTimeouts struct {
+	idle    time.Duration // close an unused connection after this long
+	connect time.Duration // connect and log in, as a whole
+	io      time.Duration // one read or directory request on an open file
 }
+
+// newUpstream builds a lazily-connected upstream for mapping m. No network
+// connection is made until the first operation; t bounds how long an unused
+// connection is kept, connecting, and each request on an open file.
+func newUpstream(m mapping, t upstreamTimeouts) *upstream {
+	return &upstream{
+		m:         m,
+		dial:      func(m mapping) (upstreamConn, error) { return dialConn(m, t.connect) },
+		idle:      t.idle,
+		ioTimeout: t.io,
+	}
+}
+
+// ioContext returns the context bounding one request on an open file: a
+// deadline of u.ioTimeout, or none when that is zero. go-smb's server never
+// passes a client's cancellation to the VFS, so this limit is what keeps a
+// target that stops answering from holding u.mu, and with it every client of
+// this connection, indefinitely.
+func (u *upstream) ioContext() (context.Context, context.CancelFunc) {
+	if u.ioTimeout <= 0 {
+		return context.Background(), func() {}
+	}
+	return context.WithTimeout(context.Background(), u.ioTimeout)
+}
+
+// connectError marks a failure to establish the upstream connection, as
+// opposed to a failure of an operation on an established one; errToStatus
+// reports the two differently to the client.
+type connectError struct{ err error }
+
+func (e *connectError) Error() string { return e.err.Error() }
+func (e *connectError) Unwrap() error { return e.err }
 
 // ensureConn dials the upstream if it is not currently connected. The caller
 // must hold u.mu. A dial failure is logged (with a cause-specific hint) and
-// returned so it surfaces to the client as the operation's status.
+// returned, as a *connectError, so it surfaces to the client as the
+// operation's status.
 func (u *upstream) ensureConn() error {
 	if u.conn != nil {
 		return nil
@@ -57,7 +95,7 @@ func (u *upstream) ensureConn() error {
 	if err != nil {
 		log.Printf("[!] upstream connect \\\\%s as %s\\%s failed: %v\n%s",
 			u.m.remoteHost, u.m.domain, u.m.user, err, connectFailureHint(err))
-		return err
+		return &connectError{err}
 	}
 	u.conn = c
 	log.Printf("[+] connected to %s as %s\\%s", u.m.remoteHost, u.m.domain, u.m.user)
@@ -172,19 +210,19 @@ func isNetworkError(err error) bool {
 	return errors.As(err, &netErr)
 }
 
-// isTransportErr reports whether err indicates a broken connection rather than
-// a protocol response. The library returns every server NTSTATUS as a sentinel
-// from smb.StatusMap, so anything wrapping one of those means the link is alive
-// and answered; a dead socket surfaces as a plain error ("remote connection
-// has closed", a net error, etc.), which is what we redial on.
+// isTransportErr reports whether err means the upstream connection is no
+// longer usable, so do should redial. An NTSTATUS answer (see ntStatus) means
+// the link is alive, except for the codes reporting that the target dropped
+// this connection's session or tree (see sessionLost), which only a fresh
+// connection cures. Anything else, a dead socket surfacing as a plain error
+// ("remote connection has closed", a net error, a timeout), is a transport
+// failure.
 func isTransportErr(err error) bool {
 	if err == nil {
 		return false
 	}
-	for _, sentinel := range smb.StatusMap {
-		if errors.Is(err, sentinel) {
-			return false
-		}
+	if code, answered := ntStatus(err); answered {
+		return sessionLost(code)
 	}
 	return true
 }
@@ -202,10 +240,12 @@ type upstreamConn interface {
 }
 
 // upstreamFile is the subset of *smb.File the proxy uses. *smb.File satisfies
-// it via the smbFile adapter.
+// it via the smbFile adapter. Reads and directory queries take a context so
+// they can be bounded (see upstream.ioContext); go-smb offers no context-aware
+// variant of the other calls.
 type upstreamFile interface {
-	ReadFile(b []byte, offset uint64) (int, error)
-	QueryDirectory(pattern string, flags byte, fileIndex uint32, bufferSize uint32) ([]smb.SharedFile, error)
+	ReadFile(ctx context.Context, b []byte, offset uint64) (int, error)
+	QueryDirectory(ctx context.Context, pattern string, flags byte, fileIndex uint32, bufferSize uint32) ([]smb.SharedFile, error)
 	// QuerySecurity fetches the file's security descriptor from the target,
 	// requesting the components named in additionalInformation, and returns it
 	// as self-relative wire bytes ready to hand back to the client.
@@ -240,9 +280,18 @@ func (c smbConn) OpenFileExt(tree, filepath string, opts *smb.CreateReqOpts) (up
 	return smbFile{f}, nil
 }
 
-// smbFile adapts *smb.File to upstreamFile. All methods but meta are promoted
-// from the embedded pointer.
+// smbFile adapts *smb.File to upstreamFile. CloseFile and IsDir are promoted
+// from the embedded pointer; ReadFile and QueryDirectory map to the library's
+// context-aware variants.
 type smbFile struct{ *smb.File }
+
+func (f smbFile) ReadFile(ctx context.Context, b []byte, offset uint64) (int, error) {
+	return f.File.ReadFileContext(ctx, b, offset)
+}
+
+func (f smbFile) QueryDirectory(ctx context.Context, pattern string, flags byte, fileIndex, bufferSize uint32) ([]smb.SharedFile, error) {
+	return f.File.QueryDirectoryContext(ctx, pattern, flags, fileIndex, bufferSize)
+}
 
 func (f smbFile) meta() fileMeta {
 	return fileMeta{
@@ -266,16 +315,18 @@ func (f smbFile) QuerySecurity(additionalInformation uint32) ([]byte, error) {
 	return sd.MarshalBinary()
 }
 
-// dialConn opens one authenticated connection to the target in mapping m. It is
-// the production dial func stored on upstream; tests substitute their own.
-func dialConn(m mapping) (upstreamConn, error) {
+// dialConn opens one authenticated connection to the target in mapping m,
+// giving up after timeout (0 = no limit). It is the production dial func
+// stored on upstream; tests substitute their own.
+func dialConn(m mapping, timeout time.Duration) (upstreamConn, error) {
 	hashBytes, err := hex.DecodeString(m.ntHex)
 	if err != nil {
 		return nil, err
 	}
-	conn, err := smb.NewConnection(smb.Options{
-		Host: m.remoteHost,
-		Port: 445,
+	opts := smb.Options{
+		Host:        m.remoteHost,
+		Port:        445,
+		DialTimeout: timeout, // the TCP connect; connectWithin bounds the rest
 		// SMB2Only skips the SMB1 multiprotocol probe, sending a direct SMB2
 		// NEGOTIATE that offers all dialects. The server picks the highest it
 		// supports (typically 3.1.1 on modern Windows), which advertises
@@ -287,11 +338,49 @@ func dialConn(m mapping) (upstreamConn, error) {
 			Domain: m.domain,
 			Hash:   hashBytes,
 		},
-	})
-	if err != nil {
-		return nil, err
 	}
-	return smbConn{conn}, nil
+	return connectWithin(timeout, func() (upstreamConn, error) {
+		conn, err := smb.NewConnection(opts)
+		if err != nil {
+			return nil, err
+		}
+		return smbConn{conn}, nil
+	})
+}
+
+// connectWithin runs connect, giving up after timeout (0 = wait indefinitely).
+// go-smb bounds only the TCP connect (Options.DialTimeout): its negotiation
+// and login take no context, so a target that accepts the connection but
+// never answers would block forever. On timeout connect keeps running in the
+// background, and a connection it still establishes is closed. The timeout
+// error wraps os.ErrDeadlineExceeded, a net.Error, so connectFailureHint
+// reports it as a reachability problem.
+func connectWithin(timeout time.Duration, connect func() (upstreamConn, error)) (upstreamConn, error) {
+	if timeout <= 0 {
+		return connect()
+	}
+	type result struct {
+		conn upstreamConn
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		c, err := connect()
+		done <- result{c, err}
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case r := <-done:
+		return r.conn, r.err
+	case <-timer.C:
+		go func() {
+			if r := <-done; r.conn != nil {
+				r.conn.Close()
+			}
+		}()
+		return nil, fmt.Errorf("no answer within %s: %w", timeout, os.ErrDeadlineExceeded)
+	}
 }
 
 // dialectByName maps the -max-dialect flag value to the go-smb constant.

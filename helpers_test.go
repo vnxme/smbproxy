@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"testing"
@@ -127,7 +128,14 @@ func TestErrToStatus(t *testing.T) {
 		{"nil", nil, smb.StatusOk},
 		{"sentinel", denied, smb.StatusAccessDenied},
 		{"wrapped sentinel", fmt.Errorf("open: %w", denied), smb.StatusAccessDenied},
-		{"unknown error", errors.New("boom"), smb.StatusObjectNameNotFound},
+		{"status error", &smb.NTStatusError{Op: "Create", Status: smb.StatusAccessDenied, Err: denied}, smb.StatusAccessDenied},
+		// A code go-smb has no sentinel for is still passed through exactly.
+		{"unmapped status error", &smb.NTStatusError{Op: "Create", Status: 0xc0000123}, 0xc0000123},
+		{"session lost", smb.StatusMap[smb.StatusUserSessionDeleted], statusUnexpectedNetworkError},
+		{"timeout", fmt.Errorf("read: %w", context.DeadlineExceeded), statusIoTimeout},
+		{"connect refused", &connectError{errors.New("connection refused")}, statusBadNetworkPath},
+		{"connect logon failure", &connectError{smb.StatusMap[smb.StatusLogonFailure]}, smb.StatusAccessDenied},
+		{"broken connection", errors.New("remote connection has closed"), statusUnexpectedNetworkError},
 	}
 	for _, c := range cases {
 		if got := errToStatus(c.err); got != c.want {

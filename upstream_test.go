@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -20,7 +22,7 @@ var connDown = fmt.Errorf("remote connection has closed")
 // always normalizes ntHex, so this guards direct callers only.) The dial itself
 // needs a live SMB server and is not unit-tested.
 func TestDialConnBadHash(t *testing.T) {
-	conn, err := dialConn(mapping{remoteHost: "192.0.2.1", ntHex: "not-hex"})
+	conn, err := dialConn(mapping{remoteHost: "192.0.2.1", ntHex: "not-hex"}, time.Second)
 	if err == nil || conn != nil {
 		t.Errorf("dialConn = (%v, %v), want (nil, hex decode error)", conn, err)
 	}
@@ -54,12 +56,95 @@ func TestUpstreamLazyConnect(t *testing.T) {
 }
 
 func TestNewUpstreamIsLazy(t *testing.T) {
-	u := newUpstream(mapping{remoteHost: "h"}, 90*time.Second)
+	u := newUpstream(mapping{remoteHost: "h"}, upstreamTimeouts{idle: 90 * time.Second, io: 30 * time.Second})
 	if u.conn != nil {
 		t.Errorf("newUpstream dialed eagerly (conn=%v)", u.conn)
 	}
-	if u.dial == nil || u.idle != 90*time.Second {
-		t.Errorf("newUpstream fields = (dial set=%v, idle=%v), want dial set and idle 90s", u.dial != nil, u.idle)
+	if u.dial == nil || u.idle != 90*time.Second || u.ioTimeout != 30*time.Second {
+		t.Errorf("newUpstream fields = (dial set=%v, idle=%v, io=%v), want dial set, idle 90s, io 30s",
+			u.dial != nil, u.idle, u.ioTimeout)
+	}
+}
+
+// connectWithin returns a connection made in time, and otherwise gives up
+// with a timeout error that the connect hint treats as a network failure,
+// closing the connection the abandoned attempt still produces.
+func TestConnectWithin(t *testing.T) {
+	quick := &fakeConn{}
+	c, err := connectWithin(time.Second, func() (upstreamConn, error) { return quick, nil })
+	if err != nil || c != quick {
+		t.Fatalf("prompt connect = (%v, %v), want (conn, nil)", c, err)
+	}
+
+	late := &fakeConn{}
+	release := make(chan struct{})
+	finished := make(chan struct{})
+	c, err = connectWithin(20*time.Millisecond, func() (upstreamConn, error) {
+		defer close(finished)
+		<-release
+		return late, nil
+	})
+	if c != nil || !errors.Is(err, os.ErrDeadlineExceeded) || !isNetworkError(err) {
+		t.Fatalf("stalled connect = (%v, %v), want (nil, deadline error that isNetworkError)", c, err)
+	}
+	close(release)
+	<-finished
+	deadline := time.Now().Add(time.Second)
+	for !late.isClosed() {
+		if time.Now().After(deadline) {
+			t.Fatal("connection established after the timeout was never closed")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// A zero timeout waits for connect, however long it takes.
+	if c, err := connectWithin(0, func() (upstreamConn, error) { return quick, nil }); err != nil || c != quick {
+		t.Errorf("unbounded connect = (%v, %v), want (conn, nil)", c, err)
+	}
+}
+
+// ensureConn reports a failed dial as a *connectError, which errToStatus turns
+// into a client-facing status that does not blame the client's credentials.
+func TestUpstreamConnectErrorStatus(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		dialErr error
+		want    uint32
+	}{
+		{"unreachable", &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("refused")}, statusBadNetworkPath},
+		{"timed out", fmt.Errorf("no answer: %w", os.ErrDeadlineExceeded), statusBadNetworkPath},
+		{"bad credentials", &smb.NTStatusError{Op: "SessionSetup", Status: smb.StatusLogonFailure,
+			Err: smb.StatusMap[smb.StatusLogonFailure]}, smb.StatusAccessDenied},
+	} {
+		u := &upstream{m: mapping{remoteHost: "h"}, dial: func(mapping) (upstreamConn, error) { return nil, c.dialErr }}
+		err := u.do(func(upstreamConn) error { return nil })
+		if _, ok := errors.AsType[*connectError](err); !ok {
+			t.Errorf("%s: do error %v is not a *connectError", c.name, err)
+		}
+		if got := errToStatus(err); got != c.want {
+			t.Errorf("%s: errToStatus = 0x%08x, want 0x%08x", c.name, got, c.want)
+		}
+	}
+}
+
+// When the target reports the proxy's session gone, do reconnects and retries
+// instead of passing that status to the client.
+func TestUpstreamRedialsOnSessionLost(t *testing.T) {
+	expired := &smb.NTStatusError{Op: "Create", Status: statusNetworkSessionExpired} // unmapped in go-smb
+	dialed, calls := 0, 0
+	u := &upstream{m: mapping{remoteHost: "h"}, dial: func(mapping) (upstreamConn, error) {
+		dialed++
+		return &fakeConn{}, nil
+	}}
+	err := u.do(func(upstreamConn) error {
+		calls++
+		if calls == 1 {
+			return expired
+		}
+		return nil
+	})
+	if err != nil || dialed != 2 || calls != 2 {
+		t.Errorf("do = %v after %d dials and %d calls, want nil after 2 and 2 (redial and retry)", err, dialed, calls)
 	}
 }
 
@@ -181,9 +266,16 @@ func TestIsTransportErr(t *testing.T) {
 		{"nil", nil, false},
 		{"status sentinel", smb.StatusMap[smb.StatusAccessDenied], false},
 		{"wrapped sentinel", fmt.Errorf("op: %w", smb.StatusMap[smb.StatusObjectNameNotFound]), false},
+		{"status error", &smb.NTStatusError{Op: "Read", Status: smb.StatusAccessDenied,
+			Err: smb.StatusMap[smb.StatusAccessDenied]}, false},
+		{"unmapped status error", &smb.NTStatusError{Op: "Read", Status: 0xc0000123}, false},
+		{"session deleted", smb.StatusMap[smb.StatusUserSessionDeleted], true},
+		{"session expired (unmapped)", &smb.NTStatusError{Op: "Create", Status: statusNetworkSessionExpired}, true},
+		{"tree disconnected", smb.StatusMap[smb.StatusNetworkNameDeleted], true},
 		{"plain error", errors.New("boom"), true},
 		{"dead connection", connDown, true},
 		{"eof", io.EOF, true},
+		{"timeout", context.DeadlineExceeded, true},
 	}
 	for _, c := range cases {
 		if got := isTransportErr(c.err); got != c.want {

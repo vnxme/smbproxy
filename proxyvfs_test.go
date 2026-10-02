@@ -34,12 +34,30 @@ type fakeFile struct {
 	secData []byte           // security descriptor QuerySecurity returns
 	secErr  error            // if set, QuerySecurity returns it
 	secInfo uint32           // additionalInformation of the last QuerySecurity call
+	stall   bool             // ReadFile and QueryDirectory block until their context ends
 	isDir   bool
 	metaVal fileMeta
 	closed  bool
 }
 
-func (f *fakeFile) ReadFile(b []byte, off uint64) (int, error) {
+// waitStalled blocks until ctx is done when the fake is stalled, standing in
+// for a target that stopped answering, and returns ctx's error; it returns nil
+// at once otherwise.
+func (f *fakeFile) waitStalled(ctx context.Context) error {
+	f.mu.Lock()
+	stalled := f.stall
+	f.mu.Unlock()
+	if !stalled {
+		return nil
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (f *fakeFile) ReadFile(ctx context.Context, b []byte, off uint64) (int, error) {
+	if err := f.waitStalled(ctx); err != nil {
+		return 0, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.reads++
@@ -52,7 +70,10 @@ func (f *fakeFile) ReadFile(b []byte, off uint64) (int, error) {
 	return copy(b, f.data[off:]), nil
 }
 
-func (f *fakeFile) QueryDirectory(_ string, flags byte, _ uint32, _ uint32) ([]smb.SharedFile, error) {
+func (f *fakeFile) QueryDirectory(ctx context.Context, _ string, flags byte, _ uint32, _ uint32) ([]smb.SharedFile, error) {
+	if err := f.waitStalled(ctx); err != nil {
+		return nil, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.dirCall++
@@ -139,6 +160,12 @@ func (c *fakeConn) Close() {
 	c.mu.Lock()
 	c.closed = true
 	c.mu.Unlock()
+}
+
+func (c *fakeConn) isClosed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closed
 }
 
 func newVFS(c *fakeConn) *proxyVFS {
@@ -551,6 +578,29 @@ func TestProxyReadPrefetchFollowsSeek(t *testing.T) {
 	if want := seek + readAheadSize; p == nil || p.off != want {
 		t.Fatalf("queued prefetch = %+v, want one at offset %d", p, want)
 	}
+}
+
+// A target that stops answering fails a read or listing with STATUS_IO_TIMEOUT
+// once the I/O timeout passes, rather than holding the upstream lock (and so
+// every other client of the connection) indefinitely.
+func TestProxyIOTimeout(t *testing.T) {
+	ff := &fakeFile{data: []byte("0123456789"), isDir: true, stall: true}
+	v := newVFS(&fakeConn{})
+	v.up.ioTimeout = 20 * time.Millisecond
+	ctx := context.Background()
+
+	n, status, err := v.Read(ctx, fileHandle(ff), 0, make([]byte, 4))
+	if err != nil || n != 0 || status != statusIoTimeout {
+		t.Errorf("stalled read = (%d, 0x%08x, %v), want (0, STATUS_IO_TIMEOUT, nil)", n, status, err)
+	}
+	entries, status, err := v.QueryDirectory(ctx, &proxyHandle{file: ff, isDir: true, path: "\\sub"}, "*", false)
+	if err != nil || entries != nil || status != statusIoTimeout {
+		t.Errorf("stalled listing = (%d entries, 0x%08x, %v), want (0, STATUS_IO_TIMEOUT, nil)", len(entries), status, err)
+	}
+	if !v.up.mu.TryLock() {
+		t.Fatal("upstream lock still held after the timed-out requests")
+	}
+	v.up.mu.Unlock()
 }
 
 // A small file costs a buffer of its own size, not a full read-ahead batch,

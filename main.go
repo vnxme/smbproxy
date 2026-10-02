@@ -163,6 +163,14 @@ func main() {
 		"close an upstream connection after this period with no open handles and no\n"+
 			"\tactivity; it is re-established on demand when a client next uses the share.\n"+
 			"\t0 keeps each connection (still dialed on demand) until shutdown")
+	connectTimeout := flag.Duration("connect-timeout", 15*time.Second,
+		"give up connecting to a target (TCP connect, negotiation and login) after this\n"+
+			"\tlong; the client's request then fails with \"network path not found\". 0 waits indefinitely")
+	ioTimeout := flag.Duration("io-timeout", time.Minute,
+		"fail a read or directory request on an open file when the target has not answered\n"+
+			"\tafter this long, so a stalled target cannot block the other clients sharing its\n"+
+			"\tconnection. Opening files and listing a share's root cannot be bounded (go-smb\n"+
+			"\toffers no way to). 0 waits indefinitely")
 	debugLog := flag.Bool("debug", false, "enable verbose go-smb debug logging (dialect, signing, session setup, DCE/RPC)\n"+
 		"\tand log every file-system call the proxy answers, with its result")
 	flag.Parse()
@@ -234,7 +242,11 @@ func main() {
 	for _, m := range mappings {
 		k := m.key()
 		if _, ok := upstreams[k]; !ok {
-			upstreams[k] = newUpstream(m, *idleTimeout)
+			upstreams[k] = newUpstream(m, upstreamTimeouts{
+				idle:    *idleTimeout,
+				connect: *connectTimeout,
+				io:      *ioTimeout,
+			})
 		}
 	}
 	defer func() {

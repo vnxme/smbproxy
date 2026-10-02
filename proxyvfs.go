@@ -344,7 +344,9 @@ func (v *proxyVFS) fetch(file upstreamFile, off, size int64) ([]byte, error) {
 	var fetchErr error
 	v.up.mu.Lock()
 	for totalN < len(upBuf) {
-		rn, rErr := file.ReadFile(upBuf[totalN:], uint64(off)+uint64(totalN))
+		ctx, cancel := v.up.ioContext()
+		rn, rErr := file.ReadFile(ctx, upBuf[totalN:], uint64(off)+uint64(totalN))
+		cancel()
 		if rn > 0 {
 			totalN += rn
 		}
@@ -467,7 +469,7 @@ func (v *proxyVFS) QueryDirectory(_ context.Context, h server.Handle, pattern st
 			func() {
 				v.up.mu.Lock()
 				defer v.up.mu.Unlock()
-				raw, err = queryDirAll(ph.file, pattern)
+				raw, err = queryDirAll(v.up, ph.file, pattern)
 			}()
 		}
 
@@ -501,12 +503,15 @@ func (v *proxyVFS) QueryDirectory(_ context.Context, h server.Handle, pattern st
 // buffer, so it keeps asking until the target reports no more files. The first
 // request always restarts the scan: a handle that was listed before (or under
 // another pattern) has an exhausted upstream enumeration that would otherwise
-// yield nothing.
-func queryDirAll(f upstreamFile, pattern string) ([]smb.SharedFile, error) {
+// yield nothing. Each request is bounded by u's I/O timeout. The caller must
+// hold u.mu.
+func queryDirAll(u *upstream, f upstreamFile, pattern string) ([]smb.SharedFile, error) {
 	var all []smb.SharedFile
 	flags := smb.RestartScans
 	for {
-		batch, err := f.QueryDirectory(pattern, flags, 0, 65536)
+		ctx, cancel := u.ioContext()
+		batch, err := f.QueryDirectory(ctx, pattern, flags, 0, 65536)
+		cancel()
 		if errors.Is(err, smb.StatusMap[smb.StatusNoMoreFiles]) && len(all) > 0 {
 			return all, nil
 		}

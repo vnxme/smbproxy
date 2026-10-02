@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"errors"
+	"os"
 	"strings"
 	"time"
 
@@ -78,16 +80,69 @@ func hasDotDot(p string) bool {
 	return false
 }
 
+// NTSTATUS codes go-smb does not define.
+const (
+	statusIoTimeout              uint32 = 0xc00000b5 // STATUS_IO_TIMEOUT
+	statusBadNetworkPath         uint32 = 0xc00000be // STATUS_BAD_NETWORK_PATH
+	statusUnexpectedNetworkError uint32 = 0xc00000c4 // STATUS_UNEXPECTED_NETWORK_ERROR
+	statusNetworkSessionExpired  uint32 = 0xc000035c // STATUS_NETWORK_SESSION_EXPIRED
+)
+
+// ntStatus returns the NTSTATUS the target answered with, if err carries one:
+// go-smb reports it as an *smb.NTStatusError (whose raw Status survives even
+// for codes missing from smb.StatusMap) or, in places, as a bare StatusMap
+// sentinel.
+func ntStatus(err error) (uint32, bool) {
+	if nt, ok := errors.AsType[*smb.NTStatusError](err); ok {
+		return nt.Status, true
+	}
+	for code, sentinel := range smb.StatusMap {
+		if errors.Is(err, sentinel) {
+			return code, true
+		}
+	}
+	return 0, false
+}
+
+// sessionLost reports whether code means the target dropped the proxy's own
+// upstream session or tree connect. These concern the proxy's connection, not
+// the client's: do redials on them, and they are never passed to a client,
+// which would take them as its session with the proxy having ended.
+func sessionLost(code uint32) bool {
+	switch code {
+	case smb.StatusUserSessionDeleted, statusNetworkSessionExpired, smb.StatusNetworkNameDeleted:
+		return true
+	}
+	return false
+}
+
+// errToStatus converts an upstream failure into the NTSTATUS reported to the
+// client:
+//   - a failure to connect to the target: STATUS_ACCESS_DENIED when the target
+//     refused the proxy's credentials (passing on a logon failure would make
+//     the client re-prompt for credentials that are not at fault), otherwise
+//     STATUS_BAD_NETWORK_PATH;
+//   - a request that timed out: STATUS_IO_TIMEOUT;
+//   - an NTSTATUS answer from the target: that status, unless it reports the
+//     proxy's own session lost (see sessionLost);
+//   - anything else, a broken connection: STATUS_UNEXPECTED_NETWORK_ERROR.
 func errToStatus(err error) uint32 {
 	if err == nil {
 		return 0
 	}
-	for code, sentinel := range smb.StatusMap {
-		if errors.Is(err, sentinel) {
-			return code
+	if _, ok := errors.AsType[*connectError](err); ok {
+		if _, answered := ntStatus(err); answered {
+			return smb.StatusAccessDenied
 		}
+		return statusBadNetworkPath
 	}
-	return smb.StatusObjectNameNotFound
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
+		return statusIoTimeout
+	}
+	if code, answered := ntStatus(err); answered && !sessionLost(code) {
+		return code
+	}
+	return statusUnexpectedNetworkError
 }
 
 func sharedFileAttrs(sf smb.SharedFile) uint32 {
