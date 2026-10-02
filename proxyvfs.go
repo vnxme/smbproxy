@@ -466,6 +466,13 @@ func (v *proxyVFS) QueryDirectory(_ context.Context, h server.Handle, pattern st
 	return result, 0, nil
 }
 
+// QueryFileInfo returns StatusNotSupported on purpose: the library then
+// serializes the info class from the handle's Stat() snapshot, which already
+// holds the target's real metadata (size, attributes, all four timestamps)
+// captured when the file was opened. go-smb exposes no raw per-class file-info
+// query to forward, and the snapshot is current for Explorer's Properties,
+// which opens a fresh handle before querying — so this is already served from
+// upstream data; there is nothing further to proxy here.
 func (v *proxyVFS) QueryFileInfo(_ context.Context, _ server.Handle, _ byte) (any, uint32, error) {
 	return nil, smb.StatusNotSupported, nil
 }
@@ -478,8 +485,40 @@ func (v *proxyVFS) QueryFSInfo(_ context.Context, _ byte) (any, uint32, error) {
 	return nil, smb.StatusNotSupported, nil
 }
 
-func (v *proxyVFS) QuerySecurity(_ context.Context, _ server.Handle, _ uint32) ([]byte, uint32, error) {
-	return nil, smb.StatusNotSupported, nil
+// QuerySecurity proxies the client's request for a file's security descriptor
+// (the Explorer "Security" tab: real owner, group and ACLs) through to the
+// target. It operates on the already-open handle like Read/QueryDirectory, so
+// it does not redial on a transport error. On anything that leaves no real
+// descriptor — the synthetic root, a closed handle, or an upstream error — it
+// returns StatusNotSupported so the library falls back to its default
+// descriptor and Properties still opens.
+func (v *proxyVFS) QuerySecurity(_ context.Context, h server.Handle, additionalInformation uint32) (buf []byte, status uint32, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[proxy] QuerySecurity panic: %v\n%s", r, debug.Stack())
+			buf, status, err = nil, smb.StatusNotSupported, nil
+		}
+	}()
+
+	ph := h.(*proxyHandle)
+	ph.fileMu.RLock()
+	file := ph.file
+	ph.fileMu.RUnlock()
+	if file == nil {
+		return nil, smb.StatusNotSupported, nil
+	}
+
+	var sd []byte
+	func() {
+		v.up.mu.Lock()
+		defer v.up.mu.Unlock()
+		sd, err = file.QuerySecurity(additionalInformation)
+	}()
+	if err != nil {
+		log.Printf("[proxy] QuerySecurity upstream error: %v", err)
+		return nil, smb.StatusNotSupported, nil
+	}
+	return sd, smb.StatusOk, nil
 }
 
 func (v *proxyVFS) Ioctl(_ context.Context, _ server.Handle, _ uint32, _ []byte, _ uint32) ([]byte, uint32, error) {

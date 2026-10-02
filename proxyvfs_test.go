@@ -27,6 +27,9 @@ type fakeFile struct {
 	dirs    []smb.SharedFile // entries QueryDirectory returns (once)
 	dirErr  error            // if set, QueryDirectory returns it
 	dirCall int              // QueryDirectory call count
+	secData []byte           // security descriptor QuerySecurity returns
+	secErr  error            // if set, QuerySecurity returns it
+	secInfo uint32           // additionalInformation of the last QuerySecurity call
 	isDir   bool
 	metaVal fileMeta
 	closed  bool
@@ -63,6 +66,16 @@ func (f *fakeFile) CloseFile() error {
 	defer f.mu.Unlock()
 	f.closed = true
 	return nil
+}
+
+func (f *fakeFile) QuerySecurity(additionalInformation uint32) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.secInfo = additionalInformation
+	if f.secErr != nil {
+		return nil, f.secErr
+	}
+	return f.secData, nil
 }
 
 func (f *fakeFile) IsDir() bool    { return f.isDir }
@@ -662,10 +675,42 @@ func TestProxyReadOnlyStubs(t *testing.T) {
 	if _, status, _ := v.QueryFSInfo(ctx, 0); status != smb.StatusNotSupported {
 		t.Errorf("QueryFSInfo = 0x%08x, want StatusNotSupported", status)
 	}
-	if _, status, _ := v.QuerySecurity(ctx, nil, 0); status != smb.StatusNotSupported {
-		t.Errorf("QuerySecurity = 0x%08x, want StatusNotSupported", status)
-	}
 	if _, status, _ := v.Ioctl(ctx, nil, 0, nil, 0); status != smb.StatusNotSupported {
 		t.Errorf("Ioctl = 0x%08x, want StatusNotSupported", status)
+	}
+}
+
+func TestProxyQuerySecurity(t *testing.T) {
+	sd := []byte{0x01, 0x00, 0x04, 0x80, 0xde, 0xad} // stand-in self-relative SD bytes
+	ff := &fakeFile{secData: sd}
+	v := newVFS(&fakeConn{})
+	ph := &proxyHandle{file: ff}
+
+	// A real descriptor is proxied back verbatim, and the client's requested
+	// components are forwarded to the target.
+	const want = smb.OwnerSecurityInformation | smb.GroupSecurityInformation | smb.DACLSecurityInformation
+	buf, status, err := v.QuerySecurity(context.Background(), ph, want)
+	if err != nil || status != smb.StatusOk || !bytes.Equal(buf, sd) {
+		t.Fatalf("QuerySecurity = (%x, 0x%08x, %v), want the upstream SD bytes", buf, status, err)
+	}
+	if ff.secInfo != want {
+		t.Errorf("forwarded additionalInformation = 0x%x, want 0x%x", ff.secInfo, want)
+	}
+}
+
+func TestProxyQuerySecurityFallbacks(t *testing.T) {
+	v := newVFS(&fakeConn{})
+
+	// Synthetic root / closed handle: no upstream file -> let the library
+	// supply its default descriptor.
+	if _, status, _ := v.QuerySecurity(context.Background(), &proxyHandle{}, 0); status != smb.StatusNotSupported {
+		t.Errorf("QuerySecurity on fileless handle = 0x%08x, want StatusNotSupported", status)
+	}
+
+	// An upstream error must not fail the client's query; fall back to default.
+	ph := &proxyHandle{file: &fakeFile{secErr: errors.New("access denied")}}
+	buf, status, err := v.QuerySecurity(context.Background(), ph, 0)
+	if err != nil || status != smb.StatusNotSupported || buf != nil {
+		t.Errorf("QuerySecurity upstream error = (%x, 0x%08x, %v), want (nil, StatusNotSupported, nil)", buf, status, err)
 	}
 }

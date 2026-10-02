@@ -206,6 +206,10 @@ type upstreamConn interface {
 type upstreamFile interface {
 	ReadFile(b []byte, offset uint64) (int, error)
 	QueryDirectory(pattern string, flags byte, fileIndex uint32, bufferSize uint32) ([]smb.SharedFile, error)
+	// QuerySecurity fetches the file's security descriptor from the target,
+	// requesting the components named in additionalInformation, and returns it
+	// as self-relative wire bytes ready to hand back to the client.
+	QuerySecurity(additionalInformation uint32) ([]byte, error)
 	CloseFile() error
 	IsDir() bool
 	// meta snapshots the metadata fields the proxy reads off a freshly opened
@@ -249,6 +253,17 @@ func (f smbFile) meta() fileMeta {
 		lastWriteTime:  f.LastWriteTime,
 		changeTime:     f.ChangeTime,
 	}
+}
+
+// QuerySecurity queries the target for the file's security descriptor and
+// re-serializes it to self-relative wire bytes. A zero bufferSize lets the
+// library pick a default and grow it if the DACL overflows.
+func (f smbFile) QuerySecurity(additionalInformation uint32) ([]byte, error) {
+	sd, err := f.File.QueryInfoSecurityRaw(additionalInformation, 0)
+	if err != nil {
+		return nil, err
+	}
+	return sd.MarshalBinary()
 }
 
 // dialConn opens one authenticated connection to the target in mapping m. It is
