@@ -47,8 +47,9 @@
 //   proxyvfs.go  — proxyHandle and proxyVFS (reads, prefetch, dir listing)
 //   noopvfs.go   — the no-op VFS registered for IPC$
 //   tracevfs.go  — the debug wrapper logging every VFS call and its result
-//   rpcpipe.go   — the srvsvc DCE/RPC pipe wrapper and BindAck fixup
+//   rpcpipe.go   — the DCE/RPC pipe wrapper (srvsvc, lsarpc) and BindAck fixup
 //   srvsvc.go    — the srvsvc service: the library's plus share and server info
+//   lsarpc.go    — a minimal read-only LSA service: domain membership queries
 //   main.go      — server startup (this file)
 
 package main
@@ -218,11 +219,19 @@ func main() {
 	// tab. rpcPipe adds the WRITE/READ transport and the BindAck fixup the
 	// Windows client needs (see its doc).
 	svc := newSrvsvcService(cfg, srvsvc.FromConfig(srvCfg))
+	lsa := newLSAService(cfg)
 	srvCfg.PipeOpener = &server.MapPipeOpener{
 		Pipes: map[string]func(*server.Session) (server.PipeBackend, error){
 			"srvsvc": func(_ *server.Session) (server.PipeBackend, error) {
 				return &rpcPipe{
 					inner: dcesrv.NewPipeHandler("srvsvc", svc),
+				}, nil
+			},
+			// lsaService answers the domain-membership queries the same tab
+			// makes next (see its doc).
+			"lsarpc": func(_ *server.Session) (server.PipeBackend, error) {
+				return &rpcPipe{
+					inner: dcesrv.NewPipeHandler("lsarpc", lsa),
 				}, nil
 			},
 		},
