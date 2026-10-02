@@ -66,6 +66,25 @@ import (
 	"github.com/jfjallid/golog"
 )
 
+// connectFailureHint returns the guidance printed under an upstream connect
+// failure, tailored to the kind of error: a TCP-level failure points at
+// reachability (SMB off / wrong host or port / firewall), anything else at
+// authentication.
+func connectFailureHint(err error) string {
+	if isNetworkError(err) {
+		return "    unreachable at the TCP level (connection refused / timeout / no route / DNS).\n" +
+			"    Is SMB running and port 445 open on the target and through any firewall?\n" +
+			"    Check the host and port in the mapping."
+	}
+	return "    STATUS_LOGON_FAILURE  → wrong credential\n" +
+		"    STATUS_ACCESS_DENIED  → wrong credential or account restrictions\n" +
+		"    'signing required'    → target mandates SMB signing. smbproxy signs with the\n" +
+		"                            supplied credential (an NT hash works as well as a\n" +
+		"                            password), so this usually means the credential was\n" +
+		"                            rejected and the session fell back to guest/anonymous,\n" +
+		"                            which cannot sign — re-check user/domain/credential."
+}
+
 func main() {
 	var maps multiFlag
 	flag.Var(&maps, "map",
@@ -160,15 +179,8 @@ func main() {
 			m.remoteHost, m.remoteShare, m.domain, m.user)
 		up, err := openUpstream(m)
 		if err != nil {
-			log.Fatalf("[!] upstream connect \\\\%s as %s\\%s failed: %v\n"+
-				"    STATUS_LOGON_FAILURE  → wrong credential\n"+
-				"    STATUS_ACCESS_DENIED  → wrong credential or account restrictions\n"+
-				"    'signing required'    → target mandates SMB signing. smbproxy signs with the\n"+
-				"                            supplied credential (an NT hash works as well as a\n"+
-				"                            password), so this usually means the credential was\n"+
-				"                            rejected and the session fell back to guest/anonymous,\n"+
-				"                            which cannot sign — re-check user/domain/credential.",
-				m.remoteHost, m.domain, m.user, err)
+			log.Fatalf("[!] upstream connect \\\\%s as %s\\%s failed: %v\n%s",
+				m.remoteHost, m.domain, m.user, err, connectFailureHint(err))
 		}
 		upstreams[k] = up
 		log.Printf("[+] authenticated as %s\\%s on %s", m.domain, m.user, m.remoteHost)

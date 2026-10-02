@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"strings"
 	"testing"
 
 	"github.com/jfjallid/go-smb/smb"
@@ -40,6 +42,45 @@ func TestIsTransportErr(t *testing.T) {
 		if got := isTransportErr(c.err); got != c.want {
 			t.Errorf("%s: isTransportErr(%v) = %v, want %v", c.name, c.err, got, c.want)
 		}
+	}
+}
+
+func TestIsNetworkError(t *testing.T) {
+	opErr := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"dial refused", opErr, true},
+		{"wrapped dial error", fmt.Errorf("connect: %w", opErr), true},
+		{"dns failure", &net.DNSError{Err: "no such host", Name: "nope"}, true},
+		{"status sentinel", smb.StatusMap[smb.StatusAccessDenied], false},
+		{"plain error", errors.New("boom"), false},
+	}
+	for _, c := range cases {
+		if got := isNetworkError(c.err); got != c.want {
+			t.Errorf("%s: isNetworkError(%v) = %v, want %v", c.name, c.err, got, c.want)
+		}
+	}
+}
+
+func TestConnectFailureHint(t *testing.T) {
+	netHint := connectFailureHint(&net.OpError{Op: "dial", Err: errors.New("refused")})
+	if !strings.Contains(netHint, "port 445") {
+		t.Errorf("network hint missing reachability guidance: %q", netHint)
+	}
+	if strings.Contains(netHint, "STATUS_LOGON_FAILURE") {
+		t.Errorf("network hint should not mention credential causes")
+	}
+
+	authHint := connectFailureHint(errors.New("STATUS_ACCESS_DENIED"))
+	if !strings.Contains(authHint, "STATUS_LOGON_FAILURE") {
+		t.Errorf("auth hint missing credential guidance: %q", authHint)
+	}
+	if strings.Contains(authHint, "port 445") {
+		t.Errorf("auth hint should not mention TCP reachability")
 	}
 }
 

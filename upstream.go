@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"log"
+	"net"
 	"sync"
 
 	"github.com/jfjallid/go-smb/smb"
@@ -65,6 +66,17 @@ func (u *upstream) redial() error {
 	}
 	u.conn = c
 	return nil
+}
+
+// isNetworkError reports whether err is a TCP-level failure (connection
+// refused, timeout, no route, DNS) rather than an SMB/auth error. The library
+// returns net.DialTimeout's error unwrapped, so *net.OpError and *net.DNSError
+// — both net.Error — are visible to errors.As. Used to tailor the connect
+// failure hint: a refused dial means nothing is listening (SMB off / wrong
+// host or port / firewall), not a credential problem.
+func isNetworkError(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr)
 }
 
 // isTransportErr reports whether err indicates a broken connection rather than
