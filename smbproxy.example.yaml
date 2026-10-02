@@ -27,6 +27,7 @@ server:
   netbios_domain: WORKGROUP  # at most 15 characters
   dns_name: ""               # e.g. smbproxy.corp.example
   dns_domain: ""             # e.g. corp.example
+  comment: ""                # server description, shown in Explorer's details
 
   signing: enabled           # enabled | required. required rejects unsigned
                              # traffic; guest and anonymous sessions cannot

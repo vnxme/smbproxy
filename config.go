@@ -52,6 +52,7 @@ type serverSection struct {
 	NetBIOSDomain  string                `yaml:"netbios_domain"`
 	DNSName        string                `yaml:"dns_name"`
 	DNSDomain      string                `yaml:"dns_domain"`
+	Comment        string                `yaml:"comment"`
 	Signing        string                `yaml:"signing"`    // enabled | required
 	Encryption     string                `yaml:"encryption"` // off | supported | required
 	Compression    bool                  `yaml:"compression"`
@@ -142,6 +143,7 @@ type config struct {
 
 	netbiosName, netbiosDomain string // identity announced during NTLM login
 	dnsName, dnsDomain         string
+	comment                    string // server description shown by Explorer
 	signing                    string // "enabled" | "required"
 	encryption                 string // "off" | "supported" | "required"
 	compression                bool
@@ -432,7 +434,7 @@ func resolveServer(cfg *config, s serverSection) error {
 		return err
 	}
 	cfg.netbiosName, cfg.netbiosDomain = s.NetBIOSName, s.NetBIOSDomain
-	cfg.dnsName, cfg.dnsDomain = s.DNSName, s.DNSDomain
+	cfg.dnsName, cfg.dnsDomain, cfg.comment = s.DNSName, s.DNSDomain, s.Comment
 
 	switch s.Signing {
 	case "enabled", "required":

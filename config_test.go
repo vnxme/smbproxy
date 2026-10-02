@@ -178,6 +178,7 @@ server:
   netbios_domain: CORP
   dns_name: proxy1.corp.example
   dns_domain: corp.example
+  comment: Corporate file proxy
   signing: required
   encryption: required
   compression: true
@@ -195,7 +196,8 @@ server:
 		t.Errorf("listen %q, min dialect %#x", cfg.listen, sc.MinDialect)
 	}
 	if sc.NetBIOSName != "PROXY1" || sc.NetBIOSDomain != "CORP" ||
-		sc.DnsComputerName != "proxy1.corp.example" || sc.DnsDomainName != "corp.example" {
+		sc.DnsComputerName != "proxy1.corp.example" || sc.DnsDomainName != "corp.example" ||
+		cfg.comment != "Corporate file proxy" {
 		t.Errorf("identity = %q/%q/%q/%q", sc.NetBIOSName, sc.NetBIOSDomain, sc.DnsComputerName, sc.DnsDomainName)
 	}
 	if !sc.SigningRequired || !sc.EncryptionSupported || !sc.RequireEncryption || !sc.Compression {
