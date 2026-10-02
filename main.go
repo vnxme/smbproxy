@@ -61,7 +61,6 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -176,21 +175,7 @@ func main() {
 	}
 
 	// ---- Build the local server ----
-	auth := &server.MapAuthenticator{Domain: cfg.localDomain, Accounts: map[string]*server.Account{}}
-	if cfg.localUser != "" {
-		auth.Accounts[strings.ToLower(cfg.localUser)] = &server.Account{NTHash: cfg.localHash}
-	}
-
-	srvCfg := &server.ServerConfig{
-		NetBIOSName:    "SMBPROXY",
-		MinDialect:     cfg.minDialect,
-		MaxDialect:     cfg.maxDialect,
-		Authenticator:  auth,
-		AllowAnonymous: cfg.allowAnon,
-		AllowGuest:     cfg.allowGuest,
-		MaxReadSize:    readAheadSize,
-	}
-
+	srvCfg := cfg.serverConfig()
 	srv := &server.Server{Config: srvCfg}
 
 	// ---- Register IPC$ with a no-op VFS ----
@@ -213,6 +198,7 @@ func main() {
 			Name:          sh.name,
 			Type:          smb.ShareTypeDisk,
 			Remark:        sh.comment,
+			EncryptData:   sh.encrypt,
 			VFS:           vfs,
 			MaximalAccess: readOnlyAccess,
 		})
@@ -250,8 +236,11 @@ func main() {
 	default:
 		log.Printf("[*] local login: %s (any domain)", cfg.localUser)
 	}
-	log.Printf("[*] dialect range: %s .. %s  allow_guest=%t  allow_anonymous=%t",
-		cfg.minDialectName, cfg.maxDialectName, cfg.allowGuest, cfg.allowAnon)
+	log.Printf("[*] server %s (domain %s)  dialects %s .. %s",
+		cfg.netbiosName, cfg.netbiosDomain, cfg.minDialectName, cfg.maxDialectName)
+	log.Printf("[*] signing=%s  encryption=%s  compression=%t  durable_handles=%t",
+		cfg.signing, cfg.encryption, cfg.compression, cfg.durableHandles)
+	log.Printf("[*] allow_guest=%t  allow_anonymous=%t", cfg.allowGuest, cfg.allowAnon)
 	log.Printf("[*] browse \\\\<this-host>  or connect directly to \\\\<this-host>\\<share>")
 
 	// ---- Graceful shutdown ----

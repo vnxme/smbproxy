@@ -18,6 +18,7 @@ import (
 
 	"github.com/jfjallid/go-smb/ntlmssp"
 	"github.com/jfjallid/go-smb/smb"
+	"github.com/jfjallid/go-smb/smb/server"
 	"go.yaml.in/yaml/v3"
 )
 
@@ -34,14 +35,41 @@ import (
 const defaultConfigPath = "smbproxy.yaml"
 
 type fileConfig struct {
-	Listen     string                   `yaml:"listen"`
-	MinDialect string                   `yaml:"min_dialect"`
-	MaxDialect string                   `yaml:"max_dialect"`
-	Debug      bool                     `yaml:"debug"`
-	Local      localSection             `yaml:"local"`
-	Timeouts   timeoutsSection          `yaml:"timeouts"`
-	Targets    map[string]targetSection `yaml:"targets"`
-	Shares     []shareSection           `yaml:"shares"`
+	Server         serverSection            `yaml:"server"`
+	Debug          bool                     `yaml:"debug"`
+	Local          localSection             `yaml:"local"`
+	TargetTimeouts targetTimeoutsSection    `yaml:"target_timeouts"`
+	Targets        map[string]targetSection `yaml:"targets"`
+	Shares         []shareSection           `yaml:"shares"`
+}
+
+// serverSection holds how clients see and reach the proxy.
+type serverSection struct {
+	Listen         string                `yaml:"listen"`
+	MinDialect     string                `yaml:"min_dialect"`
+	MaxDialect     string                `yaml:"max_dialect"`
+	NetBIOSName    string                `yaml:"netbios_name"`
+	NetBIOSDomain  string                `yaml:"netbios_domain"`
+	DNSName        string                `yaml:"dns_name"`
+	DNSDomain      string                `yaml:"dns_domain"`
+	Signing        string                `yaml:"signing"`    // enabled | required
+	Encryption     string                `yaml:"encryption"` // off | supported | required
+	Compression    bool                  `yaml:"compression"`
+	DurableHandles durableSection        `yaml:"durable_handles"`
+	MaxConnections int                   `yaml:"max_connections"`
+	Timeouts       serverTimeoutsSection `yaml:"timeouts"`
+}
+
+type durableSection struct {
+	Enabled    bool     `yaml:"enabled"`
+	Timeout    duration `yaml:"timeout"`
+	MaxTimeout duration `yaml:"max_timeout"`
+}
+
+// serverTimeoutsSection bounds waits on clients.
+type serverTimeoutsSection struct {
+	Idle  duration `yaml:"idle"`
+	Write duration `yaml:"write"`
 }
 
 // Credential is a secret in one of three forms; exactly one must be set.
@@ -59,7 +87,8 @@ type localSection struct {
 	AllowAnonymous bool `yaml:"allow_anonymous"`
 }
 
-type timeoutsSection struct {
+// targetTimeoutsSection bounds waits on targets.
+type targetTimeoutsSection struct {
 	Idle    duration `yaml:"idle"`
 	Connect duration `yaml:"connect"`
 	IO      duration `yaml:"io"`
@@ -101,6 +130,7 @@ type shareSection struct {
 	Path     string `yaml:"path"`
 	Comment  string `yaml:"comment"`
 	ReadOnly *bool  `yaml:"read_only"`
+	Encrypt  bool   `yaml:"encrypt"`
 }
 
 // config is a validated configuration, ready to run the proxy from.
@@ -109,6 +139,18 @@ type config struct {
 	minDialect, maxDialect         uint16
 	minDialectName, maxDialectName string
 	debug                          bool
+
+	netbiosName, netbiosDomain string // identity announced during NTLM login
+	dnsName, dnsDomain         string
+	signing                    string // "enabled" | "required"
+	encryption                 string // "off" | "supported" | "required"
+	compression                bool
+	durableHandles             bool
+	durableTimeout             time.Duration // default retention of a disconnected handle
+	durableMaxTimeout          time.Duration // cap on what a client may request
+	maxConnections             int           // -1 = no limit
+	clientIdleTimeout          time.Duration // 0 = no limit
+	clientWriteTimeout         time.Duration // 0 = no limit
 
 	localUser   string // "" when clients can only connect as guest or anonymous
 	localDomain string // "" accepts any domain
@@ -147,14 +189,18 @@ type share struct {
 	target        *target
 	remoteShare   string // share on the target (e.g. "C$")
 	remoteSub     string // inner directory within it (empty = share root)
+	encrypt       bool   // require SMB 3.x encryption for this share
 }
 
 // yamlSectionNames rewrites the Go type names in yaml.v3's errors ("field x
 // not found in type main.localSection") into the sections they stand for.
 var yamlSectionNames = strings.NewReplacer(
 	"not found in type main.fileConfig", "is not a known setting at the top level",
+	"not found in type main.serverSection", "is not a known setting under server",
+	"not found in type main.durableSection", "is not a known setting under server.durable_handles",
+	"not found in type main.serverTimeoutsSection", "is not a known setting under server.timeouts",
 	"not found in type main.localSection", "is not a known setting under local",
-	"not found in type main.timeoutsSection", "is not a known setting under timeouts",
+	"not found in type main.targetTimeoutsSection", "is not a known setting under target_timeouts",
 	"not found in type main.targetSection", "is not a known setting for a target",
 	"not found in type main.shareSection", "is not a known setting for a share",
 )
@@ -189,10 +235,25 @@ func loadConfig(path string) (*config, []string, error) {
 // paths are resolved against baseDir, the configuration file's directory.
 func parseConfig(data []byte, baseDir string) (*config, []string, error) {
 	fc := fileConfig{
-		Listen:     "0.0.0.0:445",
-		MinDialect: "2.1",
-		MaxDialect: "3.1.1",
-		Timeouts: timeoutsSection{
+		Server: serverSection{
+			Listen:        "0.0.0.0:445",
+			MinDialect:    "2.1",
+			MaxDialect:    "3.1.1",
+			NetBIOSName:   "SMBPROXY",
+			NetBIOSDomain: "WORKGROUP",
+			Signing:       "enabled",
+			Encryption:    "supported",
+			DurableHandles: durableSection{
+				Timeout:    duration(time.Minute),
+				MaxTimeout: duration(10 * time.Minute),
+			},
+			MaxConnections: 512,
+			Timeouts: serverTimeoutsSection{
+				Idle:  duration(5 * time.Minute),
+				Write: duration(30 * time.Second),
+			},
+		},
+		TargetTimeouts: targetTimeoutsSection{
 			Idle:    duration(5 * time.Minute),
 			Connect: duration(15 * time.Second),
 			IO:      duration(time.Minute),
@@ -205,21 +266,11 @@ func parseConfig(data []byte, baseDir string) (*config, []string, error) {
 		return nil, nil, errors.New(yamlSectionNames.Replace(err.Error()))
 	}
 
-	cfg := &config{listen: fc.Listen, debug: fc.Debug}
+	cfg := &config{debug: fc.Debug}
 	var warnings []string
-
-	// ---- Dialects ----
-	var ok bool
-	if cfg.minDialect, ok = dialectByName[fc.MinDialect]; !ok {
-		return nil, nil, fmt.Errorf("min_dialect %q: use one of %s", fc.MinDialect, dialectNames())
+	if err := resolveServer(cfg, fc.Server); err != nil {
+		return nil, nil, fmt.Errorf("server: %w", err)
 	}
-	if cfg.maxDialect, ok = dialectByName[fc.MaxDialect]; !ok {
-		return nil, nil, fmt.Errorf("max_dialect %q: use one of %s", fc.MaxDialect, dialectNames())
-	}
-	if cfg.minDialect > cfg.maxDialect {
-		return nil, nil, fmt.Errorf("min_dialect %s is above max_dialect %s", fc.MinDialect, fc.MaxDialect)
-	}
-	cfg.minDialectName, cfg.maxDialectName = fc.MinDialect, fc.MaxDialect
 
 	// ---- Local login ----
 	l := fc.Local
@@ -238,10 +289,17 @@ func parseConfig(data []byte, baseDir string) (*config, []string, error) {
 			" or allow_guest or allow_anonymous")
 	}
 
-	// ---- Timeouts ----
-	t := fc.Timeouts
+	// Guest and anonymous sessions have no session key, so they can neither
+	// sign nor encrypt; requiring either would make those logins always fail.
+	if (cfg.signing == "required" || cfg.encryption == "required") && (cfg.allowGuest || cfg.allowAnon) {
+		return nil, nil, errors.New("server: signing or encryption is required, which guest and anonymous" +
+			" sessions cannot provide; disable local.allow_guest and local.allow_anonymous")
+	}
+
+	// ---- Target timeouts ----
+	t := fc.TargetTimeouts
 	if t.Idle < 0 || t.Connect < 0 || t.IO < 0 {
-		return nil, nil, errors.New("timeouts: must not be negative (0 disables a limit)")
+		return nil, nil, errors.New("target_timeouts: must not be negative (0 disables a limit)")
 	}
 	cfg.timeouts = upstreamTimeouts{idle: time.Duration(t.Idle), connect: time.Duration(t.Connect), io: time.Duration(t.IO)}
 
@@ -278,6 +336,9 @@ func parseConfig(data []byte, baseDir string) (*config, []string, error) {
 			return nil, nil, fmt.Errorf("shares[%d]: duplicate name %q (share names are case-insensitive; %q is already defined)",
 				i, sh.name, first)
 		}
+		if sh.encrypt && cfg.encryption == "off" {
+			return nil, nil, fmt.Errorf("shares[%d] (%s): encrypt needs server.encryption supported or required", i, sh.name)
+		}
 		seen[key] = sh.name
 		used[s.Target] = true
 		cfg.shares = append(cfg.shares, sh)
@@ -285,6 +346,18 @@ func parseConfig(data []byte, baseDir string) (*config, []string, error) {
 	for _, name := range names {
 		if !used[name] {
 			warnings = append(warnings, fmt.Sprintf("target %q is not used by any share", name))
+		}
+	}
+
+	// SMB 2.x has no encryption, so a client that negotiates it cannot reach
+	// an encrypted session or share.
+	if cfg.minDialect < smb.DialectSmb_3_0 {
+		if cfg.encryption == "required" {
+			warnings = append(warnings, fmt.Sprintf("server.encryption is required but min_dialect %s lets SMB 2.x"+
+				" clients connect, and they cannot encrypt; set min_dialect to 3.0 or above", cfg.minDialectName))
+		} else if slices.ContainsFunc(cfg.shares, func(s share) bool { return s.encrypt }) {
+			warnings = append(warnings, fmt.Sprintf("some shares require encryption but min_dialect %s lets SMB 2.x"+
+				" clients connect, and they cannot open those shares", cfg.minDialectName))
 		}
 	}
 	return cfg, warnings, nil
@@ -334,7 +407,136 @@ func resolveShare(s shareSection, targets map[string]*target) (share, error) {
 	if s.ReadOnly != nil && !*s.ReadOnly {
 		return share{}, errors.New("read_only: false is not supported yet; the proxy is read-only")
 	}
-	return share{name: s.Name, comment: s.Comment, target: tg, remoteShare: remote, remoteSub: sub}, nil
+	return share{name: s.Name, comment: s.Comment, target: tg, remoteShare: remote, remoteSub: sub, encrypt: s.Encrypt}, nil
+}
+
+// resolveServer validates the server section into cfg.
+func resolveServer(cfg *config, s serverSection) error {
+	cfg.listen = s.Listen
+	var ok bool
+	if cfg.minDialect, ok = dialectByName[s.MinDialect]; !ok {
+		return fmt.Errorf("min_dialect %q: use one of %s", s.MinDialect, dialectNames())
+	}
+	if cfg.maxDialect, ok = dialectByName[s.MaxDialect]; !ok {
+		return fmt.Errorf("max_dialect %q: use one of %s", s.MaxDialect, dialectNames())
+	}
+	if cfg.minDialect > cfg.maxDialect {
+		return fmt.Errorf("min_dialect %s is above max_dialect %s", s.MinDialect, s.MaxDialect)
+	}
+	cfg.minDialectName, cfg.maxDialectName = s.MinDialect, s.MaxDialect
+
+	if err := checkNetBIOSName("netbios_name", s.NetBIOSName); err != nil {
+		return err
+	}
+	if err := checkNetBIOSName("netbios_domain", s.NetBIOSDomain); err != nil {
+		return err
+	}
+	cfg.netbiosName, cfg.netbiosDomain = s.NetBIOSName, s.NetBIOSDomain
+	cfg.dnsName, cfg.dnsDomain = s.DNSName, s.DNSDomain
+
+	switch s.Signing {
+	case "enabled", "required":
+		cfg.signing = s.Signing
+	default:
+		return fmt.Errorf("signing %q: use enabled or required", s.Signing)
+	}
+	switch s.Encryption {
+	case "off", "supported", "required":
+		cfg.encryption = s.Encryption
+	default:
+		return fmt.Errorf("encryption %q: use off, supported or required", s.Encryption)
+	}
+	cfg.compression = s.Compression
+
+	d := s.DurableHandles
+	if d.Timeout <= 0 || d.MaxTimeout <= 0 {
+		return errors.New("durable_handles: timeout and max_timeout must be positive")
+	}
+	if d.Timeout > d.MaxTimeout {
+		return fmt.Errorf("durable_handles: timeout %s is above max_timeout %s",
+			time.Duration(d.Timeout), time.Duration(d.MaxTimeout))
+	}
+	cfg.durableHandles = d.Enabled
+	cfg.durableTimeout, cfg.durableMaxTimeout = time.Duration(d.Timeout), time.Duration(d.MaxTimeout)
+
+	if s.MaxConnections < 1 && s.MaxConnections != -1 {
+		return fmt.Errorf("max_connections %d: use a positive number, or -1 for no limit", s.MaxConnections)
+	}
+	cfg.maxConnections = s.MaxConnections
+
+	if s.Timeouts.Idle < 0 || s.Timeouts.Write < 0 {
+		return errors.New("timeouts: must not be negative (0 disables a limit)")
+	}
+	cfg.clientIdleTimeout, cfg.clientWriteTimeout = time.Duration(s.Timeouts.Idle), time.Duration(s.Timeouts.Write)
+	return nil
+}
+
+// netbiosNameInvalidChars are the characters a NetBIOS name may not contain.
+const netbiosNameInvalidChars = `\/:*?"<>|`
+
+// checkNetBIOSName rejects a NetBIOS computer or domain name Windows would
+// not accept: empty, longer than 15 characters, or with a forbidden character.
+func checkNetBIOSName(field, name string) error {
+	if name == "" {
+		return fmt.Errorf("%s is required", field)
+	}
+	if n := utf8.RuneCountInString(name); n > 15 {
+		return fmt.Errorf("%s %q is %d characters long; NetBIOS names allow at most 15", field, name, n)
+	}
+	for _, r := range name {
+		if r < 0x20 || strings.ContainsRune(netbiosNameInvalidChars, r) {
+			return fmt.Errorf("%s %q contains %q, which NetBIOS names do not allow", field, name, r)
+		}
+	}
+	return nil
+}
+
+// authenticator returns the verifier for client logins: the local user, if
+// any, and the required domain ("" accepts any).
+func (c *config) authenticator() *server.MapAuthenticator {
+	auth := &server.MapAuthenticator{Domain: c.localDomain, Accounts: map[string]*server.Account{}}
+	if c.localUser != "" {
+		auth.Accounts[strings.ToLower(c.localUser)] = &server.Account{NTHash: c.localHash}
+	}
+	return auth
+}
+
+// serverConfig returns the go-smb server settings the configuration
+// describes. Shares and the srvsvc pipe are added by the caller.
+func (c *config) serverConfig() *server.ServerConfig {
+	return &server.ServerConfig{
+		NetBIOSName:             c.netbiosName,
+		NetBIOSDomain:           c.netbiosDomain,
+		DnsComputerName:         c.dnsName,
+		DnsDomainName:           c.dnsDomain,
+		MinDialect:              c.minDialect,
+		MaxDialect:              c.maxDialect,
+		SigningRequired:         c.signing == "required",
+		EncryptionSupported:     c.encryption != "off",
+		RequireEncryption:       c.encryption == "required",
+		Compression:             c.compression,
+		DurableHandles:          c.durableHandles,
+		DurableHandleTimeout:    c.durableTimeout,
+		MaxDurableHandleTimeout: c.durableMaxTimeout,
+		// One client READ maps to one upstream read-ahead batch.
+		MaxReadSize:    readAheadSize,
+		IdleTimeout:    libraryTimeout(c.clientIdleTimeout),
+		WriteTimeout:   libraryTimeout(c.clientWriteTimeout),
+		MaxConnections: c.maxConnections, // -1 means no limit to go-smb too
+		Authenticator:  c.authenticator(),
+		AllowAnonymous: c.allowAnon,
+		AllowGuest:     c.allowGuest,
+	}
+}
+
+// libraryTimeout converts a timeout where 0 means no limit, as throughout the
+// configuration, into go-smb's convention, where 0 selects its default and a
+// negative value means no limit.
+func libraryTimeout(d time.Duration) time.Duration {
+	if d == 0 {
+		return -1
+	}
+	return d
 }
 
 // count returns how many of the credential's forms are set.

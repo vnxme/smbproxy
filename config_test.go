@@ -10,6 +10,7 @@ import (
 
 	"github.com/jfjallid/go-smb/ntlmssp"
 	"github.com/jfjallid/go-smb/smb"
+	"github.com/jfjallid/go-smb/smb/server"
 )
 
 // minimalConfig is the smallest valid configuration; tests append to it or
@@ -120,9 +121,10 @@ func TestConfigDefaults(t *testing.T) {
 // mean what they look like.
 func TestConfigScalars(t *testing.T) {
 	cfg, _ := mustParse(t, minimalConfig+`
-min_dialect: 3.0
-max_dialect: 3.0.2
-timeouts:
+server:
+  min_dialect: 3.0
+  max_dialect: 3.0.2
+target_timeouts:
   idle: 0
   connect: 2m30s
   io: 45s
@@ -132,6 +134,123 @@ timeouts:
 	}
 	if want := (upstreamTimeouts{idle: 0, connect: 150 * time.Second, io: 45 * time.Second}); cfg.timeouts != want {
 		t.Errorf("timeouts = %+v, want %+v", cfg.timeouts, want)
+	}
+}
+
+// The defaults reach go-smb's ServerConfig as agreed: encryption supported but
+// not required, signing enabled, durable handles off, WORKGROUP identity.
+func TestServerConfigDefaults(t *testing.T) {
+	cfg, _ := mustParse(t, minimalConfig)
+	sc := cfg.serverConfig()
+	if sc.NetBIOSName != "SMBPROXY" || sc.NetBIOSDomain != "WORKGROUP" || sc.DnsComputerName != "" || sc.DnsDomainName != "" {
+		t.Errorf("identity = %q/%q/%q/%q, want SMBPROXY/WORKGROUP/empty/empty",
+			sc.NetBIOSName, sc.NetBIOSDomain, sc.DnsComputerName, sc.DnsDomainName)
+	}
+	if sc.SigningRequired || !sc.EncryptionSupported || sc.RequireEncryption || sc.Compression {
+		t.Errorf("signing required=%t, encryption supported=%t required=%t, compression=%t;"+
+			" want false, true, false, false", sc.SigningRequired, sc.EncryptionSupported, sc.RequireEncryption, sc.Compression)
+	}
+	if sc.DurableHandles || sc.DurableHandleTimeout != time.Minute || sc.MaxDurableHandleTimeout != 10*time.Minute {
+		t.Errorf("durable handles = %t %s/%s, want off 1m/10m", sc.DurableHandles, sc.DurableHandleTimeout, sc.MaxDurableHandleTimeout)
+	}
+	if sc.MaxConnections != 512 || sc.IdleTimeout != 5*time.Minute || sc.WriteTimeout != 30*time.Second {
+		t.Errorf("limits = %d conns, idle %s, write %s; want 512, 5m, 30s", sc.MaxConnections, sc.IdleTimeout, sc.WriteTimeout)
+	}
+	if sc.MinDialect != smb.DialectSmb_2_1 || sc.MaxDialect != smb.DialectSmb_3_1_1 || sc.MaxReadSize != readAheadSize {
+		t.Errorf("dialects %#x..%#x, max read %d", sc.MinDialect, sc.MaxDialect, sc.MaxReadSize)
+	}
+	auth, ok := sc.Authenticator.(*server.MapAuthenticator)
+	if !ok || auth.Domain != "" || auth.Accounts["alice"] == nil ||
+		string(auth.Accounts["alice"].NTHash) != string(ntlmssp.Ntowfv1("pw")) {
+		t.Errorf("authenticator = %+v, want alice with any domain", sc.Authenticator)
+	}
+	if sc.AllowGuest || sc.AllowAnonymous {
+		t.Errorf("guest=%t anonymous=%t, want both off", sc.AllowGuest, sc.AllowAnonymous)
+	}
+}
+
+func TestServerConfigOverrides(t *testing.T) {
+	cfg, _ := mustParse(t, strings.Replace(minimalConfig, "  user: alice\n", "  user: Alice\n  domain: CORP\n", 1)+`
+server:
+  listen: 127.0.0.1:1445
+  min_dialect: "3.0"
+  netbios_name: PROXY1
+  netbios_domain: CORP
+  dns_name: proxy1.corp.example
+  dns_domain: corp.example
+  signing: required
+  encryption: required
+  compression: true
+  durable_handles:
+    enabled: true
+    timeout: 2m
+    max_timeout: 5m
+  max_connections: -1
+  timeouts:
+    idle: 0
+    write: 10s
+`)
+	sc := cfg.serverConfig()
+	if cfg.listen != "127.0.0.1:1445" || sc.MinDialect != smb.DialectSmb_3_0 {
+		t.Errorf("listen %q, min dialect %#x", cfg.listen, sc.MinDialect)
+	}
+	if sc.NetBIOSName != "PROXY1" || sc.NetBIOSDomain != "CORP" ||
+		sc.DnsComputerName != "proxy1.corp.example" || sc.DnsDomainName != "corp.example" {
+		t.Errorf("identity = %q/%q/%q/%q", sc.NetBIOSName, sc.NetBIOSDomain, sc.DnsComputerName, sc.DnsDomainName)
+	}
+	if !sc.SigningRequired || !sc.EncryptionSupported || !sc.RequireEncryption || !sc.Compression {
+		t.Errorf("signing/encryption/compression = %t/%t/%t/%t, want all on",
+			sc.SigningRequired, sc.EncryptionSupported, sc.RequireEncryption, sc.Compression)
+	}
+	if !sc.DurableHandles || sc.DurableHandleTimeout != 2*time.Minute || sc.MaxDurableHandleTimeout != 5*time.Minute {
+		t.Errorf("durable handles = %t %s/%s, want on 2m/5m", sc.DurableHandles, sc.DurableHandleTimeout, sc.MaxDurableHandleTimeout)
+	}
+	// 0 (no limit) and -1 become go-smb's "no limit", a negative value; 0
+	// would select its default instead.
+	if sc.MaxConnections != -1 || sc.IdleTimeout >= 0 || sc.WriteTimeout != 10*time.Second {
+		t.Errorf("limits = %d conns, idle %s, write %s; want -1, negative, 10s", sc.MaxConnections, sc.IdleTimeout, sc.WriteTimeout)
+	}
+	// Accounts are keyed by lower-cased user name; the domain is enforced.
+	if auth := sc.Authenticator.(*server.MapAuthenticator); auth.Domain != "CORP" || auth.Accounts["alice"] == nil {
+		t.Errorf("authenticator = %+v, want alice in domain CORP", auth)
+	}
+
+	off, _ := mustParse(t, minimalConfig+"server:\n  encryption: off\n")
+	if sc := off.serverConfig(); sc.EncryptionSupported || sc.RequireEncryption {
+		t.Errorf("encryption off: supported=%t required=%t, want both false", sc.EncryptionSupported, sc.RequireEncryption)
+	}
+}
+
+// SMB 2.x clients cannot encrypt, so requiring encryption while still
+// admitting them is flagged.
+func TestServerEncryptionWarnings(t *testing.T) {
+	encryptedShare := minimalConfig + "    encrypt: true\n"
+	cases := []struct {
+		name, yaml, want string // want "" means no warning
+	}{
+		{"required with SMB 2.x allowed", minimalConfig + "server:\n  encryption: required\n", "encryption is required"},
+		{"encrypted share with SMB 2.x allowed", encryptedShare, "some shares require encryption"},
+		{"required with SMB 3.0 minimum", minimalConfig + "server:\n  encryption: required\n  min_dialect: \"3.0\"\n", ""},
+		{"encrypted share with SMB 3.0 minimum", encryptedShare + "server:\n  min_dialect: \"3.0\"\n", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, warnings := mustParse(t, c.yaml)
+			if c.want == "" {
+				if len(warnings) != 0 {
+					t.Errorf("warnings = %v, want none", warnings)
+				}
+				return
+			}
+			if len(warnings) != 1 || !strings.Contains(warnings[0], c.want) {
+				t.Errorf("warnings = %v, want one containing %q", warnings, c.want)
+			}
+
+		})
+	}
+	cfg, _ := mustParse(t, encryptedShare)
+	if !cfg.shares[0].encrypt {
+		t.Error("share encrypt: true did not reach the share")
 	}
 }
 
@@ -191,10 +310,26 @@ func TestConfigErrors(t *testing.T) {
 		{"unknown key", minimalConfig + "listne: :445\n", "field listne is not a known setting at the top level"},
 		{"misspelled nested key", replace("    password: secret", "    pasword: secret"), "field pasword is not a known setting for a target"},
 		{"duplicate target", replace("targets:\n", "targets:\n  t1:\n    host: x\n"), "already defined"},
-		{"bad dialect", minimalConfig + "max_dialect: 4.0\n", "max_dialect"},
-		{"min above max", minimalConfig + "min_dialect: 3.1.1\nmax_dialect: 3.0\n", "above max_dialect"},
-		{"negative timeout", minimalConfig + "timeouts:\n  io: -1s\n", "negative"},
-		{"timeout without unit", minimalConfig + "timeouts:\n  io: 30\n", "use a unit"},
+		{"old top-level timeouts", minimalConfig + "timeouts:\n  io: 1m\n", "field timeouts is not a known setting at the top level"},
+		{"bad dialect", minimalConfig + "server:\n  max_dialect: 4.0\n", "server: max_dialect"},
+		{"min above max", minimalConfig + "server:\n  min_dialect: 3.1.1\n  max_dialect: 3.0\n", "above max_dialect"},
+		{"negative timeout", minimalConfig + "target_timeouts:\n  io: -1s\n", "negative"},
+		{"timeout without unit", minimalConfig + "target_timeouts:\n  io: 30\n", "use a unit"},
+		{"unknown server key", minimalConfig + "server:\n  signin: required\n", "field signin is not a known setting under server"},
+		{"bad signing", minimalConfig + "server:\n  signing: always\n", "use enabled or required"},
+		{"bad encryption", minimalConfig + "server:\n  encryption: true\n", "use off, supported or required"},
+		{"empty netbios name", minimalConfig + "server:\n  netbios_name: \"\"\n", "netbios_name is required"},
+		{"long netbios name", minimalConfig + "server:\n  netbios_name: ABCDEFGHIJKLMNOP\n", "at most 15"},
+		{"bad netbios domain", minimalConfig + "server:\n  netbios_domain: CORP/X\n", "do not allow"},
+		{"durable timeout above max", minimalConfig + "server:\n  durable_handles:\n    timeout: 20m\n", "above max_timeout"},
+		{"durable timeout zero", minimalConfig + "server:\n  durable_handles:\n    timeout: 0\n", "must be positive"},
+		{"zero max_connections", minimalConfig + "server:\n  max_connections: 0\n", "-1 for no limit"},
+		{"negative client timeout", minimalConfig + "server:\n  timeouts:\n    write: -1s\n", "server: timeouts"},
+		{"required signing with guest", replace("  password: pw\n", "  password: pw\n  allow_guest: true\n") +
+			"server:\n  signing: required\n", "cannot provide"},
+		{"required encryption with anonymous", replace("  password: pw\n", "  password: pw\n  allow_anonymous: true\n") +
+			"server:\n  encryption: required\n", "cannot provide"},
+		{"share encrypt without server encryption", minimalConfig + "    encrypt: true\nserver:\n  encryption: off\n", "encrypt needs"},
 		{"no local login", without("  user: alice\n  password: pw\n"), "no way for clients to log in"},
 		{"local credential without user", without("  user: alice\n"), "no user"},
 		{"local user without credential", without("  password: pw\n"), "exactly one of"},
