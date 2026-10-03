@@ -379,9 +379,24 @@ func (sizedVFS) QueryFSInfo(_ context.Context, class byte) (any, uint32, error) 
 	return nil, smb.StatusNotSupported, nil
 }
 
+// QuerySecurity gives every file a self-relative descriptor naming one owner,
+// S-1-5-21-1-2-3-1000, unlike go-smb's default.
+func (sizedVFS) QuerySecurity(context.Context, server.Handle, uint32) ([]byte, uint32, error) {
+	le := binary.LittleEndian
+	sd := []byte{1, 0}                      // Revision, Sbz1
+	sd = le.AppendUint16(sd, 0x8000)        // Control: SE_SELF_RELATIVE
+	sd = le.AppendUint32(sd, 20)            // OffsetOwner
+	sd = append(sd, make([]byte, 12)...)    // OffsetGroup, OffsetSacl, OffsetDacl: none
+	sd = append(sd, 1, 5, 0, 0, 0, 0, 0, 5) // the owner: S-1-5, 5 sub-authorities
+	for _, v := range []uint32{21, 1, 2, 3, 1000} {
+		sd = le.AppendUint32(sd, v)
+	}
+	return sd, smb.StatusOk, nil
+}
+
 // A mapped drive shows the target volume's size, free space, sector sizes and
-// file system attributes, whether the share maps a folder or the target
-// share's root.
+// file system attributes, and its root the mapped folder's permissions,
+// whether the share maps a folder or the target share's root.
 func TestIntegrationVolumeSize(t *testing.T) {
 	sized := startTargetVFS(t, sizedVFS{memvfs.New(memvfs.Options{})})
 	direct := connect(t, sized, "admin", "x", "data")
@@ -422,6 +437,10 @@ func TestIntegrationVolumeSize(t *testing.T) {
 		attrs, err := root.QueryFSInfo(fsAttributeInformation, 512)
 		if want := fsAttributes(0x0f, "NTFS"); err != nil || !bytes.Equal(attrs, want) {
 			t.Errorf("%s: attribute info = (% x, %v), want % x: NTFS with persistent ACLs", share, attrs, err, want)
+		}
+		sd, err := f.QueryInfoSecurityRaw(0x1, 0) // OWNER_SECURITY_INFORMATION
+		if err != nil || sd.OwnerSid == nil || sd.OwnerSid.ToString() != "S-1-5-21-1-2-3-1000" {
+			t.Errorf("%s: root's descriptor = (%+v, %v), want the target's, owned by S-1-5-21-1-2-3-1000", share, sd, err)
 		}
 		_ = f.CloseFile()
 	}

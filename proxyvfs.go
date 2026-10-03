@@ -892,10 +892,11 @@ func fsLength(class byte, buf []byte) int {
 // QuerySecurity proxies the client's request for a file's security descriptor
 // (the Explorer "Security" tab: real owner, group and ACLs) through to the
 // target. It operates on the already-open handle like Read/QueryDirectory, so
-// it does not redial on a transport error. On anything that leaves no real
-// descriptor — the synthetic root, a closed handle, or an upstream error — it
-// returns StatusNotSupported so the library falls back to its default
-// descriptor and Properties still opens.
+// it does not redial on a transport error. The synthetic root has no handle on
+// the target: its descriptor is the mapped folder's (see rootSecurity). On
+// anything that leaves no real descriptor — a closed handle, or an upstream
+// error — it returns StatusNotSupported so the library falls back to its
+// default descriptor and Properties still opens.
 func (v *proxyVFS) QuerySecurity(_ context.Context, h server.Handle, additionalInformation uint32) (buf []byte, status uint32, err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -905,6 +906,14 @@ func (v *proxyVFS) QuerySecurity(_ context.Context, h server.Handle, additionalI
 	}()
 
 	ph := h.(*proxyHandle)
+	if ph.isRoot {
+		sd, err := v.rootSecurity(additionalInformation)
+		if err != nil {
+			log.Printf("[proxy] QuerySecurity of the mapped folder: upstream error: %v", err)
+			return nil, smb.StatusNotSupported, nil
+		}
+		return sd, smb.StatusOk, nil
+	}
 	ph.fileMu.RLock()
 	file := ph.file
 	ph.fileMu.RUnlock()
@@ -923,6 +932,24 @@ func (v *proxyVFS) QuerySecurity(_ context.Context, h server.Handle, additionalI
 		return nil, smb.StatusNotSupported, nil
 	}
 	return sd, smb.StatusOk, nil
+}
+
+// rootSecurity returns the security descriptor of the mapped folder, the
+// share's root, opening it on the target for reading its descriptor alone.
+func (v *proxyVFS) rootSecurity(additionalInformation uint32) ([]byte, error) {
+	var sd []byte
+	err := v.up.do(func(c upstreamConn) error {
+		o := openDirOpts()
+		o.DesiredAccess = smb.FAccMaskReadControl | smb.FAccMaskFileReadAttributes | smb.FAccMaskSynchronize
+		f, err := c.OpenFileExt(v.share, v.base, o)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = f.CloseFile() }()
+		sd, err = f.QuerySecurity(additionalInformation)
+		return err
+	})
+	return sd, err
 }
 
 // FSCTL codes answered by Ioctl (MS-FSCC 2.3).

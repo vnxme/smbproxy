@@ -1030,13 +1030,43 @@ func TestProxyQuerySecurity(t *testing.T) {
 	}
 }
 
+// The share's root shows the mapped folder's descriptor: the folder is opened
+// for reading its descriptor alone, queried and closed.
+func TestProxyQuerySecurityRoot(t *testing.T) {
+	sd := []byte{1, 0, 4, 0x80, 0, 0, 0, 0}
+	ff := &fakeFile{isDir: true, secData: sd}
+	var gotPath string
+	var gotOpts *smb.CreateReqOpts
+	c := &fakeConn{openFn: func(_, p string, opts *smb.CreateReqOpts) (upstreamFile, error) {
+		gotPath, gotOpts = p, opts
+		return ff, nil
+	}}
+	v := &proxyVFS{up: &upstream{t: testTarget(), conn: c}, share: "C$", base: "Users"}
+
+	const dacl = 0x4
+	buf, status, err := v.QuerySecurity(context.Background(), syntheticRootHandle("C$"), dacl)
+	if err != nil || status != smb.StatusOk || !bytes.Equal(buf, sd) {
+		t.Fatalf("QuerySecurity root = (% x, 0x%08x, %v), want the mapped folder's descriptor", buf, status, err)
+	}
+	if gotPath != "Users" || ff.secInfo != dacl || !ff.closed {
+		t.Errorf("opened %q, asked 0x%x, closed %t; want Users, 0x%x, closed", gotPath, ff.secInfo, ff.closed, dacl)
+	}
+	if want := uint32(smb.FAccMaskReadControl | smb.FAccMaskFileReadAttributes | smb.FAccMaskSynchronize); gotOpts.DesiredAccess != want {
+		t.Errorf("opened with access 0x%08x, want 0x%08x", gotOpts.DesiredAccess, want)
+	}
+}
+
 func TestProxyQuerySecurityFallbacks(t *testing.T) {
 	v := newVFS(&fakeConn{})
 
-	// Synthetic root / closed handle: no upstream file -> let the library
-	// supply its default descriptor.
+	// Closed handle: no upstream file -> let the library supply its default
+	// descriptor.
 	if _, status, _ := v.QuerySecurity(context.Background(), &proxyHandle{}, 0); status != smb.StatusNotSupported {
 		t.Errorf("QuerySecurity on fileless handle = 0x%08x, want StatusNotSupported", status)
+	}
+	// So does a root whose mapped folder cannot be opened.
+	if _, status, _ := v.QuerySecurity(context.Background(), syntheticRootHandle("C$"), 0); status != smb.StatusNotSupported {
+		t.Errorf("QuerySecurity on root, folder unopenable = 0x%08x, want StatusNotSupported", status)
 	}
 
 	// An upstream error must not fail the client's query; fall back to default.
