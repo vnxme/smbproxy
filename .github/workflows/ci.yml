@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "Not formatted with gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: Vet
+        run: go vet ./...
+      - name: Module tidiness
+        run: go mod tidy -diff
+      - name: Known vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  test:
+    # Natively, with the race detector.
+    name: Test (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Test
+        run: go test -race -count=1 ./...
+
+  build:
+    # Cross-compiles for every platform smbproxy supports, including those
+    # without a hosted runner.
+    name: Build (all platforms)
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "0"
+      TARGETS: >-
+        darwin/amd64 darwin/arm64
+        linux/386 linux/amd64 linux/arm linux/arm64 linux/loong64
+        linux/mips linux/mips64 linux/mips64le linux/mipsle
+        linux/ppc64 linux/ppc64le linux/riscv64 linux/s390x
+        windows/386 windows/amd64 windows/arm64
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Cross-compile
+        run: |
+          failed=""
+          for target in $TARGETS; do
+            echo "::group::$target"
+            if ! GOOS=${target%/*} GOARCH=${target#*/} go build -o /dev/null .; then
+              failed="$failed $target"
+            fi
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then
+            echo "Failed to build for:$failed"
+            exit 1
+          fi
