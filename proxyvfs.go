@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash/fnv"
 	"io"
 	"log"
@@ -103,6 +104,15 @@ type proxyVFS struct {
 	// refuses writes from everyone else; this only decides how Create opens
 	// a file on the target (see createForWrite).
 	canWrite func(*server.Session) bool
+
+	fsMu         sync.Mutex
+	fsCache      map[byte]fsCached // target volume information by class (see volumeInfo)
+	noSectorInfo bool              // the target refused FileFsSectorSizeInformation
+}
+
+type fsCached struct {
+	at  time.Time
+	buf []byte
 }
 
 func openDirOpts() *smb.CreateReqOpts {
@@ -665,29 +675,52 @@ func entryRel(dirRel, name string) string {
 // Filesystem information classes answered by QueryFSInfo (MS-FSCC 2.5).
 const (
 	fsVolumeInformation     = 0x01
+	fsSizeInformation       = 0x03
 	fsDeviceInformation     = 0x04
 	fsFullSizeInformation   = 0x07
 	fsObjectIDInformation   = 0x08
 	fsSectorSizeInformation = 0x0b
 )
 
-// Synthetic volume geometry. It matches what go-smb's fallback reports for
-// FileFsSizeInformation (0x03), so every size class describes the same volume:
-// 16M units of 8 x 512-byte sectors, half of them free.
-const (
-	fsTotalUnits     = 1 << 24
-	fsFreeUnits      = 1 << 23
-	fsSectorsPerUnit = 8
-	fsBytesPerSector = 512
-)
+// fsSizes are the sizes of the structures of the classes passed through from
+// the target: the only part of its reply passed on.
+var fsSizes = map[byte]int{fsSizeInformation: 24, fsFullSizeInformation: 32, fsSectorSizeInformation: 28}
 
-// QueryFSInfo answers the filesystem classes Windows clients query that
-// go-smb's fallback cannot serialize, or serializes unsafely; the rest (size
-// and attribute information) are left to that fallback. go-smb cannot query
-// the target's volume, so the values are synthetic but self-consistent.
+// fsBytesPerSector is the sector size assumed when a target reports none.
+const fsBytesPerSector = 512
+
+// fsCacheTTL is how long a target's volume information is reused. Explorer
+// asks for it several times in a row when it shows a drive.
+const fsCacheTTL = 2 * time.Second
+
+// QueryFSInfo answers the filesystem classes Windows clients query. The volume
+// sizes (Explorer's drive size and free space, and the free space checked
+// before a copy) and sector sizes come from the target's volume holding the
+// mapped folder, including any quota the target applies to its account. The
+// other classes are ones go-smb's fallback cannot serialize, or serializes
+// unsafely, answered with synthetic but self-consistent values; the rest
+// (attribute information) are left to that fallback.
 func (v *proxyVFS) QueryFSInfo(_ context.Context, class byte) (any, uint32, error) {
 	le := binary.LittleEndian
 	switch class {
+	case fsSizeInformation, fsFullSizeInformation, fsSectorSizeInformation:
+		var buf []byte
+		var err error
+		if class == fsSectorSizeInformation {
+			buf, err = v.sectorSize()
+		} else {
+			buf, err = v.volumeInfo(class)
+		}
+		if err != nil {
+			status := errToStatus(err)
+			if status == smb.StatusNotSupported {
+				// Not a fallback to go-smb's invented sizes: those are what
+				// this replaces.
+				status = statusInvalidDeviceRequest
+			}
+			return nil, status, nil
+		}
+		return buf, smb.StatusOk, nil
 	case fsVolumeInformation:
 		// go-smb's fallback appends the share name as the volume label and
 		// never trims a reply to the client's OutputBufferLength, which this
@@ -706,29 +739,97 @@ func (v *proxyVFS) QueryFSInfo(_ context.Context, class byte) (any, uint32, erro
 		le.PutUint32(buf[0:], 0x00000007) // DeviceType: FILE_DEVICE_DISK
 		le.PutUint32(buf[4:], 0x00000020) // Characteristics: FILE_DEVICE_IS_MOUNTED
 		return buf, smb.StatusOk, nil
-	case fsFullSizeInformation:
-		buf := make([]byte, 32)
-		le.PutUint64(buf[0:], fsTotalUnits)
-		le.PutUint64(buf[8:], fsFreeUnits)  // CallerAvailableAllocationUnits
-		le.PutUint64(buf[16:], fsFreeUnits) // ActualAvailableAllocationUnits
-		le.PutUint32(buf[24:], fsSectorsPerUnit)
-		le.PutUint32(buf[28:], fsBytesPerSector)
-		return buf, smb.StatusOk, nil
 	case fsObjectIDInformation:
 		// ObjectId is the volume ID objectID reports as BirthVolumeId;
 		// ExtendedInfo (48 bytes) stays zero.
 		buf := make([]byte, 64)
 		copy(buf, v.objectID("")[16:32])
 		return buf, smb.StatusOk, nil
-	case fsSectorSizeInformation:
-		buf := make([]byte, 28)
-		for i := range 4 { // logical, physical (atomicity, performance), effective
-			le.PutUint32(buf[4*i:], fsBytesPerSector)
-		}
-		le.PutUint32(buf[16:], 0x00000003) // SSINFO_FLAGS_ALIGNED_DEVICE | _PARTITION_ALIGNED_ON_DEVICE
-		return buf, smb.StatusOk, nil
 	}
 	return nil, smb.StatusNotSupported, nil
+}
+
+// sectorSize returns FileFsSectorSizeInformation from the target. A target
+// without it (SMB 2 servers before Windows 8, older Samba) is not asked again;
+// the reply is then built from the sector size the target reports in its
+// FileFsSizeInformation, so every class describes the same volume.
+func (v *proxyVFS) sectorSize() ([]byte, error) {
+	v.fsMu.Lock()
+	noSectorInfo := v.noSectorInfo
+	v.fsMu.Unlock()
+	if !noSectorInfo {
+		buf, err := v.volumeInfo(fsSectorSizeInformation)
+		if !classRefused(err) {
+			return buf, err
+		}
+		v.fsMu.Lock()
+		v.noSectorInfo = true
+		v.fsMu.Unlock()
+	}
+	size, err := v.volumeInfo(fsSizeInformation)
+	if err != nil {
+		return nil, err
+	}
+	return sectorSizeInfo(binary.LittleEndian.Uint32(size[20:])), nil
+}
+
+// classRefused reports whether err is a target's refusal of an information
+// class it does not implement.
+func classRefused(err error) bool {
+	code, ok := ntStatus(err)
+	return ok && (code == smb.StatusNotSupported || code == statusInvalidInfoClass || code == smb.StatusInvalidParameter)
+}
+
+// sectorSizeInfo builds FileFsSectorSizeInformation for a volume with
+// bytesPerSector-byte sectors, aligned on its device.
+func sectorSizeInfo(bytesPerSector uint32) []byte {
+	if bytesPerSector == 0 {
+		bytesPerSector = fsBytesPerSector
+	}
+	buf := make([]byte, 28)
+	for i := range 4 { // logical, physical (atomicity, performance), effective
+		binary.LittleEndian.PutUint32(buf[4*i:], bytesPerSector)
+	}
+	binary.LittleEndian.PutUint32(buf[16:], 0x00000003) // SSINFO_FLAGS_ALIGNED_DEVICE | _PARTITION_ALIGNED_ON_DEVICE
+	return buf
+}
+
+// volumeInfo returns a filesystem information class from the target: the
+// reply to querying the mapped folder, cut to the class's structure, and
+// reused for fsCacheTTL. QUERY_INFO needs an open handle, so the folder is
+// opened for attributes alone and closed again.
+func (v *proxyVFS) volumeInfo(class byte) ([]byte, error) {
+	v.fsMu.Lock()
+	defer v.fsMu.Unlock()
+	if c, ok := v.fsCache[class]; ok && time.Since(c.at) < fsCacheTTL {
+		return c.buf, nil
+	}
+
+	size := fsSizes[class]
+	var buf []byte
+	err := v.up.do(func(c upstreamConn) error {
+		o := openDirOpts()
+		o.DesiredAccess = smb.FAccMaskFileReadAttributes | smb.FAccMaskSynchronize
+		f, err := c.OpenFileExt(v.share, v.base, o)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = f.CloseFile() }()
+		buf, err = f.QueryFSInfo(class, uint32(size))
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(buf) < size {
+		return nil, fmt.Errorf("target answered FS info class 0x%02x with %d bytes, want %d", class, len(buf), size)
+	}
+	buf = buf[:size]
+	if v.fsCache == nil {
+		v.fsCache = make(map[byte]fsCached)
+	}
+	v.fsCache[class] = fsCached{at: time.Now(), buf: buf}
+	return buf, nil
 }
 
 // QuerySecurity proxies the client's request for a file's security descriptor

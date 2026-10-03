@@ -32,6 +32,12 @@ import (
 // a loopback port, standing in for a target server.
 func startTarget(t *testing.T) (port int) {
 	t.Helper()
+	return startTargetVFS(t, memvfs.New(memvfs.Options{}))
+}
+
+// startTargetVFS is startTarget with vfs as the share's file system.
+func startTargetVFS(t *testing.T, vfs server.VFS) (port int) {
+	t.Helper()
 	srv := &server.Server{Config: &server.ServerConfig{
 		Authenticator: &server.MapAuthenticator{Accounts: map[string]*server.Account{
 			"admin": {NTHash: ntlmssp.Ntowfv1("x")},
@@ -39,7 +45,7 @@ func startTarget(t *testing.T) (port int) {
 		MaxReadSize:  1 << 20,
 		MaxWriteSize: 1 << 20,
 	}}
-	srv.RegisterShare("data", server.Share{Name: "data", Type: smb.ShareTypeDisk, VFS: memvfs.New(memvfs.Options{})})
+	srv.RegisterShare("data", server.Share{Name: "data", Type: smb.ShareTypeDisk, VFS: vfs})
 	return serve(t, srv)
 }
 
@@ -336,5 +342,77 @@ func TestIntegrationWriteRefused(t *testing.T) {
 	}
 	if got, _ := getFile(t, direct, "data", `inner\keep.txt`); string(got) != "original" {
 		t.Errorf("keep.txt is %q on the target, want \"original\"", got)
+	}
+}
+
+// sizedVFS is a target file system reporting a volume of its own, unlike
+// go-smb's default sizes, so a test can tell them apart.
+type sizedVFS struct {
+	server.VFS
+}
+
+func (sizedVFS) QueryFSInfo(_ context.Context, class byte) (any, uint32, error) {
+	le := binary.LittleEndian
+	switch class {
+	case fsSizeInformation: // total, available, sectors per unit, bytes per sector
+		buf := le.AppendUint64(nil, 1000)
+		buf = le.AppendUint64(buf, 300)
+		return le.AppendUint32(le.AppendUint32(buf, 2), 4096), smb.StatusOk, nil
+	case fsFullSizeInformation: // total, caller available, actual available, ...
+		buf := le.AppendUint64(nil, 1000)
+		buf = le.AppendUint64(buf, 250)
+		buf = le.AppendUint64(buf, 300)
+		return le.AppendUint32(le.AppendUint32(buf, 2), 4096), smb.StatusOk, nil
+	case fsSectorSizeInformation: // 512-byte logical sectors on a 4K-sector disk
+		buf := le.AppendUint32(nil, 512)
+		buf = le.AppendUint32(buf, 4096)
+		buf = le.AppendUint32(buf, 4096)
+		buf = le.AppendUint32(buf, 512)
+		buf = le.AppendUint32(buf, 0x3)
+		return le.AppendUint32(le.AppendUint32(buf, 0), 0), smb.StatusOk, nil
+	}
+	return nil, smb.StatusNotSupported, nil
+}
+
+// A mapped drive shows the target volume's size, free space and sector sizes,
+// whether the share maps a folder or the target share's root.
+func TestIntegrationVolumeSize(t *testing.T) {
+	sized := startTargetVFS(t, sizedVFS{memvfs.New(memvfs.Options{})})
+	direct := connect(t, sized, "admin", "x", "data")
+	if err := direct.Mkdir("data", `inner`); err != nil {
+		t.Fatal(err)
+	}
+	proxyPort := startProxy(t, proxyConfig+`  - name: whole
+    target: mem
+    path: data
+`, sized)
+
+	for _, share := range []string{"files", "whole"} {
+		conn := connect(t, proxyPort, "alice", "a", share)
+		opts := smb.NewCreateReqOpts()
+		opts.DesiredAccess = smb.FAccMaskFileReadAttributes | smb.FAccMaskSynchronize
+		opts.ShareAccess = smb.FileShareRead | smb.FileShareWrite | smb.FileShareDelete
+		opts.CreateOpts = smb.FileDirectoryFile
+		f, err := conn.OpenFileExt(share, "", opts)
+		if err != nil {
+			t.Fatalf("%s: open root: %v", share, err)
+		}
+		root := smbFile{File: f, share: share}
+		le := binary.LittleEndian
+		size, err := root.QueryFSInfo(fsSizeInformation, 64)
+		if err != nil || len(size) != 24 || le.Uint64(size[0:]) != 1000 || le.Uint64(size[8:]) != 300 ||
+			le.Uint32(size[20:]) != 4096 {
+			t.Errorf("%s: size info = (% x, %v), want 1000 units, 300 free, 4096-byte sectors", share, size, err)
+		}
+		full, err := root.QueryFSInfo(fsFullSizeInformation, 64)
+		if err != nil || len(full) != 32 || le.Uint64(full[0:]) != 1000 || le.Uint64(full[8:]) != 250 ||
+			le.Uint64(full[16:]) != 300 {
+			t.Errorf("%s: full size info = (% x, %v), want 1000 units, 250 available, 300 free", share, full, err)
+		}
+		sector, err := root.QueryFSInfo(fsSectorSizeInformation, 64)
+		if err != nil || len(sector) != 28 || le.Uint32(sector[0:]) != 512 || le.Uint32(sector[4:]) != 4096 {
+			t.Errorf("%s: sector size info = (% x, %v), want 512-byte logical, 4096-byte physical sectors", share, sector, err)
+		}
+		_ = f.CloseFile()
 	}
 }

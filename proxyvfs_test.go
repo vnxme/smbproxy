@@ -36,11 +36,16 @@ type fakeFile struct {
 	secInfo uint32           // additionalInformation of the last QuerySecurity call
 	stall   bool             // ReadFile and QueryDirectory block until their context ends
 
-	writeErr     error  // if set, WriteFile returns it
-	flushes      int    // Flush call count
-	setInfoClass byte   // class of the last SetInfo
-	setInfoBuf   []byte // payload of the last SetInfo
-	setInfoErr   error  // if set, SetInfo returns it
+	writeErr     error                            // if set, WriteFile returns it
+	flushes      int                              // Flush call count
+	setInfoClass byte                             // class of the last SetInfo
+	setInfoBuf   []byte                           // payload of the last SetInfo
+	setInfoErr   error                            // if set, SetInfo returns it
+	fsData       []byte                           // reply QueryFSInfo returns
+	fsErr        error                            // if set, QueryFSInfo returns it
+	fsFn         func(class byte) ([]byte, error) // if set, answers QueryFSInfo instead
+	fsClass      byte                             // class of the last QueryFSInfo
+	fsQueries    int                              // QueryFSInfo call count
 	isDir        bool
 	metaVal      fileMeta
 	closed       bool
@@ -144,6 +149,17 @@ func (f *fakeFile) QuerySecurity(additionalInformation uint32) ([]byte, error) {
 		return nil, f.secErr
 	}
 	return f.secData, nil
+}
+
+func (f *fakeFile) QueryFSInfo(class byte, _ uint32) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fsClass = class
+	f.fsQueries++
+	if f.fsFn != nil {
+		return f.fsFn(class)
+	}
+	return f.fsData, f.fsErr
 }
 
 func (f *fakeFile) IsDir() bool    { return f.isDir }
@@ -1104,18 +1120,9 @@ func TestProxyQueryFSInfo(t *testing.T) {
 	if dev := query(fsDeviceInformation, 8); le.Uint32(dev[0:]) != 7 {
 		t.Errorf("DeviceType = %d, want FILE_DEVICE_DISK (7)", le.Uint32(dev[0:]))
 	}
-	full := query(fsFullSizeInformation, 32)
-	if le.Uint64(full[0:]) != fsTotalUnits || le.Uint64(full[8:]) != fsFreeUnits ||
-		le.Uint32(full[24:]) != fsSectorsPerUnit || le.Uint32(full[28:]) != fsBytesPerSector {
-		t.Errorf("full size info = % x, want total/free/sectors/bytes %d/%d/%d/%d",
-			full, fsTotalUnits, fsFreeUnits, fsSectorsPerUnit, fsBytesPerSector)
-	}
 	// The volume object ID is the BirthVolumeId in every file's object ID.
 	if obj := query(fsObjectIDInformation, 64); !bytes.Equal(obj[0:16], v.objectID("x")[16:32]) {
 		t.Errorf("volume ObjectId = %x, want the files' BirthVolumeId %x", obj[0:16], v.objectID("x")[16:32])
-	}
-	if sec := query(fsSectorSizeInformation, 28); le.Uint32(sec[0:]) != fsBytesPerSector {
-		t.Errorf("LogicalBytesPerSector = %d, want %d", le.Uint32(sec[0:]), fsBytesPerSector)
 	}
 
 	// Volume info must fit the 24-byte buffer GetFileInformationByHandle
@@ -1133,8 +1140,123 @@ func TestProxyQueryFSInfo(t *testing.T) {
 	}
 
 	// Classes go-smb serializes safely itself are left to its fallback.
-	if _, status, _ := v.QueryFSInfo(context.Background(), 0x03); status != smb.StatusNotSupported {
-		t.Errorf("size info (0x03) = 0x%08x, want StatusNotSupported (library fallback)", status)
+	if _, status, _ := v.QueryFSInfo(context.Background(), 0x05); status != smb.StatusNotSupported {
+		t.Errorf("attribute info (0x05) = 0x%08x, want StatusNotSupported (library fallback)", status)
+	}
+}
+
+// The volume size classes come from the target: the mapped folder is opened
+// for attributes alone, queried and closed, and the reply is cut to the
+// class's structure.
+func TestProxyQueryFSInfoSizes(t *testing.T) {
+	reply := make([]byte, 40) // longer than either structure
+	for i := range reply {
+		reply[i] = byte(i + 1)
+	}
+	ff := &fakeFile{isDir: true, fsData: reply}
+	var gotPath string
+	var gotOpts *smb.CreateReqOpts
+	c := &fakeConn{openFn: func(_, p string, opts *smb.CreateReqOpts) (upstreamFile, error) {
+		gotPath, gotOpts = p, opts
+		return ff, nil
+	}}
+	v := &proxyVFS{up: &upstream{t: testTarget(), conn: c}, share: "C$", base: `Users\Public`}
+
+	for _, tt := range []struct {
+		class byte
+		size  int
+	}{{fsSizeInformation, 24}, {fsFullSizeInformation, 32}, {fsSectorSizeInformation, 28}} {
+		out, status, err := v.QueryFSInfo(context.Background(), tt.class)
+		if err != nil || status != smb.StatusOk || !bytes.Equal(out.([]byte), reply[:tt.size]) {
+			t.Errorf("class 0x%02x = (% x, 0x%08x, %v), want the target's first %d bytes", tt.class, out, status, err, tt.size)
+		}
+		if ff.fsClass != tt.class {
+			t.Errorf("target queried for class 0x%02x, want 0x%02x", ff.fsClass, tt.class)
+		}
+	}
+	if gotPath != `Users\Public` {
+		t.Errorf(`opened %q, want the mapped folder Users\Public`, gotPath)
+	}
+	if gotOpts.DesiredAccess != smb.FAccMaskFileReadAttributes|smb.FAccMaskSynchronize {
+		t.Errorf("opened with access 0x%08x, want read attributes and synchronize", gotOpts.DesiredAccess)
+	}
+	if !ff.closed {
+		t.Errorf("the folder opened to query the volume was left open")
+	}
+
+	// A repeat within fsCacheTTL is answered from the cache.
+	if _, status, _ := v.QueryFSInfo(context.Background(), fsFullSizeInformation); status != smb.StatusOk || ff.fsQueries != 3 {
+		t.Errorf("repeat = 0x%08x after %d target queries, want Ok after 3", status, ff.fsQueries)
+	}
+	v.fsCache[fsFullSizeInformation] = fsCached{at: time.Now().Add(-fsCacheTTL), buf: reply[:32]}
+	if _, _, _ = v.QueryFSInfo(context.Background(), fsFullSizeInformation); ff.fsQueries != 4 {
+		t.Errorf("expired entry: %d target queries, want 4", ff.fsQueries)
+	}
+}
+
+// A target without FileFsSectorSizeInformation gets the sector size it
+// reports in FileFsSizeInformation, and is not asked for the class again.
+func TestProxyQueryFSInfoSectorFallback(t *testing.T) {
+	le := binary.LittleEndian
+	var sectorQueries int
+	ff := &fakeFile{isDir: true, fsFn: func(class byte) ([]byte, error) {
+		if class == fsSectorSizeInformation {
+			sectorQueries++
+			return nil, &smb.NTStatusError{Status: statusInvalidInfoClass}
+		}
+		size := make([]byte, 24)
+		le.PutUint32(size[16:], 8)    // SectorsPerAllocationUnit
+		le.PutUint32(size[20:], 4096) // BytesPerSector
+		return size, nil
+	}}
+	v := newVFS(&fakeConn{openFn: func(string, string, *smb.CreateReqOpts) (upstreamFile, error) { return ff, nil }})
+
+	for range 2 {
+		out, status, err := v.QueryFSInfo(context.Background(), fsSectorSizeInformation)
+		buf, _ := out.([]byte)
+		if err != nil || status != smb.StatusOk || !bytes.Equal(buf, sectorSizeInfo(4096)) {
+			t.Fatalf("sector info = (% x, 0x%08x, %v), want 4096-byte sectors", buf, status, err)
+		}
+	}
+	if sectorQueries != 1 {
+		t.Errorf("target asked for sector info %d times, want once", sectorQueries)
+	}
+	if b := sectorSizeInfo(0); le.Uint32(b[0:]) != fsBytesPerSector || le.Uint32(b[12:]) != fsBytesPerSector {
+		t.Errorf("no sector size reported: % x, want %d-byte sectors", b, fsBytesPerSector)
+	}
+
+	// Any other failure is passed on, and the class is asked for again.
+	ff.fsFn = func(byte) ([]byte, error) { return nil, &smb.NTStatusError{Status: smb.StatusAccessDenied} }
+	v = newVFS(&fakeConn{openFn: func(string, string, *smb.CreateReqOpts) (upstreamFile, error) { return ff, nil }})
+	if _, status, _ := v.QueryFSInfo(context.Background(), fsSectorSizeInformation); status != smb.StatusAccessDenied || v.noSectorInfo {
+		t.Errorf("denied = 0x%08x (noSectorInfo %t), want STATUS_ACCESS_DENIED and asking again", status, v.noSectorInfo)
+	}
+}
+
+// A target's refusal is passed on, except "not supported", which would make
+// go-smb invent sizes; a short reply is an error.
+func TestProxyQueryFSInfoSizeErrors(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		data []byte
+		err  error
+		want uint32
+	}{
+		{"access denied", nil, &smb.NTStatusError{Status: smb.StatusAccessDenied}, smb.StatusAccessDenied},
+		{"not supported", nil, &smb.NTStatusError{Status: smb.StatusNotSupported}, statusInvalidDeviceRequest},
+		{"short reply", make([]byte, 31), nil, statusUnexpectedNetworkError},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ff := &fakeFile{isDir: true, fsData: tt.data, fsErr: tt.err}
+			v := newVFS(&fakeConn{openFn: func(string, string, *smb.CreateReqOpts) (upstreamFile, error) { return ff, nil }})
+			out, status, err := v.QueryFSInfo(context.Background(), fsFullSizeInformation)
+			if err != nil || status != tt.want || out != nil {
+				t.Errorf("QueryFSInfo = (%v, 0x%08x, %v), want (nil, 0x%08x)", out, status, err, tt.want)
+			}
+			if len(v.fsCache) != 0 {
+				t.Errorf("a failure was cached: %v", v.fsCache)
+			}
+		})
 	}
 }
 

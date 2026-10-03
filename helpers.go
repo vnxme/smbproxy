@@ -82,6 +82,8 @@ func hasDotDot(p string) bool {
 
 // NTSTATUS codes go-smb does not define.
 const (
+	statusInvalidInfoClass       uint32 = 0xc0000003 // STATUS_INVALID_INFO_CLASS
+	statusInvalidDeviceRequest   uint32 = 0xc0000010 // STATUS_INVALID_DEVICE_REQUEST
 	statusIoTimeout              uint32 = 0xc00000b5 // STATUS_IO_TIMEOUT
 	statusBadNetworkPath         uint32 = 0xc00000be // STATUS_BAD_NETWORK_PATH
 	statusUnexpectedNetworkError uint32 = 0xc00000c4 // STATUS_UNEXPECTED_NETWORK_ERROR

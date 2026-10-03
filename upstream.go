@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
@@ -254,6 +256,10 @@ type upstreamFile interface {
 	// requesting the components named in additionalInformation, and returns it
 	// as self-relative wire bytes ready to hand back to the client.
 	QuerySecurity(additionalInformation uint32) ([]byte, error)
+	// QueryFSInfo queries the target for a filesystem information class of
+	// the volume holding the file, returning at most size bytes in wire
+	// format.
+	QueryFSInfo(class byte, size uint32) ([]byte, error)
 	CloseFile() error
 	IsDir() bool
 	// meta snapshots the metadata fields the proxy reads off a freshly opened
@@ -331,6 +337,43 @@ func (f smbFile) SetInfo(class byte, buf []byte) error {
 		return &smb.NTStatusError{Op: "SetInfo", Status: h.Status, Err: smb.StatusMap[h.Status]}
 	}
 	return nil
+}
+
+// QueryFSInfo sends a QUERY_INFO request for filesystem information through
+// SendRawPDU, as SetInfo does: go-smb's client has no call for it.
+func (f smbFile) QueryFSInfo(class byte, size uint32) ([]byte, error) {
+	req, err := f.File.Connection.NewQueryInfoReq(f.share, f.File.FileID(), smb.OInfoFilesystem, class, 0, 0, size, nil)
+	if err != nil {
+		return nil, err
+	}
+	pdu, err := req.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	res, err := f.File.Connection.SendRawPDU(pdu)
+	if err != nil {
+		return nil, err
+	}
+	var h smb.Header
+	if err := h.UnmarshalBinary(res); err != nil {
+		return nil, err
+	}
+	if h.Status != smb.StatusOk {
+		return nil, &smb.NTStatusError{Op: "QueryInfo", Status: h.Status, Err: smb.StatusMap[h.Status]}
+	}
+	// The body: StructureSize (2), OutputBufferOffset (2, from the start of
+	// the header), OutputBufferLength (4). Checked here, as go-smb's
+	// QueryInfoRes parser trusts both.
+	const body = 64
+	if len(res) < body+8 {
+		return nil, fmt.Errorf("QueryInfo: response too short (%d bytes)", len(res))
+	}
+	off := int(binary.LittleEndian.Uint16(res[body+2:]))
+	n := int(binary.LittleEndian.Uint32(res[body+4:]))
+	if off < body+8 || n > len(res)-off || n > int(size) {
+		return nil, fmt.Errorf("QueryInfo: output buffer %d+%d outside a %d-byte response", off, n, len(res))
+	}
+	return bytes.Clone(res[off : off+n]), nil
 }
 
 func (f smbFile) QueryDirectory(ctx context.Context, pattern string, flags byte, fileIndex, bufferSize uint32) ([]smb.SharedFile, error) {
