@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -689,14 +690,31 @@ const (
 	fsVolumeInformation     = 0x01
 	fsSizeInformation       = 0x03
 	fsDeviceInformation     = 0x04
+	fsAttributeInformation  = 0x05
 	fsFullSizeInformation   = 0x07
 	fsObjectIDInformation   = 0x08
 	fsSectorSizeInformation = 0x0b
 )
 
-// fsSizes are the sizes of the structures of the classes passed through from
-// the target: the only part of its reply passed on.
+// fsSizes are the sizes of the fixed-size structures of the classes passed
+// through from the target: the only part of its reply passed on.
 var fsSizes = map[byte]int{fsSizeInformation: 24, fsFullSizeInformation: 32, fsSectorSizeInformation: 28}
+
+// fsQueryBuffer is the reply size the target is allowed: enough for every
+// class passed through, FileFsAttributeInformation's file system name
+// included.
+const fsQueryBuffer = 512
+
+// fsProxiedAttributes are the FileFsAttributeInformation flags passed on from
+// the target: those describing names and ACLs, which the proxy passes through
+// as they are. FILE_PERSISTENT_ACLS is what makes Explorer show the Security
+// tab. The others announce operations the proxy does not carry (compression,
+// sparse files, reparse points, quotas, encryption, named streams, object
+// IDs, transactions...), so a client must not count on them.
+const fsProxiedAttributes = 0x00000001 | // FILE_CASE_SENSITIVE_SEARCH
+	0x00000002 | // FILE_CASE_PRESERVED_NAMES
+	0x00000004 | // FILE_UNICODE_ON_DISK
+	0x00000008 // FILE_PERSISTENT_ACLS
 
 // fsBytesPerSector is the sector size assumed when a target reports none.
 const fsBytesPerSector = 512
@@ -732,6 +750,15 @@ func (v *proxyVFS) QueryFSInfo(_ context.Context, class byte) (any, uint32, erro
 			}
 			return nil, status, nil
 		}
+		return buf, smb.StatusOk, nil
+	case fsAttributeInformation:
+		buf, err := v.volumeInfo(class)
+		if err != nil {
+			// go-smb's fallback: NTFS, preserving case, without ACLs.
+			return nil, smb.StatusNotSupported, nil
+		}
+		buf = bytes.Clone(buf)
+		le.PutUint32(buf, le.Uint32(buf)&fsProxiedAttributes)
 		return buf, smb.StatusOk, nil
 	case fsVolumeInformation:
 		// go-smb's fallback appends the share name as the volume label and
@@ -807,8 +834,8 @@ func sectorSizeInfo(bytesPerSector uint32) []byte {
 }
 
 // volumeInfo returns a filesystem information class from the target: the
-// reply to querying the mapped folder, cut to the class's structure, and
-// reused for fsCacheTTL. QUERY_INFO needs an open handle, so the folder is
+// reply to querying the mapped folder, cut to the class's structure (see
+// fsLength), and reused for fsCacheTTL. QUERY_INFO needs an open handle, so the folder is
 // opened for attributes alone and closed again.
 func (v *proxyVFS) volumeInfo(class byte) ([]byte, error) {
 	v.fsMu.Lock()
@@ -817,7 +844,6 @@ func (v *proxyVFS) volumeInfo(class byte) ([]byte, error) {
 		return c.buf, nil
 	}
 
-	size := fsSizes[class]
 	var buf []byte
 	err := v.up.do(func(c upstreamConn) error {
 		o := openDirOpts()
@@ -827,21 +853,40 @@ func (v *proxyVFS) volumeInfo(class byte) ([]byte, error) {
 			return err
 		}
 		defer func() { _ = f.CloseFile() }()
-		buf, err = f.QueryFSInfo(class, uint32(size))
+		buf, err = f.QueryFSInfo(class, fsQueryBuffer)
 		return err
 	})
 	if err != nil {
 		return nil, err
 	}
-	if len(buf) < size {
-		return nil, fmt.Errorf("target answered FS info class 0x%02x with %d bytes, want %d", class, len(buf), size)
+	n := fsLength(class, buf)
+	if n < 0 {
+		return nil, fmt.Errorf("target answered FS info class 0x%02x with a short reply (%d bytes)", class, len(buf))
 	}
-	buf = buf[:size]
+	buf = buf[:n]
 	if v.fsCache == nil {
 		v.fsCache = make(map[byte]fsCached)
 	}
 	v.fsCache[class] = fsCached{at: time.Now(), buf: buf}
 	return buf, nil
+}
+
+// fsLength returns the length of the class's structure at the start of buf,
+// or -1 if buf is too short to hold it.
+func fsLength(class byte, buf []byte) int {
+	n := fsSizes[class]
+	if class == fsAttributeInformation {
+		// FileSystemAttributes, MaximumComponentNameLength,
+		// FileSystemNameLength, then the name.
+		if len(buf) < 12 {
+			return -1
+		}
+		n = 12 + int(binary.LittleEndian.Uint32(buf[8:]))
+	}
+	if n == 0 || n > len(buf) {
+		return -1
+	}
+	return n
 }
 
 // QuerySecurity proxies the client's request for a file's security descriptor

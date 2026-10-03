@@ -373,12 +373,15 @@ func (sizedVFS) QueryFSInfo(_ context.Context, class byte) (any, uint32, error) 
 		buf = le.AppendUint32(buf, 512)
 		buf = le.AppendUint32(buf, 0x3)
 		return le.AppendUint32(le.AppendUint32(buf, 0), 0), smb.StatusOk, nil
+	case fsAttributeInformation: // NTFS as Windows reports it
+		return fsAttributes(0x03e700ff, "NTFS"), smb.StatusOk, nil
 	}
 	return nil, smb.StatusNotSupported, nil
 }
 
-// A mapped drive shows the target volume's size, free space and sector sizes,
-// whether the share maps a folder or the target share's root.
+// A mapped drive shows the target volume's size, free space, sector sizes and
+// file system attributes, whether the share maps a folder or the target
+// share's root.
 func TestIntegrationVolumeSize(t *testing.T) {
 	sized := startTargetVFS(t, sizedVFS{memvfs.New(memvfs.Options{})})
 	direct := connect(t, sized, "admin", "x", "data")
@@ -415,6 +418,10 @@ func TestIntegrationVolumeSize(t *testing.T) {
 		sector, err := root.QueryFSInfo(fsSectorSizeInformation, 64)
 		if err != nil || len(sector) != 28 || le.Uint32(sector[0:]) != 512 || le.Uint32(sector[4:]) != 4096 {
 			t.Errorf("%s: sector size info = (% x, %v), want 512-byte logical, 4096-byte physical sectors", share, sector, err)
+		}
+		attrs, err := root.QueryFSInfo(fsAttributeInformation, 512)
+		if want := fsAttributes(0x0f, "NTFS"); err != nil || !bytes.Equal(attrs, want) {
+			t.Errorf("%s: attribute info = (% x, %v), want % x: NTFS with persistent ACLs", share, attrs, err, want)
 		}
 		_ = f.CloseFile()
 	}

@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf16"
 
 	"github.com/jfjallid/go-smb/dcerpc"
 	"github.com/jfjallid/go-smb/dcerpc/mslsad"
@@ -1187,9 +1188,60 @@ func TestProxyQueryFSInfo(t *testing.T) {
 		t.Errorf("shares C$ and D$ report the same volume serial %x", vol[8:12])
 	}
 
-	// Classes go-smb serializes safely itself are left to its fallback.
-	if _, status, _ := v.QueryFSInfo(context.Background(), 0x05); status != smb.StatusNotSupported {
+	// Attribute information the target cannot give is left to go-smb's
+	// fallback.
+	if _, status, _ := v.QueryFSInfo(context.Background(), fsAttributeInformation); status != smb.StatusNotSupported {
 		t.Errorf("attribute info (0x05) = 0x%08x, want StatusNotSupported (library fallback)", status)
+	}
+}
+
+// fsAttributes builds FileFsAttributeInformation: flags, a 255-character name
+// limit and the file system's name, followed by extra.
+func fsAttributes(flags uint32, name string, extra ...byte) []byte {
+	le := binary.LittleEndian
+	units := utf16.Encode([]rune(name))
+	buf := le.AppendUint32(nil, flags)
+	buf = le.AppendUint32(buf, 255)
+	buf = le.AppendUint32(buf, uint32(2*len(units)))
+	for _, u := range units {
+		buf = le.AppendUint16(buf, u)
+	}
+	return append(buf, extra...)
+}
+
+// The target's file system attributes are passed on, its name included, with
+// only the flags the proxy honours: Explorer shows the Security tab for
+// FILE_PERSISTENT_ACLS, and must not count on the rest.
+func TestProxyQueryFSInfoAttributes(t *testing.T) {
+	const ntfs = 0x03e700ff // what Windows reports for an NTFS volume
+	for _, tt := range []struct {
+		name  string
+		reply []byte
+		want  []byte // nil: left to go-smb's fallback
+	}{
+		{"NTFS", fsAttributes(ntfs, "NTFS", 0xee, 0xee), fsAttributes(0x0f, "NTFS")},
+		{"Samba", fsAttributes(0x0001800f, "NTFS"), fsAttributes(0x0f, "NTFS")},
+		{"no ACLs", fsAttributes(0x00000003, "FAT32"), fsAttributes(0x03, "FAT32")},
+		{"short", []byte{0x0f, 0, 0, 0, 255, 0, 0}, nil},
+		{"name overruns", fsAttributes(0x0f, "NTFS")[:14], nil},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ff := &fakeFile{isDir: true, fsData: tt.reply}
+			v := newVFS(&fakeConn{openFn: func(string, string, *smb.CreateReqOpts) (upstreamFile, error) { return ff, nil }})
+			out, status, err := v.QueryFSInfo(context.Background(), fsAttributeInformation)
+			if tt.want == nil {
+				if status != smb.StatusNotSupported || err != nil {
+					t.Errorf("= (0x%08x, %v), want StatusNotSupported (library fallback)", status, err)
+				}
+				return
+			}
+			if err != nil || status != smb.StatusOk || !bytes.Equal(out.([]byte), tt.want) {
+				t.Errorf("= (% x, 0x%08x, %v), want % x", out, status, err, tt.want)
+			}
+			if ff.fsClass != fsAttributeInformation {
+				t.Errorf("target asked for class 0x%02x", ff.fsClass)
+			}
+		})
 	}
 }
 
