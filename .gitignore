@@ -1,10 +1,17 @@
+# Editor and assistant settings
 .claude
 .idea
 .mcp.json
 
+# Build output (build.ps1 writes to _gitignore)
 _gitignore
-
 *.exe
+/smbproxy
 
-# Local configuration; usually holds credentials
+# Test binaries and coverage profiles
+*.test
+*.out
+
+# Local configuration and password files; they hold credentials
 smbproxy.yaml
+*.pass

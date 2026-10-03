@@ -1,0 +1,6 @@
+# Store text with LF line endings and check it out that way everywhere,
+# as gofmt writes it.
+* text=auto eol=lf
+
+# PowerShell scripts keep Windows line endings on checkout.
+*.ps1 text eol=crlf
