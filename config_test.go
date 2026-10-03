@@ -391,7 +391,12 @@ func TestConfigErrors(t *testing.T) {
 		{"port out of range", replace("    user: admin", "    port: 70000\n    user: admin"), "between 1 and 65535"},
 		{"unknown target", replace("    target: t1", "    target: t2"), `"t2" is not defined`},
 		{"no path", without("    path: C$\n"), "path must name"},
-		{"read_only false", minimalConfig + "    read_only: false\n", "read_only: false"},
+		{"write_access on a read-only share", minimalConfig + "    write_access: [alice]\n", "add read_only: false"},
+		{"writer who is not a reader", replace("      password: pw\n", "      password: pw\n    bob:\n      password: b\n") +
+			"    read_only: false\n    read_access: [alice]\n    write_access: [bob]\n", "writers must also be readers"},
+		{"guest writers who are not readers", minimalConfig +
+			"    read_only: false\n    read_access: [alice]\n    write_access: [\"@guests\"]\n", "which read_access does not"},
+		{"write_access unknown user", minimalConfig + "    read_only: false\n    write_access: [zed]\n", `write_access: "zed" is not a user`},
 		{"reserved name", replace("name: data", "name: IPC$"), "reserved"},
 		{"forbidden character", replace("name: data", "name: da*ta"), "does not allow"},
 		{"duplicate share, other case", minimalConfig + "  - name: DATA\n    target: t1\n    path: D$\n", "duplicate name"},

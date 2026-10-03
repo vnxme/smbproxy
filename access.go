@@ -1,6 +1,7 @@
 package main
 
 import (
+	"maps"
 	"slices"
 	"strings"
 
@@ -17,6 +18,13 @@ import (
 const (
 	accessGuests    = "@guests"    // guest sessions (local.allow_guest)
 	accessAnonymous = "@anonymous" // null sessions (local.allow_anonymous)
+)
+
+// Maximal access reported when a client connects to a share, which Explorer
+// uses to offer or withhold changes.
+const (
+	readOnlyAccess = 0x001200a9 // FILE_GENERIC_READ | FILE_GENERIC_EXECUTE
+	fullAccess     = 0x001f01ff // FILE_ALL_ACCESS
 )
 
 // principal is who a session acts as: a local user, a guest, or anonymous.
@@ -85,16 +93,54 @@ func (a *accessList) allows(p principal) bool {
 	return a.users[p.user]
 }
 
-// readAllowed reports whether p may open the share named name (compared
-// case-insensitively, as SMB does). Names that are not proxied shares, such
-// as IPC$, are left to go-smb.
-func (c *config) readAllowed(name string, p principal) bool {
+// shareNamed returns the proxied share named name, compared case-insensitively
+// as SMB does, or nil if there is none (as for IPC$).
+func (c *config) shareNamed(name string) *share {
 	for i := range c.shares {
 		if strings.EqualFold(c.shares[i].name, name) {
-			return c.shares[i].readAccess.allows(p)
+			return &c.shares[i]
 		}
 	}
+	return nil
+}
+
+// readAllowed reports whether p may open the share named name. Names that are
+// not proxied shares, such as IPC$, are left to go-smb.
+func (c *config) readAllowed(name string, p principal) bool {
+	if sh := c.shareNamed(name); sh != nil {
+		return sh.readAccess.allows(p)
+	}
 	return true
+}
+
+// canWrite reports whether p may change s: never on a read-only share,
+// otherwise as write_access says, or, without one, as read_access does.
+func (s *share) canWrite(p principal) bool {
+	switch {
+	case s.readOnly:
+		return false
+	case s.writeAccess != nil:
+		return s.writeAccess.allows(p)
+	}
+	return s.readAccess.allows(p)
+}
+
+// libraryWriters expresses who may change s in go-smb's terms
+// (Share.WritableUsers, GuestWritable, AnonymousWritable), so its write gate
+// on CREATE, WRITE and SET_INFO enforces the same rule as canWrite. A nil
+// users map means every logged-in user to go-smb; an empty one, no one.
+func (s *share) libraryWriters() (users map[string]bool, guests, anonymous bool) {
+	if s.readOnly {
+		return map[string]bool{}, false, false
+	}
+	list := s.writeAccess
+	if list == nil {
+		list = s.readAccess
+	}
+	if list == nil {
+		return nil, true, true // everyone who can log in; guests and anonymous only if allowed to log in
+	}
+	return maps.Clone(list.users), list.guests, list.anonymous
 }
 
 // localUserNames returns the local users' names as configured, sorted.

@@ -22,8 +22,13 @@ import (
 // ---------------------------------------------------------------------------
 
 type proxyHandle struct {
+	// info and path change as a client writes, truncates, sets timestamps or
+	// renames through the handle; infoMu guards them. Read them through Stat
+	// and Path.
+	infoMu sync.Mutex
 	info   server.FileInfo
 	path   server.Path
+
 	isDir  bool
 	file   upstreamFile
 	isRoot bool
@@ -56,9 +61,33 @@ type prefetch struct {
 	err  error
 }
 
-func (h *proxyHandle) Stat() (server.FileInfo, error) { return h.info, nil }
-func (h *proxyHandle) Path() server.Path              { return h.path }
-func (h *proxyHandle) IsDir() bool                    { return h.isDir }
+func (h *proxyHandle) Stat() (server.FileInfo, error) {
+	h.infoMu.Lock()
+	defer h.infoMu.Unlock()
+	return h.info, nil
+}
+
+func (h *proxyHandle) Path() server.Path {
+	h.infoMu.Lock()
+	defer h.infoMu.Unlock()
+	return h.path
+}
+
+func (h *proxyHandle) IsDir() bool { return h.isDir }
+
+// size returns the file's current size as the proxy knows it.
+func (h *proxyHandle) size() int64 {
+	h.infoMu.Lock()
+	defer h.infoMu.Unlock()
+	return h.info.Size
+}
+
+// updateInfo applies fn to the handle's metadata under its lock.
+func (h *proxyHandle) updateInfo(fn func(*server.FileInfo)) {
+	h.infoMu.Lock()
+	defer h.infoMu.Unlock()
+	fn(&h.info)
+}
 
 // ---------------------------------------------------------------------------
 // proxyVFS — implements server.VFS
@@ -68,6 +97,12 @@ type proxyVFS struct {
 	up    *upstream // shared across all VFS instances on the same connection
 	share string    // target SMB share (e.g. "C$", or a Samba share like "data")
 	base  string    // inner directory within the share this local share maps to (empty = root)
+
+	// canWrite reports whether a session may change this share (see
+	// share.canWrite); nil means no one may. go-smb's write gate already
+	// refuses writes from everyone else; this only decides how Create opens
+	// a file on the target (see createForWrite).
+	canWrite func(*server.Session) bool
 }
 
 func openDirOpts() *smb.CreateReqOpts {
@@ -82,8 +117,27 @@ func openDirOpts() *smb.CreateReqOpts {
 	return o
 }
 
-func openFileOpts() *smb.CreateReqOpts {
+// contentAccess are the rights that reach a file's contents. Sharing modes
+// apply only to opens asking for one of these (or for write or delete rights,
+// which take the write path); an open without them reads metadata alone.
+const contentAccess = smb.FAccMaskFileReadData | smb.FAccMaskFileExecute |
+	smb.FAccMaskGenericRead | smb.FAccMaskGenericExecute | smb.FAccMaskGenericAll |
+	smb.FAccMaskMaximumAllowed
+
+// metadataAccess are the read rights that sharing modes never block.
+const metadataAccess = smb.FAccMaskFileReadAttributes | smb.FAccMaskFileReadEA |
+	smb.FAccMaskReadControl | smb.FAccMaskSynchronize
+
+// openFileOpts opens a file for reading on behalf of a client that asked for
+// access. A client asking only for metadata gets just that on the target too:
+// as on Windows, such an open succeeds while another client holds the file
+// exclusively (Explorer stats a file it is still copying, for instance), where
+// opening it for reading would fail with a sharing violation.
+func openFileOpts(access uint32) *smb.CreateReqOpts {
 	o := smb.NewCreateReqOpts()
+	if access&contentAccess == 0 {
+		o.DesiredAccess = access&metadataAccess | smb.FAccMaskFileReadAttributes | smb.FAccMaskSynchronize
+	}
 	o.ShareAccess = smb.FileShareRead | smb.FileShareWrite
 	o.CreateDisp = smb.FileOpen
 	return o
@@ -138,7 +192,7 @@ func handleFromFile(req server.CreateRequest, f upstreamFile, shareName string) 
 	}
 }
 
-func (v *proxyVFS) Create(_ context.Context, _ *server.Session, req server.CreateRequest) (result server.CreateResult, status uint32, err error) {
+func (v *proxyVFS) Create(_ context.Context, sess *server.Session, req server.CreateRequest) (result server.CreateResult, status uint32, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[proxy] Create %q panic: %v\n%s", req.Path, r, debug.Stack())
@@ -159,6 +213,9 @@ func (v *proxyVFS) Create(_ context.Context, _ *server.Session, req server.Creat
 		return server.CreateResult{}, smb.StatusAccessDenied, nil
 	}
 	remote := joinRemote(v.base, rel)
+	if writeIntent(req) && v.canWrite != nil && sess != nil && v.canWrite(sess) {
+		return v.createForWrite(req, rel, remote)
+	}
 
 	wantsDir := (req.CreateOptions&smb.FileDirectoryFile) != 0 ||
 		(req.FileAttributes&smb.FileAttrDirectory) != 0
@@ -174,9 +231,15 @@ func (v *proxyVFS) Create(_ context.Context, _ *server.Session, req server.Creat
 				upFile, e = c.OpenFileExt(v.share, remote, o)
 			}
 		} else {
-			upFile, e = c.OpenFileExt(v.share, remote, openFileOpts())
+			upFile, e = c.OpenFileExt(v.share, remote, openFileOpts(req.DesiredAccess))
 			if e != nil {
-				upFile, e = c.OpenFileExt(v.share, remote, openDirOpts())
+				// It may be a directory the file open could not reach. If the
+				// target says it is not one, the file open's own failure (a
+				// sharing violation, say) is the answer.
+				f, de := c.OpenFileExt(v.share, remote, openDirOpts())
+				if code, ok := ntStatus(de); !ok || code != smb.StatusNotADirectory {
+					upFile, e = f, de
+				}
 			}
 		}
 		return e
@@ -297,7 +360,7 @@ func (v *proxyVFS) Read(_ context.Context, h server.Handle, offset int64, buf []
 	ph.prefMu.Unlock()
 
 	// ---- tier 3: synchronous fetch ----
-	data, fErr := v.fetch(ph.file, offset, ph.info.Size)
+	data, fErr := v.fetch(ph.file, offset, ph.size())
 	if fErr != nil {
 		return 0, errToStatus(fErr), nil
 	}
@@ -405,7 +468,8 @@ func putReadBuf(b []byte) {
 // would block that RLock while Read, holding its own RLock, waits for the
 // prefetch to finish — a deadlock.
 func (v *proxyVFS) startPrefetch(ph *proxyHandle, off int64) {
-	if off >= ph.info.Size {
+	size := ph.size()
+	if off >= size {
 		return
 	}
 	ph.prefMu.Lock()
@@ -422,16 +486,8 @@ func (v *proxyVFS) startPrefetch(ph *proxyHandle, off int64) {
 	go func() {
 		defer ph.prefWG.Done()
 		defer close(p.done)
-		p.data, p.err = v.fetch(file, off, ph.info.Size)
+		p.data, p.err = v.fetch(file, off, size)
 	}()
-}
-
-func (v *proxyVFS) Write(_ context.Context, _ server.Handle, _ int64, _ []byte) (int, uint32, error) {
-	return 0, smb.StatusAccessDenied, nil
-}
-
-func (v *proxyVFS) Flush(_ context.Context, _ server.Handle) (uint32, error) {
-	return 0, nil
 }
 
 func (v *proxyVFS) QueryDirectory(_ context.Context, h server.Handle, pattern string, restart bool) (entries []server.DirEntry, status uint32, err error) {
@@ -481,7 +537,7 @@ func (v *proxyVFS) QueryDirectory(_ context.Context, h server.Handle, pattern st
 			return nil, errToStatus(err), nil
 		}
 
-		dirRel := remotePath(ph.path)
+		dirRel := remotePath(ph.Path())
 		converted := make([]server.DirEntry, len(raw))
 		for i, sf := range raw {
 			converted[i] = sharedFileToDirEntry(sf)
@@ -604,10 +660,6 @@ func entryRel(dirRel, name string) string {
 		return ""
 	}
 	return joinRemote(dirRel, name)
-}
-
-func (v *proxyVFS) SetFileInfo(_ context.Context, _ server.Handle, _ byte, _ []byte) (uint32, error) {
-	return smb.StatusAccessDenied, nil
 }
 
 // Filesystem information classes answered by QueryFSInfo (MS-FSCC 2.5).

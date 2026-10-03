@@ -35,9 +35,15 @@ type fakeFile struct {
 	secErr  error            // if set, QuerySecurity returns it
 	secInfo uint32           // additionalInformation of the last QuerySecurity call
 	stall   bool             // ReadFile and QueryDirectory block until their context ends
-	isDir   bool
-	metaVal fileMeta
-	closed  bool
+
+	writeErr     error  // if set, WriteFile returns it
+	flushes      int    // Flush call count
+	setInfoClass byte   // class of the last SetInfo
+	setInfoBuf   []byte // payload of the last SetInfo
+	setInfoErr   error  // if set, SetInfo returns it
+	isDir        bool
+	metaVal      fileMeta
+	closed       bool
 }
 
 // waitStalled blocks until ctx is done when the fake is stalled, standing in
@@ -68,6 +74,35 @@ func (f *fakeFile) ReadFile(ctx context.Context, b []byte, off uint64) (int, err
 		return 0, io.EOF
 	}
 	return copy(b, f.data[off:]), nil
+}
+
+func (f *fakeFile) WriteFile(ctx context.Context, data []byte, off uint64) (int, error) {
+	if err := f.waitStalled(ctx); err != nil {
+		return 0, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.writeErr != nil {
+		return 0, f.writeErr
+	}
+	if end := int(off) + len(data); end > len(f.data) {
+		f.data = append(f.data, make([]byte, end-len(f.data))...)
+	}
+	return copy(f.data[off:], data), nil
+}
+
+func (f *fakeFile) Flush(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.flushes++
+	return nil
+}
+
+func (f *fakeFile) SetInfo(class byte, buf []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.setInfoClass, f.setInfoBuf = class, append([]byte(nil), buf...)
+	return f.setInfoErr
 }
 
 func (f *fakeFile) QueryDirectory(ctx context.Context, _ string, flags byte, _ uint32, _ uint32) ([]smb.SharedFile, error) {
@@ -276,6 +311,61 @@ func TestProxyCreateOpenError(t *testing.T) {
 	// A non-dir open is retried once (file opts, then dir opts) before failing.
 	if len(c.opens) != 2 {
 		t.Errorf("OpenFileExt called %d times, want 2 (open + fallback)", len(c.opens))
+	}
+}
+
+const statusSharingViolation uint32 = 0xc0000043 // STATUS_SHARING_VIOLATION
+
+// A file the target refuses to open (here: held exclusively by another
+// client) is reported with the target's reason, not with the "not a
+// directory" from the directory retry that follows.
+func TestProxyCreateKeepsFileOpenError(t *testing.T) {
+	c := &fakeConn{openFn: func(_, _ string, opts *smb.CreateReqOpts) (upstreamFile, error) {
+		if opts.CreateOpts&smb.FileDirectoryFile != 0 {
+			return nil, &smb.NTStatusError{Status: smb.StatusNotADirectory}
+		}
+		return nil, &smb.NTStatusError{Status: statusSharingViolation}
+	}}
+	v := newVFS(c)
+
+	_, status, err := v.Create(context.Background(), nil, server.CreateRequest{Path: "\\busy.pdf"})
+	if err != nil || status != statusSharingViolation {
+		t.Errorf("Create = (0x%08x, %v), want STATUS_SHARING_VIOLATION", status, err)
+	}
+}
+
+// An open asking only for metadata opens the target file for metadata alone,
+// so sharing modes cannot refuse it; any other read open asks for the data.
+func TestProxyCreateTargetAccess(t *testing.T) {
+	const defaultAccess = smb.FAccMaskFileReadData | smb.FAccMaskFileReadEA |
+		smb.FAccMaskFileReadAttributes | smb.FAccMaskReadControl | smb.FAccMaskSynchronize
+	tests := []struct {
+		name         string
+		asked, wants uint32
+	}{
+		{"read attributes", smb.FAccMaskFileReadAttributes, smb.FAccMaskFileReadAttributes | smb.FAccMaskSynchronize},
+		{"security", smb.FAccMaskReadControl | smb.FAccMaskFileReadAttributes,
+			smb.FAccMaskReadControl | smb.FAccMaskFileReadAttributes | smb.FAccMaskSynchronize},
+		{"nothing", 0, smb.FAccMaskFileReadAttributes | smb.FAccMaskSynchronize},
+		{"read data", 0x00120089, defaultAccess},
+		{"generic read", smb.FAccMaskGenericRead, defaultAccess},
+		{"maximum allowed", smb.FAccMaskMaximumAllowed, defaultAccess},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got uint32
+			c := &fakeConn{openFn: func(_, _ string, opts *smb.CreateReqOpts) (upstreamFile, error) {
+				got = opts.DesiredAccess
+				return &fakeFile{}, nil
+			}}
+			req := server.CreateRequest{Path: "\\a.pdf", DesiredAccess: tt.asked}
+			if _, status, err := newVFS(c).Create(context.Background(), nil, req); err != nil || status != 0 {
+				t.Fatalf("Create: status=0x%08x err=%v", status, err)
+			}
+			if got != tt.wants {
+				t.Errorf("target access = 0x%08x, want 0x%08x", got, tt.wants)
+			}
+		})
 	}
 }
 
@@ -841,19 +931,11 @@ func TestProxyClose(t *testing.T) {
 	}
 }
 
-func TestProxyReadOnlyStubs(t *testing.T) {
+// Queries the proxy leaves to go-smb's own defaults.
+func TestProxyUnsupportedQueries(t *testing.T) {
 	v := newVFS(&fakeConn{})
 	ctx := context.Background()
 
-	if n, status, _ := v.Write(ctx, nil, 0, []byte("x")); n != 0 || status != smb.StatusAccessDenied {
-		t.Errorf("Write = (%d, 0x%08x), want (0, StatusAccessDenied)", n, status)
-	}
-	if status, err := v.Flush(ctx, nil); status != 0 || err != nil {
-		t.Errorf("Flush = (0x%08x, %v), want (0, nil)", status, err)
-	}
-	if status, err := v.SetFileInfo(ctx, nil, 0, nil); status != smb.StatusAccessDenied || err != nil {
-		t.Errorf("SetFileInfo = (0x%08x, %v), want (StatusAccessDenied, nil)", status, err)
-	}
 	if _, status, _ := v.QueryFileInfo(ctx, nil, 0); status != smb.StatusNotSupported {
 		t.Errorf("QueryFileInfo = 0x%08x, want StatusNotSupported", status)
 	}

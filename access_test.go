@@ -1,6 +1,8 @@
 package main
 
 import (
+	"maps"
+	"slices"
 	"strings"
 	"testing"
 
@@ -148,6 +150,65 @@ func TestAccessListString(t *testing.T) {
 	for name, w := range want {
 		if got[name] != w {
 			t.Errorf("share %s read_access logged as %q, want %q", name, got[name], w)
+		}
+	}
+}
+
+// writeAccessConfig covers each way write access can be set.
+const writeAccessConfig = `
+local:
+  allow_guest: true
+  users:
+    alice: {password: a}
+    bob:   {password: b}
+targets:
+  t1: {host: 10.0.0.5, user: admin, password: x}
+shares:
+  - {name: ro,       target: t1, path: A$}
+  - {name: all,      target: t1, path: B$, read_only: false}
+  - {name: readers,  target: t1, path: C$, read_only: false, read_access: [alice, "@guests"]}
+  - {name: listed,   target: t1, path: D$, read_only: false, read_access: [alice, bob], write_access: [alice]}
+`
+
+func TestWriteAccess(t *testing.T) {
+	cfg, warnings := mustParse(t, writeAccessConfig)
+	if len(warnings) != 0 {
+		t.Errorf("warnings: %v", warnings)
+	}
+	cases := []struct {
+		share   string
+		writers []*server.Session
+		users   map[string]bool // go-smb's WritableUsers; nil = every logged-in user
+		guests  bool
+	}{
+		{"ro", nil, map[string]bool{}, false},
+		{"all", []*server.Session{asAlice, asBob, asGuest}, nil, true},
+		{"readers", []*server.Session{asAlice, asGuest}, map[string]bool{"alice": true}, true},
+		{"listed", []*server.Session{asAlice}, map[string]bool{"alice": true}, false},
+	}
+	hook := cfg.serverConfig().OnTreeConnect
+	for _, c := range cases {
+		sh := cfg.shareNamed(c.share)
+		for _, s := range []*server.Session{asAlice, asBob, asGuest} {
+			want := slices.Contains(c.writers, s)
+			if got := sh.canWrite(principalOf(s)); got != want {
+				t.Errorf("%s writing to %s: %t, want %t", principalOf(s), c.share, got, want)
+			}
+			// Admitted clients are told their real maximal access.
+			res := &smb.TreeConnectRes{}
+			if st, _ := hook(nil, s, c.share, &smb.TreeConnectReq{}, res); st == nil {
+				wantAccess := uint32(readOnlyAccess)
+				if want {
+					wantAccess = fullAccess
+				}
+				if res.MaximalAccess != wantAccess {
+					t.Errorf("%s on %s: maximal access 0x%08x, want 0x%08x", principalOf(s), c.share, res.MaximalAccess, wantAccess)
+				}
+			}
+		}
+		users, guests, _ := sh.libraryWriters()
+		if (users == nil) != (c.users == nil) || !maps.Equal(users, c.users) || guests != c.guests {
+			t.Errorf("%s: go-smb writers %v (guests %t), want %v (guests %t)", c.share, users, guests, c.users, c.guests)
 		}
 	}
 }

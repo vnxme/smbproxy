@@ -120,7 +120,7 @@ shares:
     path: C$                 # the target's share, optionally with an inner
                              # folder (either slash works)
     comment: Corp server, drive C   # shown in Explorer's share list
-    read_only: true          # the only supported value for now
+    read_only: true          # the default; false lets write_access change it
     encrypt: false           # require encryption for this share (needs
                              # server.encryption supported or required)
     read_access: [alice]     # who may open it: users, @groups, and the
@@ -136,4 +136,11 @@ shares:
   - name: lab
     target: lab
     path: data/projects/2024
+    read_only: false         # writable: create, write, rename, delete, truncate,
+                             # set timestamps and attributes. The target account
+                             # needs those rights too. Not proxied: byte-range
+                             # locks (Office may then open read-only) and
+                             # permission (Security tab) changes.
     read_access: ["@finance"]
+    write_access: [alice]    # who may change it, among the readers; omitted:
+                             # every reader

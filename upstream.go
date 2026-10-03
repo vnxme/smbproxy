@@ -243,7 +243,13 @@ type upstreamConn interface {
 // variant of the other calls.
 type upstreamFile interface {
 	ReadFile(ctx context.Context, b []byte, offset uint64) (int, error)
+	WriteFile(ctx context.Context, data []byte, offset uint64) (int, error)
+	Flush(ctx context.Context) error
 	QueryDirectory(ctx context.Context, pattern string, flags byte, fileIndex uint32, bufferSize uint32) ([]smb.SharedFile, error)
+	// SetInfo sends a SET_INFO request for a file information class with
+	// buf as its wire-format payload: a rename, a delete disposition, a new
+	// end of file, timestamps and attributes.
+	SetInfo(class byte, buf []byte) error
 	// QuerySecurity fetches the file's security descriptor from the target,
 	// requesting the components named in additionalInformation, and returns it
 	// as self-relative wire bytes ready to hand back to the client.
@@ -257,6 +263,7 @@ type upstreamFile interface {
 
 // fileMeta is a snapshot of the smb.FileMetadata fields handleFromFile needs.
 type fileMeta struct {
+	createAction   uint32 // what the CREATE did: opened, created, overwritten, superseded
 	attributes     uint32
 	endOfFile      uint64
 	creationTime   uint64
@@ -275,16 +282,55 @@ func (c smbConn) OpenFileExt(tree, filepath string, opts *smb.CreateReqOpts) (up
 	if err != nil {
 		return nil, err
 	}
-	return smbFile{f}, nil
+	return smbFile{File: f, share: tree}, nil
 }
 
 // smbFile adapts *smb.File to upstreamFile. CloseFile and IsDir are promoted
-// from the embedded pointer; ReadFile and QueryDirectory map to the library's
-// context-aware variants.
-type smbFile struct{ *smb.File }
+// from the embedded pointer; reads, writes, flushes and directory queries map
+// to the library's context-aware variants.
+type smbFile struct {
+	*smb.File
+	share string // the target share the file is on, which SET_INFO addresses
+}
 
 func (f smbFile) ReadFile(ctx context.Context, b []byte, offset uint64) (int, error) {
 	return f.File.ReadFileContext(ctx, b, offset)
+}
+
+func (f smbFile) WriteFile(ctx context.Context, data []byte, offset uint64) (int, error) {
+	return f.File.WriteFileContext(ctx, data, offset)
+}
+
+func (f smbFile) Flush(ctx context.Context) error { return f.File.FlushContext(ctx) }
+
+// SetInfo builds a SET_INFO request with go-smb's own types and sends it with
+// SendRawPDU, which applies the connection's message ID, signing and
+// encryption. go-smb's client has no general set-info call: it only sends
+// SET_INFO internally, to delete files.
+func (f smbFile) SetInfo(class byte, buf []byte) error {
+	req, err := f.File.Connection.NewSetInfoReq(f.share, f.File.FileID())
+	if err != nil {
+		return err
+	}
+	req.InfoType = smb.OInfoFile
+	req.FileInfoClass = class
+	req.Buffer = buf
+	pdu, err := req.MarshalBinary()
+	if err != nil {
+		return err
+	}
+	res, err := f.File.Connection.SendRawPDU(pdu)
+	if err != nil {
+		return err
+	}
+	var h smb.Header
+	if err := h.UnmarshalBinary(res); err != nil {
+		return err
+	}
+	if h.Status != smb.StatusOk {
+		return &smb.NTStatusError{Op: "SetInfo", Status: h.Status, Err: smb.StatusMap[h.Status]}
+	}
+	return nil
 }
 
 func (f smbFile) QueryDirectory(ctx context.Context, pattern string, flags byte, fileIndex, bufferSize uint32) ([]smb.SharedFile, error) {
@@ -293,6 +339,7 @@ func (f smbFile) QueryDirectory(ctx context.Context, pattern string, flags byte,
 
 func (f smbFile) meta() fileMeta {
 	return fileMeta{
+		createAction:   f.CreateAction,
 		attributes:     f.Attributes,
 		endOfFile:      f.EndOfFile,
 		creationTime:   f.CreationTime,

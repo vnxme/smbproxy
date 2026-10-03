@@ -129,13 +129,14 @@ type targetSection struct {
 }
 
 type shareSection struct {
-	Name       string   `yaml:"name"`
-	Target     string   `yaml:"target"`
-	Path       string   `yaml:"path"`
-	Comment    string   `yaml:"comment"`
-	ReadOnly   *bool    `yaml:"read_only"`
-	Encrypt    bool     `yaml:"encrypt"`
-	ReadAccess []string `yaml:"read_access"` // users, @groups, @guests, @anonymous; absent = everyone
+	Name        string   `yaml:"name"`
+	Target      string   `yaml:"target"`
+	Path        string   `yaml:"path"`
+	Comment     string   `yaml:"comment"`
+	ReadOnly    *bool    `yaml:"read_only"`
+	Encrypt     bool     `yaml:"encrypt"`
+	ReadAccess  []string `yaml:"read_access"`  // users, @groups, @guests, @anonymous; absent = everyone
+	WriteAccess []string `yaml:"write_access"` // the same; absent = every reader, if read_only is false
 }
 
 // config is a validated configuration, ready to run the proxy from.
@@ -198,6 +199,8 @@ type share struct {
 	remoteSub     string      // inner directory within it (empty = share root)
 	encrypt       bool        // require SMB 3.x encryption for this share
 	readAccess    *accessList // who may open it; nil = everyone who can log in
+	readOnly      bool        // refuse every change (the default)
+	writeAccess   *accessList // who may change it, if not readOnly; nil = every reader
 }
 
 // localUser is one login clients may use to connect to the proxy.
@@ -357,14 +360,13 @@ func parseConfig(data []byte, baseDir string) (*config, []string, error) {
 		if sh.encrypt && cfg.encryption == "off" {
 			return nil, nil, fmt.Errorf("shares[%d] (%s): encrypt needs server.encryption supported or required", i, sh.name)
 		}
-		access, accessWarnings, err := resolveReadAccess(s.ReadAccess, cfg, groups)
+		accessWarnings, err := resolveShareAccess(&sh, s, cfg, groups)
 		if err != nil {
-			return nil, nil, fmt.Errorf("shares[%d] (%s): read_access: %w", i, sh.name, err)
+			return nil, nil, fmt.Errorf("shares[%d] (%s): %w", i, sh.name, err)
 		}
 		for _, w := range accessWarnings {
 			warnings = append(warnings, fmt.Sprintf("share %s: %s", sh.name, w))
 		}
-		sh.readAccess = access
 		seen[key] = sh.name
 		used[s.Target] = true
 		cfg.shares = append(cfg.shares, sh)
@@ -430,10 +432,42 @@ func resolveShare(s shareSection, targets map[string]*target) (share, error) {
 	if remote == "" {
 		return share{}, errors.New("path must name the target's share, optionally followed by an inner folder")
 	}
-	if s.ReadOnly != nil && !*s.ReadOnly {
-		return share{}, errors.New("read_only: false is not supported yet; the proxy is read-only")
+	readOnly := s.ReadOnly == nil || *s.ReadOnly // read-only unless explicitly not
+	return share{name: s.Name, comment: s.Comment, target: tg, remoteShare: remote, remoteSub: sub,
+		encrypt: s.Encrypt, readOnly: readOnly}, nil
+}
+
+// resolveShareAccess resolves s's read_access and write_access into sh. Write
+// access needs read_only: false, and every writer must also be a reader: a
+// client not admitted by read_access cannot connect to the share to write.
+func resolveShareAccess(sh *share, s shareSection, cfg *config, groups map[string][]string) ([]string, error) {
+	read, warnings, err := resolveAccess("read_access", s.ReadAccess, cfg, groups)
+	if err != nil {
+		return nil, fmt.Errorf("read_access: %w", err)
 	}
-	return share{name: s.Name, comment: s.Comment, target: tg, remoteShare: remote, remoteSub: sub, encrypt: s.Encrypt}, nil
+	write, writeWarnings, err := resolveAccess("write_access", s.WriteAccess, cfg, groups)
+	if err != nil {
+		return nil, fmt.Errorf("write_access: %w", err)
+	}
+	if write != nil && sh.readOnly {
+		return nil, errors.New("write_access is set, but the share is read-only: add read_only: false")
+	}
+	if read != nil && write != nil {
+		for u := range write.users {
+			if !read.users[u] {
+				return nil, fmt.Errorf("write_access admits user %s, whom read_access does not; writers must also be readers",
+					cfg.localUsers[u].name)
+			}
+		}
+		if write.guests && !read.guests {
+			return nil, fmt.Errorf("write_access admits %s, which read_access does not", accessGuests)
+		}
+		if write.anonymous && !read.anonymous {
+			return nil, fmt.Errorf("write_access admits %s, which read_access does not", accessAnonymous)
+		}
+	}
+	sh.readAccess, sh.writeAccess = read, write
+	return append(warnings, writeWarnings...), nil
 }
 
 // resolveServer validates the server section into cfg.
@@ -530,12 +564,25 @@ func (c *config) authenticator() *server.MapAuthenticator {
 }
 
 // treeConnectHook enforces each share's read_access when a client connects to
-// it, refusing everyone not listed with STATUS_ACCESS_DENIED.
+// it, refusing everyone not listed with STATUS_ACCESS_DENIED. For those
+// admitted, it reports the maximal access they actually have — full for a
+// writer, read-only otherwise — which Explorer uses to offer or withhold
+// changes.
 func (c *config) treeConnectHook(_ *server.Conn, s *server.Session, shareName string,
-	_ *smb.TreeConnectReq, _ *smb.TreeConnectRes) (*server.Status, error) {
-	if p := principalOf(s); !c.readAllowed(shareName, p) {
+	_ *smb.TreeConnectReq, res *smb.TreeConnectRes) (*server.Status, error) {
+	sh := c.shareNamed(shareName)
+	if sh == nil {
+		return nil, nil // IPC$: left to go-smb
+	}
+	p := principalOf(s)
+	if !sh.readAccess.allows(p) {
 		log.Printf("[!] %s may not open share %s (read_access); access denied", p, shareName)
 		return &server.Status{Code: smb.StatusAccessDenied}, nil
+	}
+	if sh.canWrite(p) {
+		res.MaximalAccess = fullAccess
+	} else {
+		res.MaximalAccess = readOnlyAccess
 	}
 	return nil, nil
 }
@@ -619,18 +666,22 @@ func resolveGroups(in map[string][]string, users map[string]localUser) (map[stri
 	return out, nil
 }
 
-// resolveReadAccess resolves a share's read_access entries — user names,
-// @groups, @guests and @anonymous — into an access list. No read_access (a
-// nil list) means everyone who can log in, and resolves to nil. It also
-// returns warnings for entries that can never match.
-func resolveReadAccess(entries []string, cfg *config, groups map[string][]string) (*accessList, []string, error) {
+// resolveAccess resolves a share's read_access or write_access entries (the
+// field names which) — user names, @groups, @guests and @anonymous — into an
+// access list. An absent list (nil) resolves to nil, whose meaning the caller
+// gives. It also returns warnings for entries that can never match.
+func resolveAccess(field string, entries []string, cfg *config, groups map[string][]string) (*accessList, []string, error) {
 	if entries == nil {
 		return nil, nil, nil
 	}
 	a := &accessList{users: map[string]bool{}, spec: entries}
 	var warnings []string
 	if len(entries) == 0 {
-		warnings = append(warnings, "read_access is empty, so no one can open it")
+		what := "open it"
+		if field == "write_access" {
+			what = "write to it"
+		}
+		warnings = append(warnings, fmt.Sprintf("%s is empty, so no one can %s", field, what))
 	}
 	for _, e := range entries {
 		key := strings.ToLower(e)
@@ -638,12 +689,12 @@ func resolveReadAccess(entries []string, cfg *config, groups map[string][]string
 		case key == accessGuests:
 			a.guests = true
 			if !cfg.allowGuest {
-				warnings = append(warnings, fmt.Sprintf("read_access lists %s, but local.allow_guest is off", e))
+				warnings = append(warnings, fmt.Sprintf("%s lists %s, but local.allow_guest is off", field, e))
 			}
 		case key == accessAnonymous:
 			a.anonymous = true
 			if !cfg.allowAnon {
-				warnings = append(warnings, fmt.Sprintf("read_access lists %s, but local.allow_anonymous is off", e))
+				warnings = append(warnings, fmt.Sprintf("%s lists %s, but local.allow_anonymous is off", field, e))
 			}
 		case strings.HasPrefix(key, "@"):
 			members, ok := groups[key[1:]]
@@ -691,8 +742,10 @@ func (c *config) serverConfig() *server.ServerConfig {
 		DurableHandles:          c.durableHandles,
 		DurableHandleTimeout:    c.durableTimeout,
 		MaxDurableHandleTimeout: c.durableMaxTimeout,
-		// One client READ maps to one upstream read-ahead batch.
+		// One client READ maps to one upstream read-ahead batch. Writes of the
+		// same size are split by go-smb's client to suit the target.
 		MaxReadSize:    readAheadSize,
+		MaxWriteSize:   readAheadSize,
 		IdleTimeout:    libraryTimeout(c.clientIdleTimeout),
 		WriteTimeout:   libraryTimeout(c.clientWriteTimeout),
 		MaxConnections: c.maxConnections, // -1 means no limit to go-smb too
