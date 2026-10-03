@@ -50,6 +50,8 @@
 //   rpcpipe.go   — the DCE/RPC pipe wrapper (srvsvc, lsarpc) and BindAck fixup
 //   srvsvc.go    — the srvsvc service: the library's plus share and server info
 //   lsarpc.go    — a minimal read-only LSA service: domain membership queries
+//                  and naming SIDs
+//   sids.go      — naming SIDs: well-known ones, and the targets' (resolve_sids)
 //   proxy.go     — the local server: shares, upstreams and RPC pipes
 //   access.go    — share access control (read_access, write_access)
 //   main.go      — startup: configuration, logging, shutdown (this file)

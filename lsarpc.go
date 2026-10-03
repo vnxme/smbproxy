@@ -20,8 +20,11 @@ import (
 // when the pipe cannot be opened, the tab reports that the server does not
 // accept remote requests. go-smb has no LSA server, so this answers the policy
 // queries a standalone (workgroup) server answers: open and close a policy
-// handle, and query its primary, account and DNS domain information. Every
-// other opnum faults, which the debug log shows as an unsupported opnum.
+// handle, and query its primary, account and DNS domain information.
+//
+// It also names SIDs (MS-LSAT LsarLookupSids and LsarLookupSids2), which
+// Explorer asks for to show a file's owner and permissions; see sidNamer.
+// Every other opnum faults, which the debug log shows as an unsupported opnum.
 // ---------------------------------------------------------------------------
 
 // LSA opnums answered by lsaService (MS-LSAD 3.1.4).
@@ -29,8 +32,10 @@ const (
 	lsarClose                   = 0
 	lsarOpenPolicy              = 6
 	lsarQueryInformationPolicy  = 7
+	lsarLookupSids              = 15 // MS-LSAT 3.1.4.11
 	lsarOpenPolicy2             = 44
 	lsarQueryInformationPolicy2 = 46
+	lsarLookupSids2             = 57 // MS-LSAT 3.1.4.10
 )
 
 // POLICY_INFORMATION_CLASS values answered by lsaService (MS-LSAD 2.2.4.1).
@@ -44,7 +49,9 @@ const (
 // NTSTATUS codes in LSA responses.
 const (
 	ntStatusSuccess          = 0x00000000
+	ntStatusSomeNotMapped    = 0x00000107
 	ntStatusInvalidParameter = 0xc000000d
+	ntStatusNoneMapped       = 0xc0000073
 )
 
 // lsaService describes the proxy as a standalone server: a member of the
@@ -54,6 +61,10 @@ type lsaService struct {
 	netbiosName   string // the account domain: the server's own name
 	netbiosDomain string // the primary domain: the workgroup it belongs to
 	machineSID    sid    // the account domain's SID, stable for netbiosName
+
+	// lookup names SIDs for the session the pipe was opened by; nil names
+	// only well-known SIDs.
+	lookup func([]sid) []sidName
 }
 
 func newLSAService(cfg *config) *lsaService {
@@ -86,6 +97,18 @@ func (s *lsaService) Dispatch(_ context.Context, opnum uint16, in []byte) ([]byt
 			return nil, errors.New("lsarpc: short QueryInformationPolicy request")
 		}
 		return s.queryInformationPolicy(binary.LittleEndian.Uint16(in[20:22])), nil
+	case lsarLookupSids, lsarLookupSids2:
+		sids, err := lookupSidsRequest(in)
+		if err != nil {
+			return nil, err
+		}
+		var names []sidName
+		if s.lookup != nil {
+			names = s.lookup(sids)
+		} else {
+			names = (&sidNamer{}).name(nil, sids)
+		}
+		return lookupSidsReply(names, opnum == lsarLookupSids2), nil
 	}
 	return nil, fmt.Errorf("lsarpc: unsupported opnum %d", opnum)
 }
@@ -150,10 +173,135 @@ func (s *lsaService) queryInformationPolicy(class uint16) []byte {
 	return w.b
 }
 
+// maxLookupSids is the most SIDs one request may name (MS-LSAT 2.2.18).
+const maxLookupSids = 20480
+
+// lookupSidsRequest reads the SIDs of an LsarLookupSids or LsarLookupSids2
+// request: after the policy handle, an LSAPR_SID_ENUM_BUFFER, whose array of
+// pointers to RPC_SIDs is deferred after it. The rest of the request (empty
+// TranslatedNames, the lookup level, MappedCount and, for LsarLookupSids2,
+// options and revision) does not change the answer.
+func lookupSidsRequest(in []byte) ([]sid, error) {
+	r := ndrReader{b: in, off: 20}
+	entries, ptr := r.u32(), r.u32()
+	if r.err != nil || entries > maxLookupSids || (ptr == 0) != (entries == 0) {
+		return nil, fmt.Errorf("lsarpc: bad LookupSids SID buffer (%d entries)", entries)
+	}
+	if entries == 0 {
+		return nil, nil
+	}
+	if count := r.u32(); count != entries {
+		return nil, fmt.Errorf("lsarpc: LookupSids array of %d for %d entries", count, entries)
+	}
+	for range entries {
+		if r.u32() == 0 {
+			return nil, errors.New("lsarpc: LookupSids NULL SID")
+		}
+	}
+	sids := make([]sid, entries)
+	for i := range sids {
+		sids[i] = r.sid()
+	}
+	if r.err != nil {
+		return nil, fmt.Errorf("lsarpc: LookupSids: %w", r.err)
+	}
+	return sids, nil
+}
+
+// lookupSidsReply encodes the answer to LsarLookupSids (or, with ex,
+// LsarLookupSids2): the referenced domains, a name for every SID (an unnamed
+// one as SidTypeUnknown, in no domain), the number named, and STATUS_SUCCESS,
+// STATUS_SOME_NOT_MAPPED or STATUS_NONE_MAPPED.
+func lookupSidsReply(names []sidName, ex bool) []byte {
+	type domain struct {
+		name string
+		sid  *sid
+	}
+	var domains []domain
+	byKey := map[string]int32{}
+	index := make([]int32, len(names))
+	mapped := 0
+	for i, n := range names {
+		if n.use == 0 {
+			index[i] = -1
+			continue
+		}
+		mapped++
+		key := n.domain
+		if n.domainSID != nil {
+			key += "|" + n.domainSID.String()
+		}
+		j, ok := byKey[key]
+		if !ok {
+			j = int32(len(domains))
+			byKey[key] = j
+			domains = append(domains, domain{n.domain, n.domainSID})
+		}
+		index[i] = j
+	}
+
+	var w ndrWriter
+	// ReferencedDomains: a unique pointer to LSAPR_REFERENCED_DOMAIN_LIST,
+	// its array of LSAPR_TRUST_INFORMATION deferred, and their names and SIDs
+	// deferred after the array, element by element.
+	w.pointer(true)
+	w.u32(uint32(len(domains)))
+	w.pointer(len(domains) > 0)
+	w.u32(32) // MaxEntries, which clients ignore; Windows sends 32
+	if len(domains) > 0 {
+		w.u32(uint32(len(domains)))
+		deferred := make([]func(), len(domains))
+		for k, d := range domains {
+			deferred[k] = w.unicodeString(d.name)
+			w.pointer(d.sid != nil)
+		}
+		for k, d := range domains {
+			deferred[k]()
+			if d.sid != nil {
+				w.sid(*d.sid)
+			}
+		}
+	}
+	// TranslatedNames: LSAPR_TRANSLATED_NAMES(_EX) in place, its array
+	// deferred, and the names deferred after the array.
+	w.u32(uint32(len(names)))
+	w.pointer(len(names) > 0)
+	if len(names) > 0 {
+		w.u32(uint32(len(names)))
+		deferred := make([]func(), len(names))
+		for i, n := range names {
+			use := n.use
+			if use == 0 {
+				use = mslsad.SidTypeUnknown
+			}
+			w.u32(uint32(use)) // a 16-bit enum, padded to the 4-aligned Name
+			deferred[i] = w.unicodeString(n.name)
+			w.u32(uint32(index[i])) // DomainIndex
+			if ex {
+				w.u32(0) // Flags
+			}
+		}
+		for _, d := range deferred {
+			d()
+		}
+	}
+	w.align(4)
+	w.u32(uint32(mapped)) // MappedCount
+	switch {
+	case mapped == len(names):
+		w.u32(ntStatusSuccess)
+	case mapped > 0:
+		w.u32(ntStatusSomeNotMapped)
+	default:
+		w.u32(ntStatusNoneMapped)
+	}
+	return w.b
+}
+
 // ---------------------------------------------------------------------------
 // NDR encoding (MS-RPCE NDR 2.0, little-endian), just enough for the LSA
-// policy responses above. go-smb's LSA types decode these structures but
-// cannot encode them.
+// responses above. go-smb's LSA types decode these structures but cannot
+// encode them.
 // ---------------------------------------------------------------------------
 
 type ndrWriter struct {
@@ -213,6 +361,47 @@ func (w *ndrWriter) unicodeString(s string) (deferred func()) {
 			w.b = binary.LittleEndian.AppendUint16(w.b, u)
 		}
 	}
+}
+
+// ndrReader reads NDR, little-endian, from b. The first read past the end
+// sets err, and every read after it returns zero.
+type ndrReader struct {
+	b   []byte
+	off int
+	err error
+}
+
+func (r *ndrReader) take(n int) []byte {
+	if r.err != nil || n > len(r.b)-r.off {
+		if r.err == nil {
+			r.err = errors.New("truncated")
+		}
+		return make([]byte, n)
+	}
+	p := r.b[r.off : r.off+n]
+	r.off += n
+	return p
+}
+
+func (r *ndrReader) u32() uint32 {
+	r.off = (r.off + 3) &^ 3
+	return binary.LittleEndian.Uint32(r.take(4))
+}
+
+// sid reads an RPC_SID pointee: the conformance count, then the structure.
+func (r *ndrReader) sid() sid {
+	count := r.u32()
+	head := r.take(8)
+	if r.err == nil && (head[0] != 1 || uint32(head[1]) != count || count > maxSubAuthorities) {
+		r.err = fmt.Errorf("bad SID: revision %d, %d sub-authorities of %d", head[0], head[1], count)
+	}
+	var auth [8]byte
+	copy(auth[2:], head[2:8])
+	s := sid{authority: binary.BigEndian.Uint64(auth[:])}
+	for range min(count, maxSubAuthorities) {
+		s.subAuthorities = append(s.subAuthorities, r.u32())
+	}
+	return s
 }
 
 // sid is a security identifier: S-1-<authority>-<subAuthorities...>.

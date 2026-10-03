@@ -62,6 +62,7 @@ type serverSection struct {
 	Timeouts       serverTimeoutsSection `yaml:"timeouts"`
 
 	HideInaccessibleShares bool `yaml:"hide_inaccessible_shares"`
+	ResolveSIDs            bool `yaml:"resolve_sids"`
 }
 
 type durableSection struct {
@@ -165,6 +166,7 @@ type config struct {
 	allowAnon   bool
 
 	hideInaccessibleShares bool // list only the shares a session may open (Samba's access based share enum)
+	resolveSIDs            bool // name the targets' own SIDs by asking the targets (see sidNamer)
 
 	timeouts upstreamTimeouts
 	shares   []share // in file order, which is the order Explorer lists them in
@@ -508,6 +510,7 @@ func resolveServer(cfg *config, s serverSection) error {
 	}
 	cfg.compression = s.Compression
 	cfg.hideInaccessibleShares = s.HideInaccessibleShares
+	cfg.resolveSIDs = s.ResolveSIDs
 
 	d := s.DurableHandles
 	if d.Timeout <= 0 || d.MaxTimeout <= 0 {

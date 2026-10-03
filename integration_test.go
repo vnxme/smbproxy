@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jfjallid/go-smb/dcerpc/mslsad"
+	dcesrv "github.com/jfjallid/go-smb/dcerpc/server"
 	"github.com/jfjallid/go-smb/ntlmssp"
 	"github.com/jfjallid/go-smb/smb"
 	"github.com/jfjallid/go-smb/smb/server"
@@ -556,5 +558,98 @@ func TestIntegrationShareModes(t *testing.T) {
 	}
 	if got, err := getFile(t, direct, "data", `inner\c.txt`); err != nil || string(got) != "shared" {
 		t.Errorf("renamed file holds (%q, %v), want %q", got, err, "shared")
+	}
+}
+
+// lsaTarget is startTarget with an LSA service on \pipe\lsarpc that names one
+// account of its domain, NAS: S-1-5-21-1-2-3-1000 is NAS\alice.
+func lsaTarget(t *testing.T) (port int) {
+	t.Helper()
+	nas := mustSID("S-1-5-21-1-2-3")
+	lsa := newLSAService(&config{netbiosName: "NAS", netbiosDomain: "WORKGROUP"})
+	lsa.lookup = func(sids []sid) []sidName {
+		out := (&sidNamer{}).name(nil, sids)
+		for i, s := range sids {
+			if s.String() == "S-1-5-21-1-2-3-1000" {
+				out[i] = sidName{use: mslsad.SidTypeUser, name: "alice", domain: "NAS", domainSID: nas}
+			}
+		}
+		return out
+	}
+	srv := &server.Server{Config: &server.ServerConfig{
+		Authenticator: &server.MapAuthenticator{Accounts: map[string]*server.Account{
+			"admin": {NTHash: ntlmssp.Ntowfv1("x")},
+		}},
+		PipeOpener: &server.MapPipeOpener{Pipes: map[string]func(*server.Session) (server.PipeBackend, error){
+			"lsarpc": func(*server.Session) (server.PipeBackend, error) {
+				return &rpcPipe{inner: dcesrv.NewPipeHandler("lsarpc", lsa)}, nil
+			},
+		}},
+	}}
+	srv.RegisterShare("IPC$", server.Share{Name: "IPC$", Type: smb.ShareTypePipe, VFS: &noopVFS{}})
+	srv.RegisterShare("data", server.Share{Name: "data", Type: smb.ShareTypeDisk, VFS: memvfs.New(memvfs.Options{})})
+	return serve(t, srv)
+}
+
+const sidConfig = `
+server:
+  listen: 127.0.0.1:0
+  resolve_sids: RESOLVE
+local:
+  users:
+    alice: {password: a}
+    bob: {password: b}
+targets:
+  nas:
+    host: 127.0.0.1
+    port: TARGET_PORT
+    user: admin
+    password: x
+shares:
+  - name: files
+    target: nas
+    path: data
+    read_access: [alice]
+`
+
+// Explorer's owner and permission names, end to end: the client asks the
+// proxy's LSA, which names well-known SIDs itself and, with resolve_sids, asks
+// the target behind the shares the session may read.
+func TestIntegrationSIDNames(t *testing.T) {
+	targetPort := lsaTarget(t)
+	sids := []string{"S-1-5-21-1-2-3-1000", "S-1-5-32-544", "S-1-5-21-1-2-3-1001"}
+	lookup := func(proxyPort int, user, pass string) []string {
+		t.Helper()
+		conn := connect(t, proxyPort, user, pass, "IPC$")
+		res, err := smbConn{conn}.LookupSids(sids)
+		if err != nil {
+			t.Fatalf("%s: LookupSids: %v", user, err)
+		}
+		var names []string
+		for _, n := range res.TranslatedNames {
+			switch {
+			case n.Use == mslsad.SidTypeUnknown:
+				names = append(names, "?")
+			case res.ReferencedDomains[n.DomainIndex].Name == "":
+				names = append(names, n.Name)
+			default:
+				names = append(names, res.ReferencedDomains[n.DomainIndex].Name+`\`+n.Name)
+			}
+		}
+		return names
+	}
+
+	resolving := startProxy(t, strings.ReplaceAll(sidConfig, "RESOLVE", "true"), targetPort)
+	if got, want := lookup(resolving, "alice", "a"), []string{`NAS\alice`, `BUILTIN\Administrators`, "?"}; !slices.Equal(got, want) {
+		t.Errorf("alice with resolve_sids: %q, want %q", got, want)
+	}
+	// bob may read no share on the target: it is not asked for him.
+	if got, want := lookup(resolving, "bob", "b"), []string{"?", `BUILTIN\Administrators`, "?"}; !slices.Equal(got, want) {
+		t.Errorf("bob with resolve_sids: %q, want %q", got, want)
+	}
+
+	local := startProxy(t, strings.ReplaceAll(sidConfig, "RESOLVE", "false"), targetPort)
+	if got, want := lookup(local, "alice", "a"), []string{"?", `BUILTIN\Administrators`, "?"}; !slices.Equal(got, want) {
+		t.Errorf("alice without resolve_sids: %q, want %q", got, want)
 	}
 }

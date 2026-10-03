@@ -52,6 +52,13 @@ server:
                              # (Samba's "access based share enum"); by
                              # default, as on Windows, every share is listed
                              # and opening one without access is refused
+  resolve_sids: false        # name the targets' accounts in a file's owner and
+                             # permissions (Explorer's Properties) by asking
+                             # the targets, as the proxy's account; a session
+                             # asks only targets whose shares it may read.
+                             # Off: only well-known SIDs (Everyone, SYSTEM,
+                             # BUILTIN\Administrators...) are named; asking
+                             # lets a client learn the targets' account names
 
   # Upper bounds on waiting for clients (Go durations; 0 disables a limit).
   timeouts:

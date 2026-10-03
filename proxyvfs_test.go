@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jfjallid/go-smb/dcerpc"
+	"github.com/jfjallid/go-smb/dcerpc/mslsad"
 	"github.com/jfjallid/go-smb/smb"
 	"github.com/jfjallid/go-smb/smb/server"
 )
@@ -186,6 +188,8 @@ type fakeConn struct {
 	listDir    string // dir arg of the most recent ListDirectory call
 	opens      []string
 	closed     bool
+	lookupFn   func(sids []string) (mslsad.SidTranslations, error) // answers LookupSids
+	lookups    [][]string                                          // the SIDs of each LookupSids call
 }
 
 func (c *fakeConn) OpenFileExt(tree, filepath string, opts *smb.CreateReqOpts) (upstreamFile, error) {
@@ -199,6 +203,16 @@ func (c *fakeConn) OpenFileExt(tree, filepath string, opts *smb.CreateReqOpts) (
 }
 
 func (c *fakeConn) TreeConnect(string) error { return c.treeErr }
+
+func (c *fakeConn) LookupSids(sids []string) (mslsad.SidTranslations, error) {
+	c.mu.Lock()
+	c.lookups = append(c.lookups, sids)
+	c.mu.Unlock()
+	if c.lookupFn == nil {
+		return mslsad.SidTranslations{}, &dcerpc.StatusError{Code: mslsad.StatusNoneMapped}
+	}
+	return c.lookupFn(sids)
+}
 
 func (c *fakeConn) ListDirectory(_, dir, _ string) ([]smb.SharedFile, error) {
 	c.mu.Lock()

@@ -214,8 +214,8 @@ func TestLSAUnsupported(t *testing.T) {
 		t.Errorf("class 1 -> % x, want % x", out, want)
 	}
 	// An unanswered opnum faults.
-	if _, err := s.Dispatch(context.Background(), 15, nil); err == nil {
-		t.Error("opnum 15 (LsarLookupSids) answered, want a fault")
+	if _, err := s.Dispatch(context.Background(), 14, nil); err == nil {
+		t.Error("opnum 14 (LsarLookupNames) answered, want a fault")
 	}
 	if _, err := s.Dispatch(context.Background(), lsarQueryInformationPolicy, make([]byte, 10)); err == nil {
 		t.Error("short QueryInformationPolicy request accepted, want an error")

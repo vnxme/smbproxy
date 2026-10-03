@@ -91,6 +91,7 @@ func newProxy(cfg *config) *proxy {
 	// Windows client needs (see its doc).
 	allShares := srvsvc.FromConfig(srvCfg)
 	lsa := newLSAService(cfg)
+	namer := &sidNamer{resolve: cfg.resolveSIDs}
 	srvCfg.PipeOpener = &server.MapPipeOpener{
 		Pipes: map[string]func(*server.Session) (server.PipeBackend, error){
 			// Built per open, for the session opening it: with
@@ -106,15 +107,35 @@ func newProxy(cfg *config) *proxy {
 				}, nil
 			},
 			// lsaService answers the domain-membership queries the same tab
-			// makes next (see its doc).
-			"lsarpc": func(_ *server.Session) (server.PipeBackend, error) {
+			// makes next (see its doc), and names the SIDs of files'
+			// owners and permissions. Built per open: the session's SIDs
+			// are asked only of the targets whose shares it may read.
+			"lsarpc": func(s *server.Session) (server.PipeBackend, error) {
+				svc := *lsa
+				ups := p.readableUpstreams(cfg, principalOf(s))
+				svc.lookup = func(sids []sid) []sidName { return namer.name(ups, sids) }
 				return &rpcPipe{
-					inner: dcesrv.NewPipeHandler("lsarpc", lsa),
+					inner: dcesrv.NewPipeHandler("lsarpc", &svc),
 				}, nil
 			},
 		},
 	}
 	return p
+}
+
+// readableUpstreams lists, in configuration order and once each, the
+// upstreams behind the shares pr may read.
+func (p *proxy) readableUpstreams(cfg *config, pr principal) []*upstream {
+	var ups []*upstream
+	seen := map[*upstream]bool{}
+	for i := range cfg.shares {
+		sh := &cfg.shares[i]
+		if up := p.upstreams[sh.target]; sh.readAccess.allows(pr) && !seen[up] {
+			seen[up] = true
+			ups = append(ups, up)
+		}
+	}
+	return ups
 }
 
 // close tears down every upstream connection.

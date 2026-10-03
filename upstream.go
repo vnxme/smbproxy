@@ -12,6 +12,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jfjallid/go-smb/dcerpc"
+	"github.com/jfjallid/go-smb/dcerpc/mslsad"
+	"github.com/jfjallid/go-smb/dcerpc/smbtransport"
 	"github.com/jfjallid/go-smb/smb"
 	"github.com/jfjallid/go-smb/spnego"
 )
@@ -235,6 +238,8 @@ type upstreamConn interface {
 	// *smb.File, so the whole handle path stays mockable.
 	OpenFileExt(tree, filepath string, opts *smb.CreateReqOpts) (upstreamFile, error)
 	TreeConnect(name string) error
+	// LookupSids asks the target's LSA to name sids (as S-1-... strings).
+	LookupSids(sids []string) (mslsad.SidTranslations, error)
 	ListDirectory(share, dir, pattern string) ([]smb.SharedFile, error)
 	Close()
 }
@@ -289,6 +294,29 @@ func (c smbConn) OpenFileExt(tree, filepath string, opts *smb.CreateReqOpts) (up
 		return nil, err
 	}
 	return smbFile{File: f, share: tree}, nil
+}
+
+// LookupSids opens \pipe\lsarpc on the target's IPC$ and asks with go-smb's
+// LSA client, which opens and closes a policy handle around LsarLookupSids2.
+func (c smbConn) LookupSids(sids []string) (mslsad.SidTranslations, error) {
+	if err := c.TreeConnect("IPC$"); err != nil {
+		return mslsad.SidTranslations{}, err
+	}
+	f, err := c.OpenFile("IPC$", mslsad.MSRPCLsaRpcPipe)
+	if err != nil {
+		return mslsad.SidTranslations{}, err
+	}
+	defer func() { _ = f.CloseFile() }()
+	tr, err := smbtransport.NewSMBTransport(f)
+	if err != nil {
+		return mslsad.SidTranslations{}, err
+	}
+	bind, err := dcerpc.Bind(tr, mslsad.MSRPCUuidLsaRpc, mslsad.MSRPCLsaRpcMajorVersion,
+		mslsad.MSRPCLsaRpcMinorVersion, dcerpc.MSRPCUuidNdr)
+	if err != nil {
+		return mslsad.SidTranslations{}, err
+	}
+	return mslsad.NewRPCCon(bind).LsarLookupSids2(mslsad.LsapLookupWksta, sids)
 }
 
 // smbFile adapts *smb.File to upstreamFile. CloseFile and IsDir are promoted
