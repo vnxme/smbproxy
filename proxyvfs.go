@@ -313,11 +313,11 @@ func (v *proxyVFS) Read(_ context.Context, h server.Handle, offset int64, buf []
 // setCache makes data, read from the target at off, the handle's cached
 // region and recycles the buffer it replaces. Readers copy out of the cache
 // under cacheMu, so once swapped out the old buffer has no other user.
-func (ph *proxyHandle) setCache(off int64, data []byte) {
-	ph.cacheMu.Lock()
-	old := ph.cacheData
-	ph.cacheOff, ph.cacheData = off, data
-	ph.cacheMu.Unlock()
+func (h *proxyHandle) setCache(off int64, data []byte) {
+	h.cacheMu.Lock()
+	old := h.cacheData
+	h.cacheOff, h.cacheData = off, data
+	h.cacheMu.Unlock()
 	putReadBuf(old)
 }
 
@@ -583,7 +583,7 @@ func streamInfo(info server.FileInfo) []byte {
 // handle and listing, which clients use to tell files apart.
 func (v *proxyVFS) fileID(rel string) uint64 {
 	h := fnv.New64a()
-	h.Write([]byte(strings.ToLower(v.share + "\\" + joinRemote(v.base, rel))))
+	_, _ = h.Write([]byte(strings.ToLower(v.share + "\\" + joinRemote(v.base, rel))))
 	if id := h.Sum64(); id != 0 {
 		return id
 	}

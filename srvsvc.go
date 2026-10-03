@@ -61,7 +61,7 @@ func newSrvsvcService(cfg *config, shares []srvsvc.ShareEntry) *srvsvcService {
 		s.maxUsers = uint32(cfg.maxConnections)
 	}
 	if idle := cfg.clientIdleTimeout; idle > 0 {
-		s.autodisconnect = int32(max(1, (idle.Minutes() + 0.5)))
+		s.autodisconnect = int32(max(1, idle.Minutes()+0.5))
 	}
 	return s
 }

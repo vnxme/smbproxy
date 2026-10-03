@@ -124,7 +124,7 @@ func main() {
 	configPath := flag.String("config", defaultConfigPath,
 		"configuration file (YAML); see smbproxy.example.yaml for every setting")
 	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(),
+		_, _ = fmt.Fprintf(flag.CommandLine.Output(),
 			"usage: %s [-config file]\n\nAll settings are in the configuration file.\n\n", os.Args[0])
 		flag.PrintDefaults()
 	}
