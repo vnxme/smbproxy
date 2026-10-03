@@ -115,6 +115,11 @@ type fsCached struct {
 	buf []byte
 }
 
+// openDirOpts opens a directory for listing. It shares the directory fully,
+// whatever the client asked: it asks the target for list access even when the
+// client asked for attributes alone, and such an open, exempt from sharing
+// modes on Windows, must not keep other clients from renaming or deleting the
+// directory.
 func openDirOpts() *smb.CreateReqOpts {
 	o := smb.NewCreateReqOpts()
 	o.DesiredAccess = smb.DAccMaskFileListDirectory |
@@ -139,16 +144,23 @@ const metadataAccess = smb.FAccMaskFileReadAttributes | smb.FAccMaskFileReadEA |
 	smb.FAccMaskReadControl | smb.FAccMaskSynchronize
 
 // openFileOpts opens a file for reading on behalf of a client that asked for
-// access. A client asking only for metadata gets just that on the target too:
-// as on Windows, such an open succeeds while another client holds the file
+// access and share mode share.
+//
+// A client asking only for metadata gets just that on the target too: as on
+// Windows, such an open succeeds while another client holds the file
 // exclusively (Explorer stats a file it is still copying, for instance), where
 // opening it for reading would fail with a sharing violation.
-func openFileOpts(access uint32) *smb.CreateReqOpts {
+//
+// The share mode is the client's, so the target applies it between all the
+// proxy's clients as Windows would between processes: a reader that allows
+// deletion lets others rename or delete the file while it reads, and one that
+// allows no writing keeps others from writing.
+func openFileOpts(access, share uint32) *smb.CreateReqOpts {
 	o := smb.NewCreateReqOpts()
 	if access&contentAccess == 0 {
 		o.DesiredAccess = access&metadataAccess | smb.FAccMaskFileReadAttributes | smb.FAccMaskSynchronize
 	}
-	o.ShareAccess = smb.FileShareRead | smb.FileShareWrite
+	o.ShareAccess = share
 	o.CreateDisp = smb.FileOpen
 	return o
 }
@@ -241,7 +253,7 @@ func (v *proxyVFS) Create(_ context.Context, sess *server.Session, req server.Cr
 				upFile, e = c.OpenFileExt(v.share, remote, o)
 			}
 		} else {
-			upFile, e = c.OpenFileExt(v.share, remote, openFileOpts(req.DesiredAccess))
+			upFile, e = c.OpenFileExt(v.share, remote, openFileOpts(req.DesiredAccess, req.ShareAccess))
 			if e != nil {
 				// It may be a directory the file open could not reach. If the
 				// target says it is not one, the file open's own failure (a

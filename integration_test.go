@@ -10,6 +10,7 @@ import (
 	"net"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -414,5 +415,146 @@ func TestIntegrationVolumeSize(t *testing.T) {
 			t.Errorf("%s: sector size info = (% x, %v), want 512-byte logical, 4096-byte physical sectors", share, sector, err)
 		}
 		_ = f.CloseFile()
+	}
+}
+
+// sharingVFS enforces share modes on a target file system, as Windows does
+// (memvfs ignores them): an open asking for rights that sharing governs must
+// be admitted by every such open of the file already there, and admit them.
+type sharingVFS struct {
+	server.VFS
+	mu    sync.Mutex
+	opens map[server.Handle]sharingOpen
+}
+
+type sharingOpen struct {
+	path          string
+	access, share uint32
+}
+
+// sharedRights pairs the rights sharing modes govern with the flag admitting
+// them.
+var sharedRights = []struct{ access, share uint32 }{
+	{smb.FAccMaskFileReadData | smb.FAccMaskFileExecute | smb.FAccMaskGenericRead | smb.FAccMaskGenericAll, smb.FileShareRead},
+	{smb.FAccMaskFileWriteData | smb.FAccMaskFileAppendData | smb.FAccMaskGenericWrite | smb.FAccMaskGenericAll, smb.FileShareWrite},
+	{smb.FAccMaskDelete | smb.FAccMaskGenericAll, smb.FileShareDelete},
+}
+
+// admits reports whether an open with share mode share admits another asking
+// for access.
+func admits(share, access uint32) bool {
+	for _, r := range sharedRights {
+		if access&r.access != 0 && share&r.share == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// governed reports whether sharing modes apply to an open asking for access.
+func governed(access uint32) bool {
+	return !admits(0, access)
+}
+
+func (v *sharingVFS) Create(ctx context.Context, sess *server.Session, req server.CreateRequest) (server.CreateResult, uint32, error) {
+	path := strings.ToLower(req.Path)
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if governed(req.DesiredAccess) {
+		for _, o := range v.opens {
+			if o.path == path && governed(o.access) &&
+				(!admits(o.share, req.DesiredAccess) || !admits(req.ShareAccess, o.access)) {
+				return server.CreateResult{}, statusSharingViolation, nil
+			}
+		}
+	}
+	res, status, err := v.VFS.Create(ctx, sess, req)
+	if err == nil && status == smb.StatusOk {
+		if v.opens == nil {
+			v.opens = make(map[server.Handle]sharingOpen)
+		}
+		v.opens[res.Handle] = sharingOpen{path, req.DesiredAccess, req.ShareAccess}
+	}
+	return res, status, err
+}
+
+func (v *sharingVFS) Close(ctx context.Context, h server.Handle) error {
+	v.mu.Lock()
+	delete(v.opens, h)
+	v.mu.Unlock()
+	return v.VFS.Close(ctx, h)
+}
+
+// sharingViolation fails the test unless err is STATUS_SHARING_VIOLATION.
+func sharingViolation(t *testing.T, what string, err error) {
+	t.Helper()
+	if code, ok := ntStatus(err); !ok || code != statusSharingViolation {
+		t.Errorf("%s: got %v, want STATUS_SHARING_VIOLATION", what, err)
+	}
+}
+
+// The share mode a client opens a file with reaches the target, which applies
+// it between the proxy's clients as Windows does between processes.
+func TestIntegrationShareModes(t *testing.T) {
+	targetPort := startTargetVFS(t, &sharingVFS{VFS: memvfs.New(memvfs.Options{})})
+	direct := connect(t, targetPort, "admin", "x", "data")
+	if err := direct.Mkdir("data", `inner`); err != nil {
+		t.Fatal(err)
+	}
+	putFile(t, direct, "data", `inner\a.txt`, []byte("shared"))
+	proxyPort := startProxy(t, writeConfig, targetPort)
+	reader := connect(t, proxyPort, "alice", "a", "files") // two clients
+	other := connect(t, proxyPort, "alice", "a", "files")
+
+	const read = smb.FAccMaskFileReadData | smb.FAccMaskFileReadAttributes | smb.FAccMaskSynchronize
+	const all = smb.FileShareRead | smb.FileShareWrite | smb.FileShareDelete
+	open := func(conn *smb.Connection, path string, access, share uint32) (*smb.File, error) {
+		opts := smb.NewCreateReqOpts()
+		opts.DesiredAccess, opts.ShareAccess, opts.CreateDisp = access, share, smb.FileOpen
+		return conn.OpenFileExt("files", path, opts)
+	}
+	rename := func(from, to string) error {
+		return setInfo(t, other, "files", from, accessDelete|smb.FAccMaskSynchronize,
+			smb.FileRenameInformation, renameInfo(false, to))
+	}
+
+	// A reader that admits deletion, as Explorer's preview does: the other
+	// client renames the file while it is open.
+	r, err := open(reader, `a.txt`, read, all)
+	if err != nil {
+		t.Fatalf("open for reading: %v", err)
+	}
+	if err := rename(`a.txt`, `b.txt`); err != nil {
+		t.Errorf("rename under a reader admitting deletion: %v", err)
+	}
+	_ = r.CloseFile()
+
+	// A reader that admits only reading: others may read, but neither write
+	// nor rename; asking for attributes alone is never refused.
+	r, err = open(reader, `b.txt`, read, smb.FileShareRead)
+	if err != nil {
+		t.Fatalf("open for reading: %v", err)
+	}
+	if f, err := open(other, `b.txt`, read, all); err != nil {
+		t.Errorf("read beside a reader admitting reading: %v", err)
+	} else {
+		_ = f.CloseFile()
+	}
+	_, err = open(other, `b.txt`, accessWriteData|smb.FAccMaskSynchronize, all)
+	sharingViolation(t, "write beside a reader admitting only reading", err)
+	sharingViolation(t, "rename under a reader admitting only reading", rename(`b.txt`, `c.txt`))
+	if f, err := open(other, `b.txt`, smb.FAccMaskFileReadAttributes, 0); err != nil {
+		t.Errorf("attributes beside a reader admitting only reading: %v", err)
+	} else {
+		_ = f.CloseFile()
+	}
+	_ = r.CloseFile()
+
+	// Once it is closed, the rename goes through.
+	if err := rename(`b.txt`, `c.txt`); err != nil {
+		t.Errorf("rename after the reader closed: %v", err)
+	}
+	if got, err := getFile(t, direct, "data", `inner\c.txt`); err != nil || string(got) != "shared" {
+		t.Errorf("renamed file holds (%q, %v), want %q", got, err, "shared")
 	}
 }

@@ -385,6 +385,40 @@ func TestProxyCreateTargetAccess(t *testing.T) {
 	}
 }
 
+// A file is opened on the target with the client's share mode; a directory
+// is always fully shared, as its open asks for more than a client asking only
+// for attributes.
+func TestProxyCreateShareAccess(t *testing.T) {
+	const all = smb.FileShareRead | smb.FileShareWrite | smb.FileShareDelete
+	tests := []struct {
+		name         string
+		req          server.CreateRequest
+		asked, wants uint32
+	}{
+		{"file, all", server.CreateRequest{DesiredAccess: 0x00120089}, all, all},
+		{"file, read only", server.CreateRequest{DesiredAccess: 0x00120089}, smb.FileShareRead, smb.FileShareRead},
+		{"file, exclusive", server.CreateRequest{DesiredAccess: 0x00120089}, 0, 0},
+		{"directory", server.CreateRequest{DesiredAccess: 0x00100080, CreateOptions: smb.FileDirectoryFile}, 0, all},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got uint32
+			c := &fakeConn{openFn: func(_, _ string, opts *smb.CreateReqOpts) (upstreamFile, error) {
+				got = opts.ShareAccess
+				return &fakeFile{}, nil
+			}}
+			req := tt.req
+			req.Path, req.ShareAccess = `\x`, tt.asked
+			if _, status, err := newVFS(c).Create(context.Background(), nil, req); err != nil || status != 0 {
+				t.Fatalf("Create: status=0x%08x err=%v", status, err)
+			}
+			if got != tt.wants {
+				t.Errorf("target share access = %d, want %d", got, tt.wants)
+			}
+		})
+	}
+}
+
 func TestProxyCreateDirFallback(t *testing.T) {
 	ff := &fakeFile{isDir: true, metaVal: fileMeta{attributes: server.FileAttributeDirectory}}
 	var calls int
