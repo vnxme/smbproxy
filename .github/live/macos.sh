@@ -5,8 +5,7 @@
 # files directly and through the proxy to compare speeds.
 #
 # Run from the repository root, with ./smbproxy built, on a throwaway
-# machine: it turns on file sharing, sets the runner account's password
-# and mounts shares.
+# machine: it turns on file sharing, adds a user and mounts shares.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -17,7 +16,7 @@ WORK=$(mktemp -d)
 WORK=$(cd "$WORK" && pwd -P)  # /var is a symlink to /private/var
 ROOT=/Users/Shared/smbtest   # the target's share; file sharing may not
                              # share folders under /var/folders
-TUSER=$(id -un)              # target account: the runner's own user
+TUSER=smbtarget              # target account, created here
 TPASS=TargetPw2026x
 PUSER=tester                 # proxy logins
 PPASS=ProxyPw2026x
@@ -44,10 +43,21 @@ mkdir -p "$ROOT"/rw "$ROOT"/ro "$ROOT"/secret
 echo "read me" >"$ROOT/ro/readme.txt"
 echo "secret" >"$ROOT/secret/secret.txt"
 # File sharing authenticates with an NT hash, which macOS keeps only for
-# accounts allowed SMB logins and only from the next password change.
+# accounts allowed SMB logins and only from the next password change. The
+# runner's own account cannot be used: changing its password asks for the
+# old one.
+sudo sysadminctl -addUser "$TUSER" -fullName "smbproxy live test" -password "$TPASS"
 sudo pwpolicy -u "$TUSER" -sethashtypes SMB-NT on
 sudo dscl . -passwd "/Users/$TUSER" "$TPASS"
 dscl . -read "/Users/$TUSER" AuthenticationAuthority
+# What the target account creates through SMB must stay usable by the
+# runner, which checks it on the file system, and the other way round.
+perms=read,write,execute,delete,append,readattr,writeattr,readextattr,writeextattr
+perms=$perms,readsecurity,list,search,add_file,add_subdirectory,delete_child
+for u in "$TUSER" "$(id -un)"; do
+	find "$ROOT" -type d -exec chmod +a "user:$u allow $perms,file_inherit,directory_inherit" {} +
+done
+ls -led "$ROOT/rw"
 sudo defaults write /Library/Preferences/SystemConfiguration/com.apple.smb.server EnabledServices -array disk
 sudo launchctl enable system/com.apple.smbd
 sudo launchctl bootstrap system /System/Library/LaunchDaemons/com.apple.smbd.plist 2>/dev/null ||
