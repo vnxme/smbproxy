@@ -33,6 +33,7 @@ cleanup() {
 	[ -f "$WORK/proxy.pid" ] && kill "$(cat "$WORK/proxy.pid")"
 	[ -f "$WORK/samba/run/smbd.pid" ] && sudo kill "$(cat "$WORK/samba/run/smbd.pid")"
 	cp "$WORK/proxy.log" proxy.log 2>/dev/null
+	ls -laR "$ROOT" | head -40
 	sudo cat "$WORK"/samba/log/* >samba.log 2>/dev/null
 }
 trap cleanup EXIT
@@ -72,6 +73,9 @@ cat >"$conf" <<EOF
    path = $ROOT
    read only = no
    valid users = $TUSER
+   # smbd runs as root here; new files and folders would otherwise be
+   # root's, which the runner's own account then may not change.
+   inherit owner = unix only
 EOF
 printf '%s\n%s\n' "$TPASS" "$TPASS" | sudo "$smbpasswd" -c "$conf" -a -s "$TUSER"
 sudo "$smbd" -D -s "$conf"
@@ -88,7 +92,7 @@ fi
 step "Start smbproxy"
 live config --out "$WORK/live.yaml" --listen "127.0.0.1:$PORT" \
 	--host 127.0.0.1 --port $TPORT --user "$TUSER" --domain WORKGROUP --password "$TPASS" --share data \
-	--proxy-user $PUSER --proxy-password $PPASS --other-user $OUSER --other-password $OPASS --debug
+	--proxy-user $PUSER --proxy-password $PPASS --other-user $OUSER --other-password $OPASS
 ./smbproxy -version
 ./smbproxy -config "$WORK/live.yaml" >"$WORK/proxy.log" 2>&1 &
 echo $! >"$WORK/proxy.pid"
