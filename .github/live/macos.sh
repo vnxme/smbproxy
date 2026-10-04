@@ -35,6 +35,7 @@ cleanup() {
 	cp "$WORK/proxy.log" proxy.log 2>/dev/null
 	ls -laR "$ROOT" | head -40
 	sudo cat "$WORK"/samba/log/* >samba.log 2>/dev/null
+	grep -iE 'chmod|mode|set_nt_acl|nfs_ace|fruit' samba.log | head -60
 }
 trap cleanup EXIT
 
@@ -67,18 +68,17 @@ cat >"$conf" <<EOF
    cache directory = $WORK/samba/cache
    pid directory = $WORK/samba/run
    log file = $WORK/samba/log/log.%m
-   fruit:aapl = no
+   log level = 1 vfs:5 acls:5
 
 [data]
    path = $ROOT
    read only = no
    valid users = $TUSER
-   # The macOS client sets permissions on what it creates, which this
-   # Samba build (without ACL support) maps to mode 000, even without the
-   # proxy. Ignore them and give the owner full access.
-   nt acl support = no
-   force create mode = 0600
-   force directory mode = 0700
+   # The macOS client sets the mode of what it creates, which plain Samba
+   # turns into 000, even without the proxy; vfs_fruit, which Samba uses
+   # for macOS clients, understands it.
+   vfs objects = catia fruit streams_xattr
+   fruit:nfs_aces = yes
 EOF
 printf '%s\n%s\n' "$TPASS" "$TPASS" | sudo "$smbpasswd" -c "$conf" -a -s "$TUSER"
 sudo "$smbd" -D -s "$conf"
