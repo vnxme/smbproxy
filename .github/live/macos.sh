@@ -75,7 +75,7 @@ if ! smbutil view -N "//$TUSER:$TPASS@$HOST"; then
 fi
 
 step "Start smbproxy"
-# No domain: macOS file sharing refuses WORKGROUP\\user, while its own
+# No domain: macOS file sharing refuses WORKGROUP\user, while its own
 # client, which names none, logs in.
 live config --out "$WORK/live.yaml" --listen "127.0.0.1:$PORT" \
 	--host 127.0.0.1 --port 445 --user "$TUSER" --domain "" --password "$TPASS" --share data \
@@ -85,8 +85,15 @@ live config --out "$WORK/live.yaml" --listen "127.0.0.1:$PORT" \
 echo $! >"$WORK/proxy.pid"
 live wait --port $PORT
 
+# smbutil view works against the target directly but not through the
+# proxy yet, so it only warns. A second proxy with debug logging, on its own
+# port, records the exchange without flooding the other tests' logs.
 step "smbutil: list shares"
-if shares=$(smbutil view -N "//$PUSER:$PPASS@127.0.0.1:$PORT"); then
+sed 's/^debug: false/debug: true/; s/:'"$PORT"'"/:'"$((PORT + 1))"'"/' "$WORK/live.yaml" >"$WORK/debug.yaml"
+./smbproxy -config "$WORK/debug.yaml" >"$WORK/debug.log" 2>&1 &
+debug_pid=$!
+live wait --port $((PORT + 1))
+if shares=$(smbutil view -N "//$PUSER:$PPASS@127.0.0.1:$((PORT + 1))"); then
 	echo "$shares"
 	grep -Eq '^rw +Disk' <<<"$shares"
 	grep -Eq '^ro +Disk' <<<"$shares"
@@ -95,6 +102,10 @@ else
 	echo "$shares"
 	echo "::warning::smbutil view failed through the proxy"
 fi
+kill "$debug_pid"
+echo "::group::proxy exchange for smbutil view"
+grep -vE '^\S+ \S+ \[[*+!]\]' "$WORK/debug.log" | head -150
+echo "::endgroup::"
 
 mnt() { # mnt NAME //user:password@host:port/share
 	mkdir -p "$WORK/mnt/$1"

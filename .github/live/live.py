@@ -25,6 +25,7 @@ import statistics
 import sys
 import threading
 import time
+import unicodedata
 
 CHUNK = 4 << 20  # 4 MiB
 
@@ -251,7 +252,9 @@ def cmd_fs(a):
         name = "файл с пробелом ✓ (1).txt"
         write(m(name), b"unicode")
         expect(read(t(name)) == b"unicode", "unicode name not on target")
-        expect(name in os.listdir(M), "unicode name not listed")
+        # macOS's client lists names decomposed (NFD); compare them composed.
+        listed = [unicodedata.normalize("NFC", n) for n in os.listdir(M)]
+        expect(name in listed, "unicode name not listed")
 
     c.run("unicode and spaces in names", names)
 
