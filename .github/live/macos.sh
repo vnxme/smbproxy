@@ -75,8 +75,10 @@ if ! smbutil view -N "//$TUSER:$TPASS@$HOST"; then
 fi
 
 step "Start smbproxy"
+# No domain: macOS file sharing refuses WORKGROUP\\user, while its own
+# client, which names none, logs in.
 live config --out "$WORK/live.yaml" --listen "127.0.0.1:$PORT" \
-	--host 127.0.0.1 --port 445 --user "$TUSER" --domain WORKGROUP --password "$TPASS" --share data \
+	--host 127.0.0.1 --port 445 --user "$TUSER" --domain "" --password "$TPASS" --share data \
 	--proxy-user $PUSER --proxy-password $PPASS --other-user $OUSER --other-password $OPASS
 ./smbproxy -version
 ./smbproxy -config "$WORK/live.yaml" >"$WORK/proxy.log" 2>&1 &
