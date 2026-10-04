@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Live test on macOS: Samba from Homebrew serves the target share on port
-# 1445 (macOS keeps 445 for its own file sharing), smbproxy listens on 4445
-# in front of it, and macOS's own SMB client (smbutil, mount_smbfs) uses
-# the proxy. Then the client copies large files directly and through the
-# proxy to compare speeds.
+# Live test on macOS: macOS's own file sharing serves the target share on
+# port 445, smbproxy listens on 4445 in front of it, and macOS's own SMB
+# client (smbutil, mount_smbfs) uses the proxy. Then the client copies large
+# files directly and through the proxy to compare speeds.
 #
 # Run from the repository root, with ./smbproxy built, on a throwaway
-# machine: it installs packages, runs smbd as root and mounts shares.
+# machine: it turns on file sharing, sets the runner account's password
+# and mounts shares.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -15,10 +15,10 @@ step() { echo; echo "=== $*"; }
 
 WORK=$(mktemp -d)
 WORK=$(cd "$WORK" && pwd -P)  # /var is a symlink to /private/var
-ROOT=$WORK/share             # the target's share
+ROOT=/Users/Shared/smbtest   # the target's share; file sharing may not
+                             # share folders under /var/folders
 TUSER=$(id -un)              # target account: the runner's own user
 TPASS=TargetPw2026x
-TPORT=1445
 PUSER=tester                 # proxy logins
 PPASS=ProxyPw2026x
 OUSER=other
@@ -26,75 +26,47 @@ OPASS=OtherPw2026x
 PORT=4445
 SIZE=${LIVE_SPEED_MIB:-512}
 RUNS=${LIVE_SPEED_RUNS:-3}
+# Direct mounts go to the machine's own address rather than loopback, in
+# case the client treats a share on 127.0.0.1 as its own.
+HOST=$(ipconfig getifaddr en0 || echo 127.0.0.1)
 
 cleanup() {
 	set +e
 	for d in "$WORK"/mnt/*; do mount | grep -q " on $d " && umount "$d"; done
 	[ -f "$WORK/proxy.pid" ] && kill "$(cat "$WORK/proxy.pid")"
-	[ -f "$WORK/samba/run/smbd.pid" ] && sudo kill "$(cat "$WORK/samba/run/smbd.pid")"
 	cp "$WORK/proxy.log" proxy.log 2>/dev/null
 	ls -laR "$ROOT" | head -40
-	sudo cat "$WORK"/samba/log/* >samba.log 2>/dev/null
-	grep -iE 'chmod|mode|set_nt_acl|nfs_ace|fruit' samba.log | head -60
 }
 trap cleanup EXIT
 
-step "Install Samba"
-brew install samba
-prefix=$(brew --prefix samba)
-# Homebrew may rename smbd so it does not shadow the system's.
-smbd=$(find "$prefix/" -type f \( -name smbd -o -name samba-dot-org-smbd \) -perm -u+x | head -1)
-smbpasswd=$(find "$prefix/" -type f -name smbpasswd -perm -u+x | head -1)
-echo "smbd: $smbd"
-echo "smbpasswd: $smbpasswd"
-
 step "Set up the target share"
-mkdir -p "$ROOT"/rw "$ROOT"/ro "$ROOT"/secret "$WORK"/samba/{private,lock,state,cache,run,log}
+mkdir -p "$ROOT"/rw "$ROOT"/ro "$ROOT"/secret
 echo "read me" >"$ROOT/ro/readme.txt"
 echo "secret" >"$ROOT/secret/secret.txt"
-conf=$WORK/samba/smb.conf
-cat >"$conf" <<EOF
-[global]
-   server role = standalone server
-   workgroup = WORKGROUP
-   smb ports = $TPORT
-   disable netbios = yes
-   server min protocol = SMB2_10
-   map to guest = never
-   passdb backend = tdbsam:$WORK/samba/private/passdb.tdb
-   private dir = $WORK/samba/private
-   lock directory = $WORK/samba/lock
-   state directory = $WORK/samba/state
-   cache directory = $WORK/samba/cache
-   pid directory = $WORK/samba/run
-   log file = $WORK/samba/log/log.%m
-   log level = 1 vfs:5 acls:5
-
-[data]
-   path = $ROOT
-   read only = no
-   valid users = $TUSER
-   # The macOS client sets the mode of what it creates, which plain Samba
-   # turns into 000, even without the proxy; vfs_fruit, which Samba uses
-   # for macOS clients, understands it.
-   vfs objects = catia fruit streams_xattr
-   fruit:nfs_aces = yes
-EOF
-printf '%s\n%s\n' "$TPASS" "$TPASS" | sudo "$smbpasswd" -c "$conf" -a -s "$TUSER"
-sudo "$smbd" -D -s "$conf"
-live wait --port $TPORT
+# File sharing authenticates with an NT hash, which macOS keeps only for
+# accounts allowed SMB logins and only from the next password change.
+sudo pwpolicy -u "$TUSER" -sethashtypes SMB-NT on
+sudo dscl . -passwd "/Users/$TUSER" "$TPASS"
+dscl . -read "/Users/$TUSER" AuthenticationAuthority
+sudo defaults write /Library/Preferences/SystemConfiguration/com.apple.smb.server EnabledServices -array disk
+sudo launchctl enable system/com.apple.smbd
+sudo launchctl bootstrap system /System/Library/LaunchDaemons/com.apple.smbd.plist 2>/dev/null ||
+	sudo launchctl kickstart -k system/com.apple.smbd
+sudo sharing -a "$ROOT" -S data -n data
+sharing -l
+live wait --port 445
+echo "client to target: $HOST"
 
 # Listing shares over the srvsvc pipe is checked, but does not fail the job
-# yet: smbutil view breaks against Homebrew's Samba as well ("Broken pipe"),
-# so it is not known to work against any server here.
+# yet: smbutil view broke against Homebrew's Samba as well as the proxy.
 step "smbutil: list the target's shares directly"
-if ! smbutil view -N "//$TUSER:$TPASS@127.0.0.1:$TPORT"; then
-	echo "::warning::smbutil view failed against Samba directly"
+if ! smbutil view -N "//$TUSER:$TPASS@$HOST"; then
+	echo "::warning::smbutil view failed against the target directly"
 fi
 
 step "Start smbproxy"
 live config --out "$WORK/live.yaml" --listen "127.0.0.1:$PORT" \
-	--host 127.0.0.1 --port $TPORT --user "$TUSER" --domain WORKGROUP --password "$TPASS" --share data \
+	--host 127.0.0.1 --port 445 --user "$TUSER" --domain WORKGROUP --password "$TPASS" --share data \
 	--proxy-user $PUSER --proxy-password $PPASS --other-user $OUSER --other-password $OPASS
 ./smbproxy -version
 ./smbproxy -config "$WORK/live.yaml" >"$WORK/proxy.log" 2>&1 &
@@ -118,9 +90,9 @@ mnt() { # mnt NAME //user:password@host:port/share
 }
 
 # Checks the setup rather than the proxy: what the macOS client creates
-# on Samba directly must be usable, or every test below fails for that.
+# on the target directly must be usable, or every test below fails for that.
 step "mount_smbfs: create on the target directly"
-mnt direct "//$TUSER:$TPASS@127.0.0.1:$TPORT/data"
+mnt direct "//$TUSER:$TPASS@$HOST/data"
 mkdir "$WORK/mnt/direct/rw/direct-probe"
 echo probe >"$WORK/mnt/direct/rw/direct-probe/probe.txt"
 ls -ld "$ROOT/rw/direct-probe" "$ROOT/rw/direct-probe/probe.txt"
@@ -145,12 +117,12 @@ if mount | grep -q "$WORK/mnt"; then echo "still mounted"; exit 1; fi
 step "mount_smbfs: speed, direct and through the proxy"
 for i in $(seq "$RUNS"); do live mkfile --path "$ROOT/rw/speed-src-$i.bin" --size-mib "$SIZE"; done
 for i in $(seq "$RUNS"); do
-	mnt direct "//$TUSER:$TPASS@127.0.0.1:$TPORT/data"
+	mnt direct "//$TUSER:$TPASS@$HOST/data"
 	live speed --dir "$WORK/mnt/direct/rw" --src "speed-src-$i.bin" --label direct --size-mib "$SIZE" --out "$WORK/speed.jsonl"
 	umount "$WORK/mnt/direct"
 	mnt proxy "//$PUSER:$PPASS@127.0.0.1:$PORT/rw"
 	live speed --dir "$WORK/mnt/proxy" --src "speed-src-$i.bin" --label proxy --size-mib "$SIZE" --out "$WORK/speed.jsonl"
 	umount "$WORK/mnt/proxy"
 done
-live report --results "$WORK/speed.jsonl" --title "macOS: macOS SMB client, Samba target" --size-mib "$SIZE" |
+live report --results "$WORK/speed.jsonl" --title "macOS: macOS SMB client, macOS file sharing target" --size-mib "$SIZE" |
 	tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
