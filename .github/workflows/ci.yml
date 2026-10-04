@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -46,7 +47,7 @@ jobs:
 
   build:
     # Cross-compiles for every platform smbproxy supports, including those
-    # without a hosted runner.
+    # without a hosted runner. On a tag, the binaries go to the release job.
     name: Build (all platforms)
     runs-on: ubuntu-latest
     env:
@@ -63,11 +64,17 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Cross-compile
+        # Named and built as build.ps1 does: smbproxy_<os>_<arch>[.exe],
+        # without build machine paths or debug information.
         run: |
+          mkdir dist
           failed=""
           for target in $TARGETS; do
             echo "::group::$target"
-            if ! GOOS=${target%/*} GOARCH=${target#*/} go build -o /dev/null .; then
+            goos=${target%/*} goarch=${target#*/}
+            out=dist/smbproxy_${goos}_${goarch}
+            [ "$goos" = windows ] && out=$out.exe
+            if ! GOOS=$goos GOARCH=$goarch go build -trimpath -ldflags "-s -w" -o "$out" .; then
               failed="$failed $target"
             fi
             echo "::endgroup::"
@@ -75,4 +82,43 @@ jobs:
           if [ -n "$failed" ]; then
             echo "Failed to build for:$failed"
             exit 1
+          fi
+          (cd dist && sha256sum -- * > SHA256SUMS)
+      - name: Upload binaries
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v7
+        with:
+          name: binaries
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    # A draft release for a pushed tag, once everything above has passed,
+    # with the binaries attached. Publishing it is left to a person.
+    name: Draft release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [lint, test, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: binaries
+          path: dist
+      - name: Create or update the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # A re-run: replace the binaries on the existing release.
+            gh release upload "$TAG" dist/* --clobber
+          else
+            prerelease=""
+            case "$TAG" in *-*) prerelease="--prerelease" ;; esac
+            gh release create "$TAG" dist/* --draft --verify-tag \
+              --title "$TAG" --generate-notes $prerelease
           fi
