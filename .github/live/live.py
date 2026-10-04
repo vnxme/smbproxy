@@ -157,6 +157,14 @@ def cmd_fs(a):
 
     c.run("create folders", mkdir)
 
+    def empty():
+        os.mkdir(m("empty"))
+        expect(os.listdir(m("empty")) == [], f"listing {os.listdir(m('empty'))}")
+        os.rmdir(m("empty"))
+        expect(not os.path.exists(t("empty")), "folder still on target")
+
+    c.run("list and remove an empty folder", empty)
+
     def small():
         write(m("hello.txt"), b"hello, proxy\n")
         expect(read(t("hello.txt")) == b"hello, proxy\n", "content differs on target")

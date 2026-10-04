@@ -48,7 +48,8 @@ $proxy = $null
 try {
     step "Set up the target share"
     New-Item -ItemType Directory -Force "$root\rw", "$root\ro", "$root\secret" | Out-Null
-    Set-Content -NoNewline "$root\ro\readme.txt" "read me`n"
+    Set-Content -NoNewline -Path "$root\ro\readme.txt" -Value "read me`n"
+    Set-Content -NoNewline -Path "$root\secret\secret.txt" -Value "secret`n"
     net user $tuser $tpass /add /y
     if ($LASTEXITCODE) { throw "net user failed" }
     icacls $root /grant "${tuser}:(OI)(CI)F" | Out-Null

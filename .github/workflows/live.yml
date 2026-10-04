@@ -70,6 +70,6 @@ jobs:
         shell: bash
         run: |
           for f in proxy.log samba.log; do
-            [ -f "$f" ] && { echo "::group::$f"; tail -n 300 "$f"; echo "::endgroup::"; }
+            [ -f "$f" ] && { echo "::group::$f"; tail -n 600 "$f"; echo "::endgroup::"; }
           done
           true

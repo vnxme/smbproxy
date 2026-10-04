@@ -44,6 +44,7 @@ fi
 step "Set up the target share"
 sudo mkdir -p "$ROOT"/rw "$ROOT"/ro "$ROOT"/secret
 echo "read me" | sudo tee "$ROOT/ro/readme.txt" >/dev/null
+echo "secret" | sudo tee "$ROOT/secret/secret.txt" >/dev/null
 sudo chown -R "$TUSER:" "$ROOT"
 sudo tee -a /etc/samba/smb.conf >/dev/null <<EOF
 

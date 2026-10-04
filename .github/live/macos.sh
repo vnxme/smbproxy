@@ -49,6 +49,7 @@ echo "smbpasswd: $smbpasswd"
 step "Set up the target share"
 mkdir -p "$ROOT"/rw "$ROOT"/ro "$ROOT"/secret "$WORK"/samba/{private,lock,state,cache,run,log}
 echo "read me" >"$ROOT/ro/readme.txt"
+echo "secret" >"$ROOT/secret/secret.txt"
 conf=$WORK/samba/smb.conf
 cat >"$conf" <<EOF
 [global]
@@ -76,10 +77,13 @@ printf '%s\n%s\n' "$TPASS" "$TPASS" | sudo "$smbpasswd" -c "$conf" -a -s "$TUSER
 sudo "$smbd" -D -s "$conf"
 live wait --port $TPORT
 
+step "smbutil: list the target's shares directly"
+smbutil view -N "//$TUSER:$TPASS@127.0.0.1:$TPORT"
+
 step "Start smbproxy"
 live config --out "$WORK/live.yaml" --listen "127.0.0.1:$PORT" \
 	--host 127.0.0.1 --port $TPORT --user "$TUSER" --domain WORKGROUP --password "$TPASS" --share data \
-	--proxy-user $PUSER --proxy-password $PPASS --other-user $OUSER --other-password $OPASS
+	--proxy-user $PUSER --proxy-password $PPASS --other-user $OUSER --other-password $OPASS --debug
 ./smbproxy -version
 ./smbproxy -config "$WORK/live.yaml" >"$WORK/proxy.log" 2>&1 &
 echo $! >"$WORK/proxy.pid"
