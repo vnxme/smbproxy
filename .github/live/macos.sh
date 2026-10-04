@@ -92,7 +92,7 @@ fi
 step "Start smbproxy"
 live config --out "$WORK/live.yaml" --listen "127.0.0.1:$PORT" \
 	--host 127.0.0.1 --port $TPORT --user "$TUSER" --domain WORKGROUP --password "$TPASS" --share data \
-	--proxy-user $PUSER --proxy-password $PPASS --other-user $OUSER --other-password $OPASS
+	--proxy-user $PUSER --proxy-password $PPASS --other-user $OUSER --other-password $OPASS --debug
 ./smbproxy -version
 ./smbproxy -config "$WORK/live.yaml" >"$WORK/proxy.log" 2>&1 &
 echo $! >"$WORK/proxy.pid"
@@ -113,6 +113,15 @@ mnt() { # mnt NAME //user:password@host:port/share
 	mkdir -p "$WORK/mnt/$1"
 	mount_smbfs -N "$2" "$WORK/mnt/$1"
 }
+
+# Diagnostic while macOS is informational: the mode a folder gets when
+# the macOS client creates it on Samba without the proxy.
+step "mount_smbfs: create a folder on the target directly"
+mnt direct "//$TUSER:$TPASS@127.0.0.1:$TPORT/data"
+mkdir "$WORK/mnt/direct/rw/direct-probe"
+ls -ld "$ROOT/rw/direct-probe"
+rmdir "$WORK/mnt/direct/rw/direct-probe" || true
+umount "$WORK/mnt/direct"
 
 step "mount_smbfs: a wrong password is refused"
 if mnt bad "//$PUSER:wrong@127.0.0.1:$PORT/rw"; then echo "mounted"; exit 1; fi
