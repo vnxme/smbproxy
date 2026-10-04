@@ -77,8 +77,13 @@ printf '%s\n%s\n' "$TPASS" "$TPASS" | sudo "$smbpasswd" -c "$conf" -a -s "$TUSER
 sudo "$smbd" -D -s "$conf"
 live wait --port $TPORT
 
+# Listing shares over the srvsvc pipe is checked, but does not fail the job
+# yet: smbutil view breaks against Homebrew's Samba as well ("Broken pipe"),
+# so it is not known to work against any server here.
 step "smbutil: list the target's shares directly"
-smbutil view -N "//$TUSER:$TPASS@127.0.0.1:$TPORT"
+if ! smbutil view -N "//$TUSER:$TPASS@127.0.0.1:$TPORT"; then
+	echo "::warning::smbutil view failed against Samba directly"
+fi
 
 step "Start smbproxy"
 live config --out "$WORK/live.yaml" --listen "127.0.0.1:$PORT" \
@@ -90,11 +95,15 @@ echo $! >"$WORK/proxy.pid"
 live wait --port $PORT
 
 step "smbutil: list shares"
-shares=$(smbutil view -N "//$PUSER:$PPASS@127.0.0.1:$PORT")
-echo "$shares"
-grep -Eq '^rw +Disk' <<<"$shares"
-grep -Eq '^ro +Disk' <<<"$shares"
-if grep -q '^secret' <<<"$shares"; then echo "secret is listed to $PUSER"; exit 1; fi
+if shares=$(smbutil view -N "//$PUSER:$PPASS@127.0.0.1:$PORT"); then
+	echo "$shares"
+	grep -Eq '^rw +Disk' <<<"$shares"
+	grep -Eq '^ro +Disk' <<<"$shares"
+	if grep -q '^secret' <<<"$shares"; then echo "secret is listed to $PUSER"; exit 1; fi
+else
+	echo "$shares"
+	echo "::warning::smbutil view failed through the proxy"
+fi
 
 mnt() { # mnt NAME //user:password@host:port/share
 	mkdir -p "$WORK/mnt/$1"
