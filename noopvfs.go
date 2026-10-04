@@ -27,6 +27,7 @@ func (v *noopVFS) Close(_ context.Context, _ server.Handle) error { return nil }
 func (v *noopVFS) Read(_ context.Context, _ server.Handle, _ int64, _ []byte) (int, uint32, error) {
 	return 0, smb.StatusAccessDenied, nil
 }
+
 func (v *noopVFS) Write(_ context.Context, _ server.Handle, _ int64, _ []byte) (int, uint32, error) {
 	return 0, smb.StatusAccessDenied, nil
 }
@@ -34,18 +35,23 @@ func (v *noopVFS) Flush(_ context.Context, _ server.Handle) (uint32, error) { re
 func (v *noopVFS) QueryDirectory(_ context.Context, _ server.Handle, _ string, _ bool) ([]server.DirEntry, uint32, error) {
 	return nil, smb.StatusNoMoreFiles, nil
 }
+
 func (v *noopVFS) QueryFileInfo(_ context.Context, _ server.Handle, _ byte) (any, uint32, error) {
 	return nil, smb.StatusNotSupported, nil
 }
+
 func (v *noopVFS) SetFileInfo(_ context.Context, _ server.Handle, _ byte, _ []byte) (uint32, error) {
 	return smb.StatusAccessDenied, nil
 }
+
 func (v *noopVFS) QueryFSInfo(_ context.Context, _ byte) (any, uint32, error) {
 	return nil, smb.StatusNotSupported, nil
 }
+
 func (v *noopVFS) QuerySecurity(_ context.Context, _ server.Handle, _ uint32) ([]byte, uint32, error) {
 	return nil, smb.StatusNotSupported, nil
 }
+
 func (v *noopVFS) Ioctl(_ context.Context, _ server.Handle, _ uint32, _ []byte, _ uint32) ([]byte, uint32, error) {
 	return nil, smb.StatusNotSupported, nil
 }

@@ -128,7 +128,7 @@ func (p *rpcPipe) process(ctx context.Context, pdu []byte) ([]byte, uint32, erro
 	out, status, err := p.inner.Transceive(ctx, pdu)
 	out = fixBindAck(out) // correct the result list for NDR64 / BTFN contexts
 	if verbose {
-		var rtype = -1
+		rtype := -1
 		if len(out) >= 3 {
 			rtype = int(out[2])
 		}
@@ -178,13 +178,13 @@ func (p *rpcPipe) Write(_ context.Context, b []byte) (int, uint32, error) {
 // whenever a pipe Read returns a non-OK status (see smb/server/read.go), so a
 // message-mode partial read via StatusBufferOverflow is not possible here;
 // srvsvc enum responses are small enough to always fit a single client READ.
-func (p *rpcPipe) Read(_ context.Context, max int) ([]byte, uint32, error) {
+func (p *rpcPipe) Read(_ context.Context, maxLen int) ([]byte, uint32, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	out := p.out
 	p.out = nil
 	if verbose {
-		log.Printf("[rpc] Read max=%d -> %d bytes", max, len(out))
+		log.Printf("[rpc] Read max=%d -> %d bytes", maxLen, len(out))
 	}
 	return out, smb.StatusOk, nil
 }

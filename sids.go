@@ -233,8 +233,7 @@ func (n *sidNamer) fromTarget(up *upstream, sids []sid, pending []int, out []sid
 // translated converts a target's name for a SID, or none if it did not name
 // it.
 func translated(res mslsad.SidTranslations, t mslsad.SidNameTranslation) sidName {
-	switch t.Use {
-	case 0, mslsad.SidTypeInvalid, mslsad.SidTypeUnknown:
+	if t.Use == 0 || t.Use == mslsad.SidTypeInvalid || t.Use == mslsad.SidTypeUnknown {
 		return sidName{}
 	}
 	nm := sidName{use: t.Use, name: t.Name}

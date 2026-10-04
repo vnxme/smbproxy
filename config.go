@@ -435,8 +435,10 @@ func resolveShare(s shareSection, targets map[string]*target) (share, error) {
 		return share{}, errors.New("path must name the target's share, optionally followed by an inner folder")
 	}
 	readOnly := s.ReadOnly == nil || *s.ReadOnly // read-only unless explicitly not
-	return share{name: s.Name, comment: s.Comment, target: tg, remoteShare: remote, remoteSub: sub,
-		encrypt: s.Encrypt, readOnly: readOnly}, nil
+	return share{
+		name: s.Name, comment: s.Comment, target: tg, remoteShare: remote, remoteSub: sub,
+		encrypt: s.Encrypt, readOnly: readOnly,
+	}, nil
 }
 
 // resolveShareAccess resolves s's read_access and write_access into sh. Write
@@ -572,7 +574,8 @@ func (c *config) authenticator() *server.MapAuthenticator {
 // writer, read-only otherwise — which Explorer uses to offer or withhold
 // changes.
 func (c *config) treeConnectHook(_ *server.Conn, s *server.Session, shareName string,
-	_ *smb.TreeConnectReq, res *smb.TreeConnectRes) (*server.Status, error) {
+	_ *smb.TreeConnectReq, res *smb.TreeConnectRes,
+) (*server.Status, error) {
 	sh := c.shareNamed(shareName)
 	if sh == nil {
 		return nil, nil // IPC$: left to go-smb

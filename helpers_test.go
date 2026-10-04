@@ -152,10 +152,16 @@ func TestSharedFileAttrs(t *testing.T) {
 	}{
 		{"plain file", smb.SharedFile{}, server.FileAttributeNormal},
 		{"dir", smb.SharedFile{IsDir: true}, server.FileAttributeDirectory},
-		{"hidden readonly file", smb.SharedFile{IsHidden: true, IsReadOnly: true},
-			server.FileAttributeNormal | server.FileAttributeHidden | server.FileAttributeReadonly},
-		{"junction dir", smb.SharedFile{IsDir: true, IsJunction: true},
-			server.FileAttributeDirectory | 0x00000400},
+		{
+			"hidden readonly file",
+			smb.SharedFile{IsHidden: true, IsReadOnly: true},
+			server.FileAttributeNormal | server.FileAttributeHidden | server.FileAttributeReadonly,
+		},
+		{
+			"junction dir",
+			smb.SharedFile{IsDir: true, IsJunction: true},
+			server.FileAttributeDirectory | 0x00000400,
+		},
 	}
 	for _, c := range cases {
 		if got := sharedFileAttrs(c.sf); got != c.want {

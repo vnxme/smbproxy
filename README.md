@@ -203,10 +203,13 @@ shares:
 ## Development
 
 ```sh
-go vet ./...
+golangci-lint run   # lint and format checks, configured in .golangci.yml
 go test ./...
 go test -race ./...
 ```
+
+golangci-lint must be v2.14 or newer, built with Go 1.27 or newer, as the
+official release binaries are; `golangci-lint fmt` applies the formatting.
 
 Besides unit tests, the integration tests run the real proxy in-process
 between go-smb's client and a go-smb server standing in for a target, over

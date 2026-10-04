@@ -14,9 +14,9 @@ import (
 	"github.com/jfjallid/go-smb/smb"
 )
 
-// connDown is a representative dead-connection error, matching the plain errors
+// errConnDown is a representative dead-connection error, matching the plain errors
 // the library returns when the socket is gone.
-var connDown = fmt.Errorf("remote connection has closed")
+var errConnDown = errors.New("remote connection has closed")
 
 // testTarget returns a target for upstreams under test, which dial a fake
 // rather than the target itself.
@@ -109,8 +109,10 @@ func TestUpstreamConnectErrorStatus(t *testing.T) {
 	}{
 		{"unreachable", &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("refused")}, statusBadNetworkPath},
 		{"timed out", fmt.Errorf("no answer: %w", os.ErrDeadlineExceeded), statusBadNetworkPath},
-		{"bad credentials", &smb.NTStatusError{Op: "SessionSetup", Status: smb.StatusLogonFailure,
-			Err: smb.StatusMap[smb.StatusLogonFailure]}, smb.StatusAccessDenied},
+		{"bad credentials", &smb.NTStatusError{
+			Op: "SessionSetup", Status: smb.StatusLogonFailure,
+			Err: smb.StatusMap[smb.StatusLogonFailure],
+		}, smb.StatusAccessDenied},
 	} {
 		u := &upstream{t: testTarget(), dial: func() (upstreamConn, error) { return nil, c.dialErr }}
 		err := u.do(func(upstreamConn) error { return nil })
@@ -262,14 +264,16 @@ func TestIsTransportErr(t *testing.T) {
 		{"nil", nil, false},
 		{"status sentinel", smb.StatusMap[smb.StatusAccessDenied], false},
 		{"wrapped sentinel", fmt.Errorf("op: %w", smb.StatusMap[smb.StatusObjectNameNotFound]), false},
-		{"status error", &smb.NTStatusError{Op: "Read", Status: smb.StatusAccessDenied,
-			Err: smb.StatusMap[smb.StatusAccessDenied]}, false},
+		{"status error", &smb.NTStatusError{
+			Op: "Read", Status: smb.StatusAccessDenied,
+			Err: smb.StatusMap[smb.StatusAccessDenied],
+		}, false},
 		{"unmapped status error", &smb.NTStatusError{Op: "Read", Status: 0xc0000123}, false},
 		{"session deleted", smb.StatusMap[smb.StatusUserSessionDeleted], true},
 		{"session expired (unmapped)", &smb.NTStatusError{Op: "Create", Status: statusNetworkSessionExpired}, true},
 		{"tree disconnected", smb.StatusMap[smb.StatusNetworkNameDeleted], true},
 		{"plain error", errors.New("boom"), true},
-		{"dead connection", connDown, true},
+		{"dead connection", errConnDown, true},
 		{"eof", io.EOF, true},
 		{"timeout", context.DeadlineExceeded, true},
 	}
@@ -349,8 +353,8 @@ func TestUpstreamDoNoRedialOnStatusError(t *testing.T) {
 }
 
 func TestUpstreamDoRedialsAndRetries(t *testing.T) {
-	conn1 := &fakeConn{treeErr: connDown} // dead link
-	conn2 := &fakeConn{}                  // healthy replacement
+	conn1 := &fakeConn{treeErr: errConnDown} // dead link
+	conn2 := &fakeConn{}                     // healthy replacement
 	dialed := 0
 	u := &upstream{
 		t:    testTarget(),
@@ -376,7 +380,7 @@ func TestUpstreamDoRedialsAndRetries(t *testing.T) {
 }
 
 func TestUpstreamDoRedialFailureReturnsOriginalError(t *testing.T) {
-	conn1 := &fakeConn{treeErr: connDown}
+	conn1 := &fakeConn{treeErr: errConnDown}
 	u := &upstream{
 		t:    testTarget(),
 		conn: conn1,
@@ -384,7 +388,7 @@ func TestUpstreamDoRedialFailureReturnsOriginalError(t *testing.T) {
 	}
 
 	err := u.do(func(c upstreamConn) error { return c.TreeConnect("x") })
-	if !errors.Is(err, connDown) {
+	if !errors.Is(err, errConnDown) {
 		t.Errorf("do = %v, want the original transport error when redial fails", err)
 	}
 	if u.conn != upstreamConn(conn1) {

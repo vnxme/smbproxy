@@ -111,8 +111,8 @@ func putFile(t *testing.T, conn *smb.Connection, share, path string, content []b
 func getFile(t *testing.T, conn *smb.Connection, share, path string) ([]byte, error) {
 	t.Helper()
 	var buf bytes.Buffer
-	err := conn.RetrieveFile(share, path, 0, func(b []byte) (int, error) { return buf.Write(b) })
-	if err != nil && err != io.EOF {
+	err := conn.RetrieveFile(share, path, 0, buf.Write)
+	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, err
 	}
 	return buf.Bytes(), nil
@@ -224,7 +224,7 @@ func setInfo(t *testing.T, conn *smb.Connection, share, path string, access uint
 	if err != nil {
 		return err
 	}
-	defer f.CloseFile()
+	defer func() { _ = f.CloseFile() }()
 	return smbFile{File: f, share: share}.SetInfo(class, buf)
 }
 

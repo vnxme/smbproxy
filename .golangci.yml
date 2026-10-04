@@ -1,0 +1,46 @@
+version: "2"
+
+linters:
+  # The default set (errcheck, govet, ineffassign, staticcheck, unused) plus:
+  enable:
+    - durationcheck # multiplying two time.Durations
+    - errname       # sentinel errors named errFoo, error types named FooError
+    - errorlint     # sentinel comparisons that break on wrapped errors
+    - exhaustive    # switches over enums that miss cases
+    - gocritic
+    - gosec
+    - modernize     # newer stdlib idioms
+    - nolintlint    # keeps //nolint directives specific and justified
+    - prealloc
+    - predeclared   # shadowing of builtins like new, max
+    - unconvert
+    - wastedassign
+    - whitespace
+  settings:
+    exhaustive:
+      # A default case counts as handling the remaining enum members.
+      default-signifies-exhaustive: true
+    gocritic:
+      disabled-checks:
+        - exitAfterDefer # log.Fatal in main; the skipped defers don't matter at exit
+    gosec:
+      excludes:
+        - G115 # integer conversions are deliberate in the RPC and SMB wire encoding
+        - G304 # file paths come from the operator (config, command line)
+    staticcheck:
+      checks:
+        # golangci-lint's defaults…
+        - all
+        - -ST1000
+        - -ST1003
+        - -ST1016
+        - -ST1020
+        - -ST1021
+        - -ST1022
+        # …and keep explicit embedded-field selectors (f.File.X), which read
+        # clearer in wrappers.
+        - -QF1008
+
+formatters:
+  enable:
+    - gofumpt

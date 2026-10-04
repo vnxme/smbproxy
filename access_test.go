@@ -118,11 +118,19 @@ func TestReadAccessReservedWarnings(t *testing.T) {
 // shares it may not open, but keeps entries that are not proxied shares.
 func TestVisibleShares(t *testing.T) {
 	cfg, _ := mustParse(t, accessConfig)
-	all := []srvsvc.ShareEntry{{Name: "IPC$"}, {Name: "open"}, {Name: "alice"}, {Name: "finance"},
-		{Name: "guests"}, {Name: "anon"}, {Name: "nobody"}}
+	all := []srvsvc.ShareEntry{
+		{Name: "IPC$"},
+		{Name: "open"},
+		{Name: "alice"},
+		{Name: "finance"},
+		{Name: "guests"},
+		{Name: "anon"},
+		{Name: "nobody"},
+	}
 	listed := func(s *server.Session) string {
-		var names []string
-		for _, e := range cfg.visibleShares(all, principalOf(s)) {
+		visible := cfg.visibleShares(all, principalOf(s))
+		names := make([]string, 0, len(visible))
+		for _, e := range visible {
 			names = append(names, e.Name)
 		}
 		return strings.Join(names, ",")

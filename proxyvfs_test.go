@@ -375,8 +375,10 @@ func TestProxyCreateTargetAccess(t *testing.T) {
 		asked, wants uint32
 	}{
 		{"read attributes", smb.FAccMaskFileReadAttributes, smb.FAccMaskFileReadAttributes | smb.FAccMaskSynchronize},
-		{"security", smb.FAccMaskReadControl | smb.FAccMaskFileReadAttributes,
-			smb.FAccMaskReadControl | smb.FAccMaskFileReadAttributes | smb.FAccMaskSynchronize},
+		{
+			"security", smb.FAccMaskReadControl | smb.FAccMaskFileReadAttributes,
+			smb.FAccMaskReadControl | smb.FAccMaskFileReadAttributes | smb.FAccMaskSynchronize,
+		},
 		{"nothing", 0, smb.FAccMaskFileReadAttributes | smb.FAccMaskSynchronize},
 		{"read data", 0x00120089, defaultAccess},
 		{"generic read", smb.FAccMaskGenericRead, defaultAccess},
@@ -466,7 +468,7 @@ func TestProxyCreateDirFallback(t *testing.T) {
 func TestProxyCreateReconnects(t *testing.T) {
 	ff := &fakeFile{metaVal: fileMeta{endOfFile: 5, attributes: server.FileAttributeNormal}}
 	conn1 := &fakeConn{openFn: func(_, _ string, _ *smb.CreateReqOpts) (upstreamFile, error) {
-		return nil, connDown
+		return nil, errConnDown
 	}}
 	conn2 := &fakeConn{openFn: func(_, _ string, _ *smb.CreateReqOpts) (upstreamFile, error) {
 		return ff, nil
@@ -492,8 +494,10 @@ func TestProxyHandlePinsConnectionAgainstReap(t *testing.T) {
 	conn := &fakeConn{openFn: func(_, _ string, _ *smb.CreateReqOpts) (upstreamFile, error) {
 		return ff, nil
 	}}
-	u := &upstream{t: testTarget(), conn: conn, idle: time.Minute,
-		dial: func() (upstreamConn, error) { return conn, nil }}
+	u := &upstream{
+		t: testTarget(), conn: conn, idle: time.Minute,
+		dial: func() (upstreamConn, error) { return conn, nil },
+	}
 	v := &proxyVFS{up: u, share: "C$"}
 	ctx := context.Background()
 
@@ -522,7 +526,7 @@ func TestProxyHandlePinsConnectionAgainstReap(t *testing.T) {
 }
 
 func TestProxyQueryDirectoryRootReconnects(t *testing.T) {
-	conn1 := &fakeConn{treeErr: connDown}
+	conn1 := &fakeConn{treeErr: errConnDown}
 	conn2 := &fakeConn{listResult: []smb.SharedFile{{Name: "f"}}}
 	u := &upstream{t: testTarget(), conn: conn1, dial: func() (upstreamConn, error) {
 		return conn2, nil
@@ -1051,7 +1055,7 @@ func TestProxyQuerySecurityRoot(t *testing.T) {
 	if gotPath != "Users" || ff.secInfo != dacl || !ff.closed {
 		t.Errorf("opened %q, asked 0x%x, closed %t; want Users, 0x%x, closed", gotPath, ff.secInfo, ff.closed, dacl)
 	}
-	if want := uint32(smb.FAccMaskReadControl | smb.FAccMaskFileReadAttributes | smb.FAccMaskSynchronize); gotOpts.DesiredAccess != want {
+	if want := smb.FAccMaskReadControl | smb.FAccMaskFileReadAttributes | smb.FAccMaskSynchronize; gotOpts.DesiredAccess != want {
 		t.Errorf("opened with access 0x%08x, want 0x%08x", gotOpts.DesiredAccess, want)
 	}
 }

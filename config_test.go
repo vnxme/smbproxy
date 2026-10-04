@@ -270,7 +270,6 @@ func TestServerEncryptionWarnings(t *testing.T) {
 			if len(warnings) != 1 || !strings.Contains(warnings[0], c.want) {
 				t.Errorf("warnings = %v, want one containing %q", warnings, c.want)
 			}
-
 		})
 	}
 	cfg, _ := mustParse(t, encryptedShare)
@@ -334,7 +333,7 @@ func TestConfigLocalLogin(t *testing.T) {
 
 func TestConfigErrors(t *testing.T) {
 	without := func(old string) string { return strings.Replace(minimalConfig, old, "", 1) }
-	replace := func(old, new string) string { return strings.Replace(minimalConfig, old, new, 1) }
+	replace := func(old, repl string) string { return strings.Replace(minimalConfig, old, repl, 1) }
 	cases := []struct {
 		name, yaml, want string // want: a fragment of the error
 	}{
@@ -364,10 +363,14 @@ func TestConfigErrors(t *testing.T) {
 			"server:\n  encryption: required\n", "cannot provide"},
 		{"share encrypt without server encryption", minimalConfig + "    encrypt: true\nserver:\n  encryption: off\n", "encrypt needs"},
 		{"no local login", without("  users:\n    alice:\n      password: pw\n"), "no way for clients to log in"},
-		{"old single-user keys", replace("  users:\n    alice:\n      password: pw\n", "  user: alice\n  password: pw\n"),
-			"field user is not a known setting under local"},
-		{"domain without users", replace("  users:\n    alice:\n      password: pw\n", "  domain: CORP\n  allow_guest: true\n"),
-			"domain is set but no users"},
+		{
+			"old single-user keys", replace("  users:\n    alice:\n      password: pw\n", "  user: alice\n  password: pw\n"),
+			"field user is not a known setting under local",
+		},
+		{
+			"domain without users", replace("  users:\n    alice:\n      password: pw\n", "  domain: CORP\n  allow_guest: true\n"),
+			"domain is set but no users",
+		},
 		{"user without credential", without("      password: pw\n"), "alice: set exactly one of"},
 		{"misspelled user key", replace("      password: pw\n", "      pasword: pw\n"), "field pasword is not a known setting for a user"},
 		{"users differing in case", replace("      password: pw\n", "      password: pw\n    ALICE:\n      password: x\n"), "same user"},

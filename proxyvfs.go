@@ -474,7 +474,7 @@ func getReadBuf(n int) []byte {
 // caller must hold the only reference to it.
 func putReadBuf(b []byte) {
 	if cap(b) == readAheadSize {
-		readBufPool.Put((*[readAheadSize]byte)(b[:readAheadSize]))
+		readBufPool.Put((*[readAheadSize]byte)(b[:cap(b)]))
 	}
 }
 
@@ -677,8 +677,8 @@ func entryRel(dirRel, name string) string {
 	case ".":
 		return dirRel
 	case "..":
-		if i := strings.LastIndexByte(dirRel, '\\'); i >= 0 {
-			return dirRel[:i]
+		if parent, _, ok := strings.CutLast(dirRel, `\`); ok {
+			return parent
 		}
 		return ""
 	}

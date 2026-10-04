@@ -25,8 +25,10 @@ func TestSIDString(t *testing.T) {
 			t.Errorf("parse %s, String = %s", str, got)
 		}
 	}
-	for _, bad := range []string{"", "S-1", "S-2-5-1", "X-1-5-1", "S-1-5-x", "S-1-5-4294967296", "S-1-0x1000000000000-1",
-		"S-1-5-1-2-3-4-5-6-7-8-9-10-11-12-13-14-15-16"} {
+	for _, bad := range []string{
+		"", "S-1", "S-2-5-1", "X-1-5-1", "S-1-5-x", "S-1-5-4294967296", "S-1-0x1000000000000-1",
+		"S-1-5-1-2-3-4-5-6-7-8-9-10-11-12-13-14-15-16",
+	} {
 		if _, err := parseSID(bad); err == nil {
 			t.Errorf("parse %q accepted, want an error", bad)
 		}
@@ -38,7 +40,7 @@ func TestSIDString(t *testing.T) {
 // remaining fields are ignored, so it serves for both opnums.
 func lookupRequest(t *testing.T, sids ...string) []byte {
 	t.Helper()
-	var infos []mslsad.LsaprSidInformation
+	infos := make([]mslsad.LsaprSidInformation, 0, len(sids))
 	for _, s := range sids {
 		v, err := mstypes.ConvertStrToSID(s)
 		if err != nil {
@@ -302,7 +304,7 @@ func TestSIDNamerTargets(t *testing.T) {
 
 	for round := range 2 {
 		got := n.name(ups, sids)
-		var names []string
+		names := make([]string, 0, len(got))
 		for _, g := range got {
 			names = append(names, fullName(g))
 		}
