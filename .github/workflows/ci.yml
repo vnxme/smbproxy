@@ -65,8 +65,14 @@ jobs:
           go-version-file: go.mod
       - name: Cross-compile
         # Named and built as build.ps1 does: smbproxy_<os>_<arch>[.exe],
-        # without build machine paths or debug information.
+        # without build machine paths or debug information. A tag is
+        # stamped in as the version; other builds report a pseudo-version
+        # from git.
         run: |
+          ldflags="-s -w"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            ldflags="$ldflags -X main.version=$GITHUB_REF_NAME"
+          fi
           mkdir dist
           failed=""
           for target in $TARGETS; do
@@ -74,7 +80,7 @@ jobs:
             goos=${target%/*} goarch=${target#*/}
             out=dist/smbproxy_${goos}_${goarch}
             [ "$goos" = windows ] && out=$out.exe
-            if ! GOOS=$goos GOARCH=$goarch go build -trimpath -ldflags "-s -w" -o "$out" .; then
+            if ! GOOS=$goos GOARCH=$goarch go build -trimpath -ldflags "$ldflags" -o "$out" .; then
               failed="$failed $target"
             fi
             echo "::endgroup::"

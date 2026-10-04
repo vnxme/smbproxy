@@ -118,9 +118,10 @@ func reapUpstreams(upstreams map[*target]*upstream, idle time.Duration, stop <-c
 func main() {
 	configPath := flag.String("config", defaultConfigPath,
 		"configuration file (YAML); see smbproxy.example.yaml for every setting")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Usage = func() {
 		_, _ = fmt.Fprintf(flag.CommandLine.Output(),
-			"usage: %s [-config file]\n\nAll settings are in the configuration file.\n\n", os.Args[0])
+			"usage: %s [-config file] [-version]\n\nAll settings are in the configuration file.\n\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -128,6 +129,11 @@ func main() {
 		flag.Usage()
 		os.Exit(2)
 	}
+	if *showVersion {
+		fmt.Println(versionString())
+		return
+	}
+	log.Printf("[*] %s", versionString())
 
 	cfg, warnings, err := loadConfig(*configPath)
 	if err != nil {

@@ -70,7 +70,11 @@ the targets.
 
 ## Installing
 
-smbproxy needs Go 1.27 or later.
+Prebuilt binaries for Linux, macOS and Windows on many architectures are
+attached to each [release](https://github.com/vnxme/smbproxy/releases), with a
+`SHA256SUMS` file to check them against.
+
+To build it yourself, smbproxy needs Go 1.27 or later.
 
 ```sh
 go install github.com/vnxme/smbproxy@latest
@@ -94,6 +98,8 @@ smbproxy -config /etc/smbproxy/smbproxy.yaml
 ```
 
 Without `-config`, smbproxy reads `smbproxy.yaml` in the current directory.
+`smbproxy -version` prints the version and the commit it was built from, which
+smbproxy also logs at startup.
 
 Clients connect to port 445, which needs root on Linux and macOS. Rather than
 running as root, allow the binary to bind it:
