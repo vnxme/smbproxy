@@ -73,9 +73,12 @@ cat >"$conf" <<EOF
    path = $ROOT
    read only = no
    valid users = $TUSER
-   # smbd runs as root here; new files and folders would otherwise be
-   # root's, which the runner's own account then may not change.
-   inherit owner = unix only
+   # The macOS client sets permissions on what it creates, which this
+   # Samba build (without ACL support) maps to mode 000, even without the
+   # proxy. Ignore them and give the owner full access.
+   nt acl support = no
+   force create mode = 0600
+   force directory mode = 0700
 EOF
 printf '%s\n%s\n' "$TPASS" "$TPASS" | sudo "$smbpasswd" -c "$conf" -a -s "$TUSER"
 sudo "$smbd" -D -s "$conf"
@@ -92,7 +95,7 @@ fi
 step "Start smbproxy"
 live config --out "$WORK/live.yaml" --listen "127.0.0.1:$PORT" \
 	--host 127.0.0.1 --port $TPORT --user "$TUSER" --domain WORKGROUP --password "$TPASS" --share data \
-	--proxy-user $PUSER --proxy-password $PPASS --other-user $OUSER --other-password $OPASS --debug
+	--proxy-user $PUSER --proxy-password $PPASS --other-user $OUSER --other-password $OPASS
 ./smbproxy -version
 ./smbproxy -config "$WORK/live.yaml" >"$WORK/proxy.log" 2>&1 &
 echo $! >"$WORK/proxy.pid"
@@ -114,13 +117,14 @@ mnt() { # mnt NAME //user:password@host:port/share
 	mount_smbfs -N "$2" "$WORK/mnt/$1"
 }
 
-# Diagnostic while macOS is informational: the mode a folder gets when
-# the macOS client creates it on Samba without the proxy.
-step "mount_smbfs: create a folder on the target directly"
+# Checks the setup rather than the proxy: what the macOS client creates
+# on Samba directly must be usable, or every test below fails for that.
+step "mount_smbfs: create on the target directly"
 mnt direct "//$TUSER:$TPASS@127.0.0.1:$TPORT/data"
 mkdir "$WORK/mnt/direct/rw/direct-probe"
-ls -ld "$ROOT/rw/direct-probe"
-rmdir "$WORK/mnt/direct/rw/direct-probe" || true
+echo probe >"$WORK/mnt/direct/rw/direct-probe/probe.txt"
+ls -ld "$ROOT/rw/direct-probe" "$ROOT/rw/direct-probe/probe.txt"
+rm -r "$WORK/mnt/direct/rw/direct-probe"
 umount "$WORK/mnt/direct"
 
 step "mount_smbfs: a wrong password is refused"
