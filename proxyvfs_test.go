@@ -703,11 +703,11 @@ func TestProxyReadPrefetchData(t *testing.T) {
 	drainPrefetch(ph)
 }
 
-// After a seek away from the queued read-ahead, the stale prefetch is replaced
-// by one following the new position, so sequential reads from there are
-// prefetched again rather than all falling through to synchronous fetches.
+// After a seek, the region following the new position is read ahead, so
+// sequential reads from there are served from the cache rather than all
+// falling through to synchronous fetches.
 func TestProxyReadPrefetchFollowsSeek(t *testing.T) {
-	data := make([]byte, 3*readAheadSize)
+	data := make([]byte, 4*readAheadSize)
 	for i := range data {
 		data[i] = byte(i)
 	}
@@ -717,27 +717,154 @@ func TestProxyReadPrefetchFollowsSeek(t *testing.T) {
 	ctx := context.Background()
 	buf := make([]byte, 4096)
 
-	// Sequential start: the cache holds [0, R) and a prefetch is queued at R.
+	// Sequential start: region 0 is read and region 1 read ahead.
 	if _, status, _ := v.Read(ctx, ph, 0, buf); status != smb.StatusOk {
 		t.Fatalf("first read status 0x%08x", status)
 	}
 	drainPrefetch(ph)
 
-	// Seek past both the cache and the queued prefetch, far enough from the
-	// end that the next read-ahead still starts inside the file.
-	seek := int64(readAheadSize + readAheadSize/2)
+	// Seek past both, far enough from the end that the next read-ahead
+	// still starts inside the file: region 2 is read and region 3 ahead.
+	seek := int64(2*readAheadSize + readAheadSize/2)
 	n, status, _ := v.Read(ctx, ph, seek, buf)
 	if status != smb.StatusOk || n != len(buf) || !bytes.Equal(buf, data[seek:seek+int64(n)]) {
 		t.Fatalf("seek read = (%d, 0x%08x), want (%d, Ok) with matching bytes", n, status, len(buf))
 	}
 	drainPrefetch(ph)
 
-	ph.prefMu.Lock()
-	p := ph.pref
-	ph.prefMu.Unlock()
-	if want := seek + readAheadSize; p == nil || p.off != want {
-		t.Fatalf("queued prefetch = %+v, want one at offset %d", p, want)
+	before := ff.readCount()
+	next := int64(3 * readAheadSize)
+	n, status, _ = v.Read(ctx, ph, next, buf)
+	if status != smb.StatusOk || n != len(buf) || !bytes.Equal(buf, data[next:next+int64(n)]) {
+		t.Fatalf("read after the seek = (%d, 0x%08x), want (%d, Ok) with matching bytes", n, status, len(buf))
 	}
+	if r := ff.readCount() - before; r != 0 {
+		t.Errorf("read after the seek called upstream ReadFile %d times, want 0: not read ahead", r)
+	}
+}
+
+// Reads that arrive out of order around a region boundary, as a client with
+// several reads in flight sends them, are served from the cache: the previous
+// region is kept, and a read in the middle of a region takes the read-ahead
+// queued for it. Each region is read from the target once.
+func TestProxyReadOutOfOrder(t *testing.T) {
+	data := make([]byte, 3*readAheadSize)
+	for i := range data {
+		data[i] = byte(i / 7)
+	}
+	ff := &fakeFile{data: data}
+	v := newVFS(&fakeConn{})
+	ph := fileHandle(ff)
+	ctx := context.Background()
+	buf := make([]byte, 1<<20)
+
+	read := func(off int64) {
+		t.Helper()
+		n, status, _ := v.Read(ctx, ph, off, buf)
+		if status != smb.StatusOk || n != len(buf) || !bytes.Equal(buf, data[off:off+int64(n)]) {
+			t.Fatalf("read at %d = (%d, 0x%08x), want (%d, Ok) with matching bytes", off, n, status, len(buf))
+		}
+		drainPrefetch(ph)
+	}
+	r := int64(readAheadSize)
+	read(0)                     // region 0 from the target, region 1 read ahead
+	read(r + r/4)               // the middle of region 1, from its read-ahead
+	read(r - int64(len(buf)))   // the end of region 0, still cached
+	read(r - int64(len(buf))/2) // spans regions 0 and 1
+	read(2*r + r/2)             // region 2, read ahead when region 1 was loaded
+	read(r + r/2)               // back in region 1, still cached
+	if got := ff.readCount(); got != 3 {
+		t.Errorf("upstream ReadFile called %d times, want 3, once per region", got)
+	}
+}
+
+// A client whose reads run a region ahead of the read-ahead does not cost the
+// region being read ahead: it is cached for the reads still to come rather
+// than discarded and read again.
+func TestProxyReadRunsAhead(t *testing.T) {
+	data := make([]byte, 4*readAheadSize)
+	for i := range data {
+		data[i] = byte(i / 7)
+	}
+	ff := &fakeFile{data: data}
+	v := newVFS(&fakeConn{})
+	ph := fileHandle(ff)
+	ctx := context.Background()
+	buf := make([]byte, 1<<20)
+
+	r := int64(readAheadSize)
+	for _, off := range []int64{0, 2*r + r/2, r + r/2, 3 * r} {
+		n, status, _ := v.Read(ctx, ph, off, buf)
+		if status != smb.StatusOk || n != len(buf) || !bytes.Equal(buf, data[off:off+int64(n)]) {
+			t.Fatalf("read at %d = (%d, 0x%08x), want (%d, Ok) with matching bytes", off, n, status, len(buf))
+		}
+		drainPrefetch(ph)
+	}
+	if got := ff.readCount(); got != 4 {
+		t.Errorf("upstream ReadFile called %d times, want 4, once per region", got)
+	}
+}
+
+// The macOS client reads a file as two streams through neighbouring 32 MiB
+// segments, alternating between them. Both streams read ahead without
+// displacing each other, and each region is read from the target once.
+func TestProxyReadTwoStreams(t *testing.T) {
+	const segment = 4 * readAheadSize
+	data := make([]byte, 4*segment)
+	for i := range data {
+		data[i] = byte(i / 7)
+	}
+	ff := &fakeFile{data: data}
+	v := newVFS(&fakeConn{})
+	ph := fileHandle(ff)
+	ctx := context.Background()
+	buf := make([]byte, 512<<10)
+
+	for s := int64(0); s < int64(len(data)); s += 2 * segment {
+		for o := int64(0); o < segment; o += int64(len(buf)) {
+			for _, off := range []int64{s + o, s + segment + o} {
+				n, status, _ := v.Read(ctx, ph, off, buf)
+				if status != smb.StatusOk || n != len(buf) || !bytes.Equal(buf, data[off:off+int64(n)]) {
+					t.Fatalf("read at %d = (%d, 0x%08x), want (%d, Ok) with matching bytes", off, n, status, len(buf))
+				}
+			}
+		}
+	}
+	drainPrefetch(ph)
+	if got, want := ff.readCount(), len(data)/readAheadSize; got != want {
+		t.Errorf("upstream ReadFile called %d times, want %d, once per region", got, want)
+	}
+}
+
+// Reads of one handle from several goroutines at once, as a server serving
+// requests concurrently would make, each get the right bytes while
+// read-aheads fill and evict the cache under them.
+func TestProxyReadConcurrent(t *testing.T) {
+	data := make([]byte, (cacheRegions+2)*readAheadSize)
+	for i := range data {
+		data[i] = byte(i / 7)
+	}
+	ff := &fakeFile{data: data}
+	v := newVFS(&fakeConn{})
+	ph := fileHandle(ff)
+	ctx := context.Background()
+
+	var wg sync.WaitGroup
+	for g := range 4 {
+		wg.Go(func() {
+			buf := make([]byte, 300<<10)
+			for i := range 64 {
+				off := int64((g*7919 + i*5000011) % (len(data) - len(buf)))
+				n, status, _ := v.Read(ctx, ph, off, buf)
+				if status != smb.StatusOk || n != len(buf) || !bytes.Equal(buf, data[off:off+int64(n)]) {
+					t.Errorf("read at %d = (%d, 0x%08x), want (%d, Ok) with matching bytes", off, n, status, len(buf))
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+	drainPrefetch(ph)
 }
 
 // A target that stops answering fails a read or listing with STATUS_IO_TIMEOUT
@@ -776,11 +903,11 @@ func TestProxyReadClampsToFileSize(t *testing.T) {
 	if status != smb.StatusOk || n != len(data) || !bytes.Equal(buf[:n], data) {
 		t.Fatalf("read = (%d, 0x%08x, %q), want (10, Ok, %q)", n, status, buf[:n], data)
 	}
-	if c := cap(ph.cacheData); c != len(data) {
+	if c := cap(ph.cache[0].data); c != len(data) {
 		t.Errorf("cache buffer cap = %d, want %d", c, len(data))
 	}
-	if ph.pref != nil {
-		t.Errorf("prefetch queued at %d, want none past the end of file", ph.pref.off)
+	if len(ph.cache) != 1 {
+		t.Errorf("%d regions cached, want 1: nothing read ahead past the end of file", len(ph.cache))
 	}
 	if r := ff.readCount(); r != 1 {
 		t.Errorf("upstream ReadFile called %d times, want 1", r)
@@ -800,7 +927,7 @@ func TestProxyReadPastOpenTimeSize(t *testing.T) {
 	if status != smb.StatusOk || n != 6 || !bytes.Equal(buf[:n], data[10:]) {
 		t.Fatalf("read = (%d, 0x%08x, %q), want (6, Ok, %q)", n, status, buf[:n], data[10:])
 	}
-	if c := cap(ph.cacheData); c != probeSize {
+	if c := cap(ph.cache[0].data); c != probeSize {
 		t.Errorf("cache buffer cap = %d, want probeSize %d", c, probeSize)
 	}
 }
@@ -1018,9 +1145,9 @@ func TestProxyClose(t *testing.T) {
 	ff.mu.Lock()
 	closed := ff.closed
 	ff.mu.Unlock()
-	if !closed || ph.file != nil || ph.cacheData != nil || ph.pref != nil {
+	if !closed || ph.file != nil || len(ph.cache) != 0 || len(ph.inflight) != 0 {
 		t.Errorf("after Close: fileClosed=%v file=%v cache=%v pref=%v, want closed and all cleared",
-			closed, ph.file, ph.cacheData, ph.pref)
+			closed, ph.file, ph.cache, ph.inflight)
 	}
 }
 

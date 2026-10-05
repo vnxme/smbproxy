@@ -37,13 +37,14 @@ type proxyHandle struct {
 
 	fileMu sync.RWMutex
 
-	cacheMu   sync.Mutex
-	cacheOff  int64
-	cacheData []byte
-
-	prefMu sync.Mutex
-	pref   *prefetch      // the current read-ahead; nil when none is queued
-	prefWG sync.WaitGroup // every prefetch goroutine, including discarded ones
+	// Read-ahead state; see Read. cacheMu guards all but prefWG.
+	cacheMu  sync.Mutex
+	cache    []cachedRegion       // most recently loaded first, cacheRegions at most
+	inflight map[int64]*prefetch  // read-aheads still running, by offset
+	gen      uint64               // bumped when cached data goes stale
+	loaded   [recentRegions]int64 // offsets of the regions loaded last, +1
+	nloaded  int                  // regions loaded so far, indexing loaded
+	prefWG   sync.WaitGroup       // every read-ahead goroutine
 
 	mu          sync.Mutex
 	entries     []server.DirEntry
@@ -52,14 +53,36 @@ type proxyHandle struct {
 	lastPattern string
 }
 
-// prefetch is one background read-ahead of up to readAheadSize bytes at off.
-// Its goroutine sets data and err before closing done, so they are safe to
-// read once done is closed. Each prefetch owns its result, so a stale one can
-// be discarded while still running without clobbering its replacement.
+// cacheRegions is how many regions read from the target a handle keeps.
+// Clients keep many reads in flight, and the macOS client reads a file as
+// several streams some 32 MiB apart; the server handles them one at a time,
+// in the order they arrive. Keeping that much of the file serves each region
+// to every stream from one read of the target.
+const cacheRegions = 6
+
+// maxReadAheads is how many read-aheads a handle runs at once. Each stream
+// of a client's reads queues its own.
+const maxReadAheads = 2
+
+// recentRegions is how many of the regions it loaded last a handle
+// remembers, so as not to read one of them ahead again once evicted: with
+// the client's streams reading neighbouring segments, the region after the
+// end of one stream's segment is the start of the other's, consumed already.
+const recentRegions = 16
+
+// cachedRegion is data read from the target at off.
+type cachedRegion struct {
+	off  int64
+	data []byte
+}
+
+func (r cachedRegion) end() int64 { return r.off + int64(len(r.data)) }
+
+// prefetch is one background read-ahead of the region at off. Its goroutine
+// caches the region, or sets err, before closing done.
 type prefetch struct {
 	off  int64
 	done chan struct{}
-	data []byte
 	err  error
 }
 
@@ -292,16 +315,12 @@ func (v *proxyVFS) Close(_ context.Context, h server.Handle) (err error) {
 	ph.file = nil
 	ph.fileMu.Unlock()
 
-	// No Read can still be using the cache: each holds fileMu.RLock throughout,
-	// and from here on sees the nil file and returns before reaching it.
-	ph.setCache(0, nil)
-
-	ph.prefMu.Lock()
-	ph.pref = nil
-	ph.prefMu.Unlock()
-	// Wait out every read-ahead, including discarded ones still running, so
-	// none touches the upstream file after it is closed below.
+	// Wait out every read-ahead, so none touches the upstream file after it
+	// is closed below, then drop what they cached. No Read can still be
+	// using the cache: each holds fileMu.RLock throughout, and from here on
+	// sees the nil file and returns before reaching it.
 	ph.prefWG.Wait()
+	ph.clearCache()
 
 	if file != nil {
 		func() {
@@ -336,75 +355,144 @@ func (v *proxyVFS) Read(_ context.Context, h server.Handle, offset int64, buf []
 		return 0, smb.StatusFileClosed, nil
 	}
 
-	need := len(buf)
-
-	// ---- tier 1: cache hit ----
-	ph.cacheMu.Lock()
-	if ph.cacheData != nil {
-		cacheOff := ph.cacheOff
-		cacheLen := int64(len(ph.cacheData))
-		cacheEnd := cacheOff + cacheLen
-		if offset >= cacheOff && offset < cacheEnd {
-			start := int(offset - cacheOff)
-			avail := len(ph.cacheData) - start
-			serve := min(avail, need)
-			copy(buf[:serve], ph.cacheData[start:start+serve])
-			triggerAt := cacheOff + cacheLen/2
-			nextOff := cacheEnd
-			ph.cacheMu.Unlock()
-			if offset+int64(serve) >= triggerAt {
-				v.startPrefetch(ph, nextOff)
+	// Serve from the cache, or else from the target, region by region,
+	// until buf is full or the file ends. Regions are readAheadSize long and
+	// aligned, so reads anywhere in one find it cached or being read ahead.
+	n = 0
+	for n < len(buf) {
+		pos := offset + int64(n)
+		if n > 0 && pos >= ph.size() {
+			break // probe past the end only for a read that starts there
+		}
+		served, sp, ok := ph.copyCached(pos, buf[n:])
+		if !ok {
+			var st uint32
+			if served, sp, st = v.load(ph, pos, buf[n:]); st != smb.StatusOk {
+				if n > 0 {
+					break // return what was read; the client asks again
+				}
+				return 0, st, nil
 			}
-			if serve == 0 {
-				return 0, smb.StatusEndOfFile, nil
-			}
-			return serve, smb.StatusOk, nil
+		}
+		if served == 0 {
+			break // end of file
+		}
+		n += served
+		// Read the next region ahead once half of this one is consumed.
+		if pos+int64(served) >= sp.off+(sp.end-sp.off)/2 {
+			v.startPrefetch(ph, sp.end)
 		}
 	}
-	ph.cacheMu.Unlock()
-
-	// ---- tier 2: prefetch hit ----
-	ph.prefMu.Lock()
-	if p := ph.pref; p != nil && p.off == offset {
-		ph.pref = nil
-		ph.prefMu.Unlock()
-		<-p.done
-		if p.err != nil {
-			return 0, errToStatus(p.err), nil
-		}
-		if len(p.data) == 0 {
-			return 0, smb.StatusEndOfFile, nil
-		}
-		serve := copy(buf[:min(len(p.data), need)], p.data)
-		ph.setCache(offset, p.data)
-		v.startPrefetch(ph, offset+int64(len(p.data)))
-		return serve, smb.StatusOk, nil
-	}
-	ph.prefMu.Unlock()
-
-	// ---- tier 3: synchronous fetch ----
-	data, fErr := v.fetch(ph.file, offset, ph.size())
-	if fErr != nil {
-		return 0, errToStatus(fErr), nil
-	}
-	if len(data) == 0 {
+	if n == 0 {
 		return 0, smb.StatusEndOfFile, nil
 	}
-	serve := copy(buf[:min(len(data), need)], data)
-	ph.setCache(offset, data)
-	v.startPrefetch(ph, offset+int64(len(data)))
-	return serve, smb.StatusOk, nil
+	return n, smb.StatusOk, nil
 }
 
-// setCache makes data, read from the target at off, the handle's cached
-// region and recycles the buffer it replaces. Readers copy out of the cache
-// under cacheMu, so once swapped out the old buffer has no other user.
-func (h *proxyHandle) setCache(off int64, data []byte) {
+// span is the extent of a region read from the target.
+type span struct{ off, end int64 }
+
+// copyCached copies into dst from the cached region holding pos, if any, and
+// returns how much it copied and that region's extent. It copies under
+// cacheMu: a region's buffer is recycled once evicted, which happens under
+// cacheMu too.
+func (h *proxyHandle) copyCached(pos int64, dst []byte) (int, span, bool) {
 	h.cacheMu.Lock()
-	old := h.cacheData
-	h.cacheOff, h.cacheData = off, data
+	defer h.cacheMu.Unlock()
+	for _, r := range h.cache {
+		if pos >= r.off && pos < r.end() {
+			return copy(dst, r.data[pos-r.off:]), span{r.off, r.end()}, true
+		}
+	}
+	return 0, span{}, false
+}
+
+// load reads the region holding pos, waiting for its read-ahead if one is
+// running and reading it from the target otherwise, copies into dst from pos
+// and caches the region. It also starts reading the next region ahead.
+func (v *proxyVFS) load(ph *proxyHandle, pos int64, dst []byte) (int, span, uint32) {
+	size := ph.size()
+	// Past the end of the file as it was when opened, probe at pos instead.
+	off := pos
+	if pos < size {
+		off = pos - pos%readAheadSize
+	}
+
+	ph.cacheMu.Lock()
+	p := ph.inflight[off]
+	ph.cacheMu.Unlock()
+	if p != nil {
+		<-p.done
+		if p.err != nil {
+			return 0, span{}, errToStatus(p.err)
+		}
+		if n, sp, ok := ph.copyCached(pos, dst); ok {
+			return n, sp, smb.StatusOk
+		}
+		// Evicted already, or empty at the end of the file: read it again.
+	}
+
+	ph.cacheMu.Lock()
+	gen := ph.gen
+	ph.cacheMu.Unlock()
+	data, err := v.fetch(ph.file, off, size)
+	if err != nil {
+		return 0, span{}, errToStatus(err)
+	}
+	r := cachedRegion{off: off, data: data}
+	n := 0
+	if pos < r.end() {
+		n = copy(dst, data[pos-off:])
+	}
+	ph.addCache(r, gen)
+	v.startPrefetch(ph, r.end())
+	return n, span{r.off, r.end()}, smb.StatusOk
+}
+
+// addCache makes r the most recently loaded region, unless the cache was
+// discarded since gen, replacing any region at the same offset and evicting
+// the least recently loaded one when full. An empty r is not cached.
+func (h *proxyHandle) addCache(r cachedRegion, gen uint64) {
+	h.cacheMu.Lock()
+	if len(r.data) == 0 || h.gen != gen {
+		h.cacheMu.Unlock()
+		putReadBuf(r.data)
+		return
+	}
+	var old []byte
+	i := 0
+	for i < len(h.cache) && h.cache[i].off != r.off {
+		i++
+	}
+	switch {
+	case i < len(h.cache):
+		old = h.cache[i].data
+	case len(h.cache) < cacheRegions:
+		h.cache = append(h.cache, cachedRegion{})
+	default:
+		i = len(h.cache) - 1
+		old = h.cache[i].data
+	}
+	copy(h.cache[1:i+1], h.cache[:i])
+	h.cache[0] = r
+	h.loaded[h.nloaded%recentRegions] = r.off + 1
+	h.nloaded++
 	h.cacheMu.Unlock()
 	putReadBuf(old)
+}
+
+// clearCache drops every cached region and recycles their buffers. A
+// read-ahead still running when it is called caches nothing.
+func (h *proxyHandle) clearCache() {
+	h.cacheMu.Lock()
+	old := h.cache
+	h.cache = nil
+	h.loaded = [recentRegions]int64{}
+	h.gen++
+	h.cacheMu.Unlock()
+	for _, r := range old {
+		putReadBuf(r.data)
+	}
 }
 
 // probeSize is how much fetch asks for at or past the end of file as seen
@@ -478,13 +566,12 @@ func putReadBuf(b []byte) {
 	}
 }
 
-// startPrefetch queues a background read-ahead at off. A read-ahead already
-// queued for off is kept; one for any other offset is stale (the client has
-// moved elsewhere in the file) and is replaced, so a seek does not leave
-// read-ahead stuck on a region that will never be read. Nothing is queued at
-// or past the end of the file as it was when opened: that read would almost
-// always come back empty, and a client reading on past it (into a file that
-// has since grown) is served by a synchronous fetch instead.
+// startPrefetch starts reading the region at off ahead, unless it is
+// cached or being read ahead already, maxReadAheads are running, or off is
+// at or past the end of the file as it was when opened: that read would
+// almost always come back empty, and a client reading on past it (into a
+// file that has since grown) is served by a synchronous fetch instead. The
+// read-ahead caches the region when done.
 //
 // The caller must hold ph.fileMu.RLock with ph.file non-nil. The goroutine is
 // handed the file rather than taking fileMu itself: a pending Close's Lock
@@ -495,22 +582,34 @@ func (v *proxyVFS) startPrefetch(ph *proxyHandle, off int64) {
 	if off >= size {
 		return
 	}
-	ph.prefMu.Lock()
-	if ph.pref != nil && ph.pref.off == off {
-		ph.prefMu.Unlock()
+	ph.cacheMu.Lock()
+	defer ph.cacheMu.Unlock()
+	if ph.inflight[off] != nil || len(ph.inflight) >= maxReadAheads {
 		return
 	}
+	for _, l := range ph.loaded {
+		if l == off+1 {
+			return // cached, or loaded and consumed already
+		}
+	}
 	p := &prefetch{off: off, done: make(chan struct{})}
-	ph.pref = p
+	if ph.inflight == nil {
+		ph.inflight = make(map[int64]*prefetch)
+	}
+	ph.inflight[off] = p
+	gen := ph.gen
 	file := ph.file
-	ph.prefWG.Add(1)
-	ph.prefMu.Unlock()
-
-	go func() {
-		defer ph.prefWG.Done()
-		defer close(p.done)
-		p.data, p.err = v.fetch(file, off, size)
-	}()
+	ph.prefWG.Go(func() {
+		data, err := v.fetch(file, off, size)
+		if err == nil {
+			ph.addCache(cachedRegion{off: off, data: data}, gen)
+		}
+		ph.cacheMu.Lock()
+		delete(ph.inflight, off)
+		ph.cacheMu.Unlock()
+		p.err = err
+		close(p.done)
+	})
 }
 
 func (v *proxyVFS) QueryDirectory(_ context.Context, h server.Handle, pattern string, restart bool) (entries []server.DirEntry, status uint32, err error) {
