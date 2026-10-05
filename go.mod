@@ -17,3 +17,5 @@ require (
 	golang.org/x/net v0.59.0 // indirect
 	software.sslmate.com/src/go-pkcs12 v0.7.3 // indirect
 )
+
+replace github.com/jfjallid/go-smb => github.com/vnxme/go-smb v0.0.0-20261004190900-9a00f212d5a6

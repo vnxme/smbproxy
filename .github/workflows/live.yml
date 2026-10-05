@@ -1,0 +1,75 @@
+name: Live
+
+# smbproxy between each OS's own SMB client and a real SMB server, on one
+# GitHub-hosted machine: file-system tests through the proxy, checked on
+# the target, and speeds compared with a direct connection. The scripts in
+# .github/live/ explain each setup. CI calls this on tags, before a release.
+
+on:
+  pull_request:
+    paths: &paths
+      - "**.go"
+      - go.mod
+      - go.sum
+      - .github/live/**
+      - .github/workflows/live.yml
+  push:
+    branches: [main]
+    paths: *paths
+  workflow_dispatch:
+    inputs:
+      speed_mib:
+        description: Size of the speed test file, in MiB
+        default: "512"
+      speed_runs:
+        description: Speed test runs
+        default: "3"
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  LIVE_SPEED_MIB: ${{ inputs.speed_mib || '512' }}
+  LIVE_SPEED_RUNS: ${{ inputs.speed_runs || '3' }}
+  PYTHONUTF8: "1"
+
+jobs:
+  live:
+    name: Live (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            runner: ubuntu-latest
+            script: bash .github/live/linux.sh
+          - os: windows
+            runner: windows-latest
+            script: pwsh -File .github/live/windows.ps1
+          - os: macos
+            runner: macos-latest
+            script: bash .github/live/macos.sh
+            # Informational until the macOS client is known to work with
+            # the proxy.
+            experimental: true
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ matrix.experimental || false }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: go build -o smbproxy${{ matrix.os == 'windows' && '.exe' || '' }} .
+      - name: Live test
+        run: ${{ matrix.script }}
+      - name: Proxy log
+        if: failure()
+        shell: bash
+        run: |
+          for f in proxy.log samba.log; do
+            [ -f "$f" ] && { echo "::group::$f"; head -n 250 "$f"; echo "[...]"; tail -n 250 "$f"; echo "::endgroup::"; }
+          done
+          true
