@@ -277,11 +277,8 @@ func (ph *proxyHandle) applySetInfo(class byte, raw []byte, newPath string) {
 }
 
 // discardReadAhead drops the handle's cached and prefetched data, which a
-// change to the file through the handle may have made stale. A prefetch
-// still running completes into a discarded result.
+// change to the file through the handle may have made stale. A read-ahead
+// still running caches nothing.
 func (ph *proxyHandle) discardReadAhead() {
-	ph.setCache(0, nil)
-	ph.prefMu.Lock()
-	ph.pref = nil
-	ph.prefMu.Unlock()
+	ph.clearCache()
 }
