@@ -46,6 +46,8 @@ type proxyHandle struct {
 	nloaded  int                  // regions loaded so far, indexing loaded
 	prefWG   sync.WaitGroup       // every read-ahead goroutine
 
+	wb writeBehind // writes not yet on the target; see bufferWrite
+
 	mu          sync.Mutex
 	entries     []server.DirEntry
 	pos         int
@@ -245,6 +247,7 @@ func (v *proxyVFS) Create(_ context.Context, sess *server.Session, req server.Cr
 			result, status = server.CreateResult{}, smb.StatusObjectNameNotFound
 		}
 	}()
+	v.syncWrites(req.Path)
 
 	rel := remotePath(req.Path)
 	if rel == "" {
@@ -312,6 +315,11 @@ func (v *proxyVFS) Close(_ context.Context, h server.Handle) (err error) {
 
 	ph.fileMu.Lock()
 	file := ph.file
+	if file != nil {
+		if err := v.flushWrites(ph); err != nil {
+			log.Printf("[proxy] Close %q: a write behind failed: %v", ph.Path(), err)
+		}
+	}
 	ph.file = nil
 	ph.fileMu.Unlock()
 
@@ -336,6 +344,7 @@ func (v *proxyVFS) Close(_ context.Context, h server.Handle) (err error) {
 }
 
 func (v *proxyVFS) Read(_ context.Context, h server.Handle, offset int64, buf []byte) (n int, status uint32, err error) {
+	v.syncWrites(h.Path())
 	ph := h.(*proxyHandle)
 
 	ph.fileMu.RLock()
@@ -619,6 +628,7 @@ func (v *proxyVFS) QueryDirectory(_ context.Context, h server.Handle, pattern st
 			entries, status = nil, smb.StatusObjectNameNotFound
 		}
 	}()
+	v.syncWrites("")
 
 	ph := h.(*proxyHandle)
 	ph.mu.Lock()
@@ -1027,6 +1037,7 @@ func (v *proxyVFS) QuerySecurity(_ context.Context, h server.Handle, additionalI
 			buf, status, err = nil, smb.StatusNotSupported, nil
 		}
 	}()
+	v.syncWrites(h.Path())
 
 	ph := h.(*proxyHandle)
 	if ph.isRoot {

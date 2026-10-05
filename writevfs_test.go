@@ -92,23 +92,30 @@ func TestProxyWrite(t *testing.T) {
 	if err != nil || status != smb.StatusOk || n != 6 {
 		t.Fatalf("Write = (%d, 0x%08x, %v), want (6, Ok)", n, status, err)
 	}
-	if !bytes.Equal(ff.data, []byte("01234567ABCDEF")) {
-		t.Errorf("target data %q, want 01234567ABCDEF", ff.data)
-	}
 	if fi, _ := ph.Stat(); fi.Size != 14 {
 		t.Errorf("handle size %d after extending write, want 14", fi.Size)
 	}
+	// The read writes the pending data to the target first.
 	buf := make([]byte, 14)
-	if n, _, _ := v.Read(ctx, ph, 0, buf); n != 14 || !bytes.Equal(buf, ff.data) {
-		t.Errorf("read after write = %q, want %q (stale read-ahead?)", buf[:n], ff.data)
+	if n, _, _ := v.Read(ctx, ph, 0, buf); n != 14 || !bytes.Equal(buf, []byte("01234567ABCDEF")) {
+		t.Errorf("read after write = %q, want 01234567ABCDEF (stale read-ahead?)", buf[:n])
 	}
 	drainPrefetch(ph)
+	if !bytes.Equal(ff.data, []byte("01234567ABCDEF")) {
+		t.Errorf("target data %q, want 01234567ABCDEF", ff.data)
+	}
 
+	// A write the target refuses is acknowledged, then reported once, by
+	// the next flush.
 	const statusDiskFull = 0xc000007f // not named in go-smb; passed through exactly
 	ff.writeErr = &smb.NTStatusError{Op: "Write", Status: statusDiskFull}
-	if _, status, _ := v.Write(ctx, ph, 0, []byte("x")); status != statusDiskFull {
-		t.Errorf("failing write -> 0x%08x, want the target's STATUS_DISK_FULL", status)
+	if _, status, _ := v.Write(ctx, ph, 0, []byte("x")); status != smb.StatusOk {
+		t.Errorf("write behind -> 0x%08x, want Ok", status)
 	}
+	if status, _ := v.Flush(ctx, ph); status != statusDiskFull {
+		t.Errorf("Flush after a failing write -> 0x%08x, want the target's STATUS_DISK_FULL", status)
+	}
+	ff.writeErr = nil
 	if _, status, _ := v.Write(ctx, &proxyHandle{path: `x`}, 0, []byte("x")); status != smb.StatusFileClosed {
 		t.Errorf("write to a closed handle -> 0x%08x, want STATUS_FILE_CLOSED", status)
 	}

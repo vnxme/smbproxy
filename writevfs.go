@@ -98,11 +98,7 @@ func (v *proxyVFS) Write(_ context.Context, h server.Handle, offset int64, data 
 		return 0, smb.StatusFileClosed, nil
 	}
 
-	v.up.mu.Lock()
-	ctx, cancel := v.up.ioContext()
-	n, err = ph.file.WriteFile(ctx, data, uint64(offset))
-	cancel()
-	v.up.mu.Unlock()
+	n, err = v.bufferWrite(ph, offset, data)
 
 	// Whatever was written, the handle's read-ahead may now be stale.
 	ph.discardReadAhead()
@@ -129,6 +125,9 @@ func (v *proxyVFS) Flush(_ context.Context, h server.Handle) (uint32, error) {
 	if ph.file == nil || ph.isDir {
 		return smb.StatusOk, nil // nothing buffered to flush
 	}
+	if err := v.flushWrites(ph); err != nil {
+		return errToStatus(err), nil
+	}
 	v.up.mu.Lock()
 	ctx, cancel := v.up.ioContext()
 	err := ph.file.Flush(ctx)
@@ -152,6 +151,7 @@ func (v *proxyVFS) SetFileInfo(_ context.Context, h server.Handle, class byte, r
 			status, err = statusUnexpectedNetworkError, nil
 		}
 	}()
+	v.syncWrites("")
 	ph := h.(*proxyHandle)
 	ph.fileMu.RLock()
 	defer ph.fileMu.RUnlock()
