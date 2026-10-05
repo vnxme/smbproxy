@@ -552,19 +552,22 @@ func (v *proxyVFS) QueryDirectory(_ context.Context, h server.Handle, pattern st
 			}()
 		}
 
-		if err != nil {
-			if errors.Is(err, smb.StatusMap[smb.StatusNoMoreFiles]) {
-				ph.listed, ph.lastPattern, ph.entries, ph.pos = true, pattern, nil, 0
-				return nil, smb.StatusNoMoreFiles, nil
-			}
+		if err != nil && !errors.Is(err, smb.StatusMap[smb.StatusNoMoreFiles]) {
 			return nil, errToStatus(err), nil
 		}
 
 		dirRel := remotePath(ph.Path())
-		converted := make([]server.DirEntry, len(raw))
-		for i, sf := range raw {
-			converted[i] = sharedFileToDirEntry(sf)
-			converted[i].FileID = v.fileID(entryRel(dirRel, sf.Name))
+		converted := make([]server.DirEntry, 0, len(raw)+2)
+		if pattern == "*" {
+			converted = append(converted, dotEntries(ph, dirRel, v.fileID)...)
+		}
+		for _, sf := range raw {
+			if sf.Name == "." || sf.Name == ".." {
+				continue // already added, or filtered out by pattern
+			}
+			e := sharedFileToDirEntry(sf)
+			e.FileID = v.fileID(entryRel(dirRel, sf.Name))
+			converted = append(converted, e)
 		}
 		ph.entries, ph.pos, ph.listed, ph.lastPattern = converted, 0, true, pattern
 	}
@@ -575,6 +578,27 @@ func (v *proxyVFS) QueryDirectory(_ context.Context, h server.Handle, pattern st
 	result := ph.entries[ph.pos:]
 	ph.pos = len(ph.entries)
 	return result, 0, nil
+}
+
+// dotEntries returns the "." and ".." entries that Windows servers and Samba
+// list first in every directory, the share root included. go-smb's client
+// drops them from the target's replies, so the proxy adds its own; without
+// them an empty directory lists as STATUS_NO_SUCH_FILE, which some clients,
+// such as newer smbclient versions, report as an error. Both carry the
+// directory's own metadata: what clients use them for is their presence,
+// and the parent's would cost a round trip to the target.
+func dotEntries(ph *proxyHandle, dirRel string, fileID func(string) uint64) []server.DirEntry {
+	info, _ := ph.Stat()
+	info.Attributes |= server.FileAttributeDirectory
+	now := time.Now()
+	info.CreationTime = fixTime(info.CreationTime, now)
+	info.LastAccessTime = fixTime(info.LastAccessTime, now)
+	info.LastWriteTime = fixTime(info.LastWriteTime, now)
+	info.ChangeTime = fixTime(info.ChangeTime, now)
+	dot, dotdot := info, info
+	dot.Name, dot.FileID = ".", fileID(entryRel(dirRel, "."))
+	dotdot.Name, dotdot.FileID = "..", fileID(entryRel(dirRel, ".."))
+	return []server.DirEntry{{FileInfo: dot}, {FileInfo: dotdot}}
 }
 
 // queryDirAll lists every entry of the open directory f matching pattern. One

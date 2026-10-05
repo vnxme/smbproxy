@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -535,8 +536,8 @@ func TestProxyQueryDirectoryRootReconnects(t *testing.T) {
 	ph := &proxyHandle{isRoot: true, isDir: true}
 
 	entries, status, err := v.QueryDirectory(context.Background(), ph, "*", false)
-	if err != nil || status != 0 || len(entries) != 1 || entries[0].Name != "f" {
-		t.Fatalf("root list after drop = (%d entries, 0x%08x, %v), want 1 entry 'f'", len(entries), status, err)
+	if got := entryNames(entries); err != nil || status != 0 || got != ".,..,f" {
+		t.Fatalf("root list after drop = (%s, 0x%08x, %v), want .,..,f", got, status, err)
 	}
 }
 
@@ -868,11 +869,8 @@ func TestProxyQueryDirectoryRoot(t *testing.T) {
 	ctx := context.Background()
 
 	entries, status, err := v.QueryDirectory(ctx, ph, "*", false)
-	if err != nil || status != 0 || len(entries) != 2 {
-		t.Fatalf("root list = (%d entries, 0x%08x, %v), want 2 entries", len(entries), status, err)
-	}
-	if entries[0].Name != "docs" || entries[1].Name != "readme.txt" {
-		t.Errorf("entries = %q/%q, want docs/readme.txt", entries[0].Name, entries[1].Name)
+	if got := entryNames(entries); err != nil || status != 0 || got != ".,..,docs,readme.txt" {
+		t.Fatalf("root list = (%s, 0x%08x, %v), want .,..,docs,readme.txt", got, status, err)
 	}
 
 	// Second call with the same pattern exhausts the listing.
@@ -900,8 +898,8 @@ func TestProxyQueryDirectoryFile(t *testing.T) {
 	ctx := context.Background()
 
 	entries, status, err := v.QueryDirectory(ctx, ph, "*", false)
-	if err != nil || status != 0 || len(entries) != 1 || entries[0].Name != "x" {
-		t.Fatalf("file list = (%d, 0x%08x, %v), want 1 entry 'x'", len(entries), status, err)
+	if got := entryNames(entries); err != nil || status != 0 || got != ".,..,x" {
+		t.Fatalf("file list = (%s, 0x%08x, %v), want .,..,x", got, status, err)
 	}
 	if entries, status, _ := v.QueryDirectory(ctx, ph, "*", false); status != smb.StatusNoMoreFiles || entries != nil {
 		t.Errorf("exhausted list = (%v, 0x%08x), want (nil, StatusNoMoreFiles)", entries, status)
@@ -914,8 +912,8 @@ func TestProxyQueryDirectoryFile(t *testing.T) {
 
 	// A restart re-lists from the beginning.
 	entries, _, err = v.QueryDirectory(ctx, ph, "*", true)
-	if err != nil || len(entries) != 1 || entries[0].Name != "x" {
-		t.Fatalf("restart list = (%d entries, %v), want 1 entry 'x'", len(entries), err)
+	if got := entryNames(entries); err != nil || got != ".,..,x" {
+		t.Fatalf("restart list = (%s, %v), want .,..,x", got, err)
 	}
 }
 
@@ -932,10 +930,10 @@ func TestProxyQueryDirectoryAllBatches(t *testing.T) {
 	ctx := context.Background()
 
 	entries, status, err := v.QueryDirectory(ctx, ph, "*", false)
-	if err != nil || status != 0 || len(entries) != len(dirs) {
-		t.Fatalf("list = (%d entries, 0x%08x, %v), want %d entries", len(entries), status, err, len(dirs))
+	if err != nil || status != 0 || len(entries) != len(dirs)+2 {
+		t.Fatalf("list = (%d entries, 0x%08x, %v), want %d entries", len(entries), status, err, len(dirs)+2)
 	}
-	for i, e := range entries {
+	for i, e := range entries[2:] {
 		if e.Name != dirs[i].Name {
 			t.Fatalf("entry %d = %q, want %q", i, e.Name, dirs[i].Name)
 		}
@@ -949,18 +947,44 @@ func TestProxyQueryDirectoryAllBatches(t *testing.T) {
 	}
 }
 
-func TestProxyQueryDirectoryNoMoreFiles(t *testing.T) {
+// An empty directory lists as "." and "..", as Windows and Samba list it,
+// rather than as no entries, which clients see as STATUS_NO_SUCH_FILE. Under
+// a pattern other than "*" it has no entries.
+func TestProxyQueryDirectoryEmpty(t *testing.T) {
 	ff := &fakeFile{dirErr: smb.StatusMap[smb.StatusNoMoreFiles]}
 	v := newVFS(&fakeConn{})
-	ph := &proxyHandle{file: ff, path: "\\sub"}
+	ph := &proxyHandle{file: ff, path: "\\sub", info: server.FileInfo{Attributes: server.FileAttributeDirectory}}
+	ctx := context.Background()
 
-	entries, status, err := v.QueryDirectory(context.Background(), ph, "*", false)
-	if err != nil || status != smb.StatusNoMoreFiles || entries != nil {
-		t.Errorf("empty dir = (%v, 0x%08x, %v), want (nil, StatusNoMoreFiles, nil)", entries, status, err)
+	entries, status, err := v.QueryDirectory(ctx, ph, "*", false)
+	if got := entryNames(entries); err != nil || status != 0 || got != ".,.." {
+		t.Fatalf("empty dir = (%s, 0x%08x, %v), want .,..", got, status, err)
+	}
+	for _, e := range entries {
+		if e.Attributes&server.FileAttributeDirectory == 0 || e.LastWriteTime.IsZero() {
+			t.Errorf("%q: attributes 0x%x, LastWriteTime %v; want a directory with times set", e.Name, e.Attributes, e.LastWriteTime)
+		}
 	}
 	if !ph.listed {
-		t.Errorf("handle not marked listed after StatusNoMoreFiles")
+		t.Errorf("handle not marked listed")
 	}
+	if entries, status, _ := v.QueryDirectory(ctx, ph, "*", false); status != smb.StatusNoMoreFiles || entries != nil {
+		t.Errorf("exhausted list = (%v, 0x%08x), want (nil, StatusNoMoreFiles)", entries, status)
+	}
+
+	entries, status, err = v.QueryDirectory(ctx, ph, "*.txt", true)
+	if err != nil || status != smb.StatusNoMoreFiles || entries != nil {
+		t.Errorf("empty dir under *.txt = (%v, 0x%08x, %v), want (nil, StatusNoMoreFiles, nil)", entries, status, err)
+	}
+}
+
+// entryNames joins the names of a listing with commas.
+func entryNames(entries []server.DirEntry) string {
+	names := make([]string, len(entries))
+	for i, e := range entries {
+		names[i] = e.Name
+	}
+	return strings.Join(names, ",")
 }
 
 func TestProxyQueryDirectoryClosedFile(t *testing.T) {
