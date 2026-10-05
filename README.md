@@ -74,13 +74,10 @@ Prebuilt binaries for Linux, macOS and Windows on many architectures are
 attached to each [release](https://github.com/vnxme/smbproxy/releases), with a
 `SHA256SUMS` file to check them against.
 
-To build it yourself, smbproxy needs Go 1.27 or later.
-
-```sh
-go install github.com/vnxme/smbproxy@latest
-```
-
-Or build it from a clone:
+To build it yourself, smbproxy needs Go 1.27 or later. It builds against a
+[fork of go-smb](https://github.com/vnxme/go-smb/tree/smbproxy) with fixes not
+yet released upstream, through a `replace` directive in `go.mod`, which
+`go install …@latest` does not follow; build it from a clone instead:
 
 ```sh
 git clone https://github.com/vnxme/smbproxy
