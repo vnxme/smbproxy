@@ -119,5 +119,15 @@ for i in $(seq "$RUNS"); do
 	live speed --dir "$WORK/mnt/proxy" --src "speed-src-$i.bin" --label proxy --size-mib "$SIZE" --out "$WORK/speed.jsonl"
 	sudo umount "$WORK/mnt/proxy"
 done
-live report --results "$WORK/speed.jsonl" --title "Linux: kernel CIFS client, Samba target" --size-mib "$SIZE" |
+
+step "Kernel client: small files, direct and through the proxy"
+mnt direct //127.0.0.1/data 445 "$TUSER" "$TPASS"
+live bench-dir --dir "$WORK/mnt/direct/rw" --label direct --out "$WORK/dir.jsonl"
+sudo umount "$WORK/mnt/direct"
+mnt proxy //127.0.0.1/rw $PORT $PUSER $PPASS
+live bench-dir --dir "$WORK/mnt/proxy" --label proxy --out "$WORK/dir.jsonl"
+sudo umount "$WORK/mnt/proxy"
+
+live report --results "$WORK/speed.jsonl" --dir-results "$WORK/dir.jsonl" \
+	--title "Linux: kernel CIFS client, Samba target" --size-mib "$SIZE" |
 	tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"

@@ -110,7 +110,16 @@ try {
         live speed --dir "P:\" --src "speed-src-$i.bin" --label proxy --size-mib $size --out "$work\speed.jsonl"
         Unmap P
     }
-    $report = python "$here\live.py" report --results "$work\speed.jsonl" `
+
+    step "Small files, direct and through the proxy"
+    Map T $targetHost data $tuser $tpass
+    live bench-dir --dir "T:\rw" --label direct --out "$work\dir.jsonl"
+    Unmap T
+    Map P $proxyHost rw $puser $ppass $port
+    live bench-dir --dir "P:\" --label proxy --out "$work\dir.jsonl"
+    Unmap P
+
+    $report = python "$here\live.py" report --results "$work\speed.jsonl" --dir-results "$work\dir.jsonl" `
         --title "Windows: Windows SMB client, Windows target" --size-mib $size | Out-String
     Write-Host $report
     if ($env:GITHUB_STEP_SUMMARY) { Add-Content $env:GITHUB_STEP_SUMMARY $report }

@@ -122,7 +122,17 @@ for i in $(seq "$RUNS"); do
 	live speed --dir "$WORK/mnt/proxy" --src "speed-src-$i.bin" --label proxy --size-mib "$SIZE" --out "$WORK/speed.jsonl"
 	umount "$WORK/mnt/proxy"
 done
-live report --results "$WORK/speed.jsonl" --title "macOS: macOS SMB client, macOS file sharing target" --size-mib "$SIZE" |
+
+step "mount_smbfs: small files, direct and through the proxy"
+mnt direct "//$TUSER:$TPASS@$HOST/data"
+live bench-dir --dir "$WORK/mnt/direct/rw" --label direct --out "$WORK/dir.jsonl"
+umount "$WORK/mnt/direct"
+mnt proxy "//$PUSER:$PPASS@127.0.0.1:$PORT/rw"
+live bench-dir --dir "$WORK/mnt/proxy" --label proxy --out "$WORK/dir.jsonl"
+umount "$WORK/mnt/proxy"
+
+live report --results "$WORK/speed.jsonl" --dir-results "$WORK/dir.jsonl" \
+	--title "macOS: macOS SMB client, macOS file sharing target" --size-mib "$SIZE" |
 	tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
 
 # Last, as it stops file sharing to free port 445: smbutil view lists

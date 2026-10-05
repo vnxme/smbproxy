@@ -5,11 +5,12 @@ Each OS script sets up a target share, starts smbproxy in front of it and
 mounts the proxy's shares with the OS's own SMB client; this file holds the
 parts that are the same everywhere:
 
-  config   write the proxy's configuration
-  wait     wait for a TCP port to accept connections
-  fs       file-system tests on a mounted share, checked on the target side
-  speed    time writing and reading a large file on a mounted share
-  report   summarize the speed results as a Markdown table
+  config     write the proxy's configuration
+  wait       wait for a TCP port to accept connections
+  fs         file-system tests on a mounted share, checked on the target side
+  speed      time writing and reading a large file on a mounted share
+  bench-dir  time creating, listing, stat-ing and deleting many small files
+  report     summarize the speed and small-file results as Markdown tables
 
 Python is on every GitHub-hosted runner, and its file API is the same over a
 Linux, macOS or Windows mount, so the tests are written once.
@@ -332,6 +333,34 @@ def cmd_fs(a):
         sys.exit(f"{c.failed} file-system test(s) failed")
 
 
+# ---- bench-dir ----
+
+def cmd_bench_dir(a):
+    """Time creating, listing, stat-ing and deleting many small files, phase
+    by phase, appending the timings to a.out: what a client pays per file,
+    where the speed runs measure bulk transfer."""
+    d = os.path.join(a.dir, f"bench-{os.getpid()}")
+    os.mkdir(d)
+    names = [f"f{i:04d}.txt" for i in range(a.count)]
+    phases = []
+
+    def phase(name, fn):
+        start = time.perf_counter()
+        fn()
+        phases.append((name, time.perf_counter() - start))
+
+    phase("create", lambda: [write(os.path.join(d, n), b"x") for n in names])
+    phase("list", lambda: expect(len(os.listdir(d)) == a.count, "listing incomplete"))
+    phase("stat", lambda: [os.stat(os.path.join(d, n)) for n in names])
+    phase("delete", lambda: [os.remove(os.path.join(d, n)) for n in names])
+    os.rmdir(d)
+    print(f"{a.label:>6} " + ", ".join(f"{n} {s:.2f}s ({s / a.count * 1000:.1f} ms/file)" for n, s in phases),
+          flush=True)
+    with open(a.out, "a", encoding="utf-8") as f:
+        for op, secs in phases:
+            f.write(json.dumps({"label": a.label, "op": op, "count": a.count, "seconds": secs}) + "\n")
+
+
 # ---- speed ----
 
 def cmd_speed(a):
@@ -392,6 +421,24 @@ def cmd_report(a):
         print(f"| {op} | {d:.0f} | {p:.0f} | {ratio} |")
     print()
 
+    if not a.dir_results:
+        return
+    per_file = {}
+    with open(a.dir_results, encoding="utf-8") as f:
+        for line in f:
+            r = json.loads(line)
+            per_file.setdefault((r["op"], r["label"]), []).append(r["seconds"] / r["count"] * 1000)
+            count = r["count"]
+    print(f"Creating, listing, stat-ing and deleting {count} small files, in ms per file.\n")
+    print("| | direct | through smbproxy | proxy / direct (time) |")
+    print("|---|---:|---:|---:|")
+    for op in ("create", "list", "stat", "delete"):
+        d = statistics.median(per_file.get((op, "direct"), [0]))
+        p = statistics.median(per_file.get((op, "proxy"), [0]))
+        ratio = f"{p / d:.1f}×" if d else "–"
+        print(f"| {op} | {d:.2f} | {p:.2f} | {ratio} |")
+    print()
+
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -426,6 +473,13 @@ def main():
     p.add_argument("--ro-target")
     p.set_defaults(fn=cmd_fs)
 
+    p = sub.add_parser("bench-dir")
+    p.add_argument("--dir", required=True)
+    p.add_argument("--count", type=int, default=200)
+    p.add_argument("--label", required=True, choices=["direct", "proxy"])
+    p.add_argument("--out", required=True)
+    p.set_defaults(fn=cmd_bench_dir)
+
     p = sub.add_parser("mkfile")
     p.add_argument("--path", required=True)
     p.add_argument("--size-mib", type=int, required=True)
@@ -441,6 +495,7 @@ def main():
 
     p = sub.add_parser("report")
     p.add_argument("--results", required=True)
+    p.add_argument("--dir-results", help="bench-dir timings, for a second table")
     p.add_argument("--title", required=True)
     p.add_argument("--size-mib", type=int, required=True)
     p.set_defaults(fn=cmd_report)
