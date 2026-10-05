@@ -174,10 +174,10 @@ func (p *rpcPipe) Write(_ context.Context, b []byte) (int, uint32, error) {
 	return n, smb.StatusOk, nil
 }
 
-// Read drains the queued response in one shot. The library discards the data
-// whenever a pipe Read returns a non-OK status (see smb/server/read.go), so a
-// message-mode partial read via StatusBufferOverflow is not possible here;
-// srvsvc enum responses are small enough to always fit a single client READ.
+// Read drains the queued response in one shot. A response longer than the
+// client's READ (a share list of a dozen shares already passes 1 KB) is cut
+// by the library, which answers STATUS_BUFFER_OVERFLOW and serves the rest on
+// the next READ (see pipeHandle.clip in smb/server/pipe.go).
 func (p *rpcPipe) Read(_ context.Context, maxLen int) ([]byte, uint32, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
