@@ -33,7 +33,8 @@ cleanup() {
 	set +e
 	for d in "$WORK"/mnt/*; do mount | grep -q " on $d " && umount "$d"; done
 	[ -f "$WORK/proxy.pid" ] && kill "$(cat "$WORK/proxy.pid")"
-	cp "$WORK/proxy.log" proxy.log 2>/dev/null
+	[ -f "$WORK/p445.pid" ] && sudo kill "$(cat "$WORK/p445.pid")"
+	cat "$WORK/proxy.log" "$WORK/p445.log" >proxy.log 2>/dev/null
 	ls -laR "$ROOT" | head -40
 }
 trap cleanup EXIT
@@ -67,12 +68,8 @@ sharing -l
 live wait --port 445
 echo "client to target: $HOST"
 
-# Listing shares over the srvsvc pipe is checked, but does not fail the job
-# yet: smbutil view broke against Homebrew's Samba as well as the proxy.
 step "smbutil: list the target's shares directly"
-if ! smbutil view -N "//$TUSER:$TPASS@$HOST"; then
-	echo "::warning::smbutil view failed against the target directly"
-fi
+smbutil view -N "//$TUSER:$TPASS@$HOST"
 
 step "Start smbproxy"
 # No domain: macOS file sharing refuses WORKGROUP\user, while its own
@@ -84,28 +81,6 @@ live config --out "$WORK/live.yaml" --listen "127.0.0.1:$PORT" \
 ./smbproxy -config "$WORK/live.yaml" >"$WORK/proxy.log" 2>&1 &
 echo $! >"$WORK/proxy.pid"
 live wait --port $PORT
-
-# smbutil view works against the target directly but not through the
-# proxy yet, so it only warns. A second proxy with debug logging, on its own
-# port, records the exchange without flooding the other tests' logs.
-step "smbutil: list shares"
-sed 's/^debug: false/debug: true/; s/:'"$PORT"'"/:'"$((PORT + 1))"'"/' "$WORK/live.yaml" >"$WORK/debug.yaml"
-./smbproxy -config "$WORK/debug.yaml" >"$WORK/debug.log" 2>&1 &
-debug_pid=$!
-live wait --port $((PORT + 1))
-if shares=$(smbutil view -N "//$PUSER:$PPASS@127.0.0.1:$((PORT + 1))"); then
-	echo "$shares"
-	grep -Eq '^rw +Disk' <<<"$shares"
-	grep -Eq '^ro +Disk' <<<"$shares"
-	if grep -q '^secret' <<<"$shares"; then echo "secret is listed to $PUSER"; exit 1; fi
-else
-	echo "$shares"
-	echo "::warning::smbutil view failed through the proxy"
-fi
-kill "$debug_pid"
-echo "::group::proxy exchange for smbutil view"
-grep -vE '^\S+ \S+ \[[*+!]\]' "$WORK/debug.log" | head -150
-echo "::endgroup::"
 
 mnt() { # mnt NAME //user:password@host:port/share
 	mkdir -p "$WORK/mnt/$1"
@@ -149,3 +124,21 @@ for i in $(seq "$RUNS"); do
 done
 live report --results "$WORK/speed.jsonl" --title "macOS: macOS SMB client, macOS file sharing target" --size-mib "$SIZE" |
 	tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+# Last, as it stops file sharing to free port 445: smbutil view lists
+# shares through the proxy only there. It logs in on the port given, but
+# fetches the share list (srvsvc, over IPC$) through a connection to port
+# 445, whatever the port: against the proxy on 4445 that reached file
+# sharing, which refused the proxy's login, and failed with "Broken pipe";
+# file sharing itself, reached through another port, lists its shares.
+step "smbutil: list shares through the proxy on port 445"
+sudo launchctl bootout system/com.apple.smbd
+sed 's/"127.0.0.1:'"$PORT"'"/"127.0.0.1:445"/' "$WORK/live.yaml" >"$WORK/p445.yaml"
+sudo ./smbproxy -config "$WORK/p445.yaml" >"$WORK/p445.log" 2>&1 &
+echo $! >"$WORK/p445.pid"  # sudo's, which passes signals on to the proxy
+live wait --port 445
+shares=$(smbutil view -N "//$PUSER:$PPASS@127.0.0.1")
+echo "$shares"
+grep -Eq '^rw +Disk' <<<"$shares"
+grep -Eq '^ro +Disk' <<<"$shares"
+if grep -q '^secret' <<<"$shares"; then echo "secret is listed to $PUSER"; exit 1; fi
