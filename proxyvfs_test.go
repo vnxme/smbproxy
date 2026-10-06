@@ -41,6 +41,7 @@ type fakeFile struct {
 	stall   bool             // ReadFile and QueryDirectory block until their context ends
 
 	writeErr     error                            // if set, WriteFile returns it
+	writes       int                              // WriteFile call count
 	flushes      int                              // Flush call count
 	setInfoClass byte                             // class of the last SetInfo
 	setInfoBuf   []byte                           // payload of the last SetInfo
@@ -91,6 +92,7 @@ func (f *fakeFile) WriteFile(ctx context.Context, data []byte, off uint64) (int,
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.writes++
 	if f.writeErr != nil {
 		return 0, f.writeErr
 	}

@@ -132,6 +132,19 @@ def expect(cond, msg):
         raise AssertionError(msg)
 
 
+def eventually(check, msg, timeout=2.0):
+    """expect(check()), allowing the target time to settle: the proxy writes
+    behind, sending a client's last writes to the target up to 100 ms after
+    they were acknowledged unless something asks for them sooner, so the
+    target's own file system can lag a write through the mount, even once
+    the file is closed (the Linux client sends its CLOSE in the background)."""
+    deadline = time.monotonic() + timeout
+    while not check():
+        if time.monotonic() > deadline:
+            raise AssertionError(msg)
+        time.sleep(0.05)
+
+
 def expect_raises(exc, fn, what):
     try:
         fn()
@@ -169,7 +182,7 @@ def cmd_fs(a):
 
     def small():
         write(m("hello.txt"), b"hello, proxy\n")
-        expect(read(t("hello.txt")) == b"hello, proxy\n", "content differs on target")
+        eventually(lambda: read(t("hello.txt")) == b"hello, proxy\n", "content differs on target")
         expect(read(m("hello.txt")) == b"hello, proxy\n", "content differs read back")
         expect(os.path.getsize(m("hello.txt")) == 13, "size differs")
 
@@ -181,8 +194,8 @@ def cmd_fs(a):
             data = os.urandom(size)
             name = f"size-{size}.bin"
             write(m(name), data)
-            expect(os.path.getsize(t(name)) == size, f"target size {os.path.getsize(t(name))}")
-            expect(sha(t(name)) == hashlib.sha256(data).hexdigest(), "content differs on target")
+            eventually(lambda: os.path.getsize(t(name)) == size, f"target size {os.path.getsize(t(name))}")
+            eventually(lambda: sha(t(name)) == hashlib.sha256(data).hexdigest(), "content differs on target")
             expect(read(m(name)) == data, "content differs read back")
 
         c.run(f"write and read {size} bytes", sized)
@@ -206,21 +219,21 @@ def cmd_fs(a):
                 data[off:off + 10] = patch
             f.seek(1 << 20)
             expect(f.read(10) == bytes(data[1 << 20:(1 << 20) + 10]), "ranged read differs")
-        expect(read(t("ranged.bin")) == bytes(data), "content differs on target")
+        eventually(lambda: read(t("ranged.bin")) == bytes(data), "content differs on target")
 
     c.run("write and read at offsets", ranged)
 
     def append():
         write(m("log.txt"), b"one\n")
         write(m("log.txt"), b"two\n", "ab")
-        expect(read(t("log.txt")) == b"one\ntwo\n", "append differs on target")
+        eventually(lambda: read(t("log.txt")) == b"one\ntwo\n", "append differs on target")
 
     c.run("append", append)
 
     def overwrite_shorter():
         write(m("over.txt"), b"a long first version\n")
         write(m("over.txt"), b"short\n")
-        expect(read(t("over.txt")) == b"short\n", "overwrite left old bytes on target")
+        eventually(lambda: read(t("over.txt")) == b"short\n", "overwrite left old bytes on target")
 
     c.run("overwrite with shorter content", overwrite_shorter)
 
@@ -252,7 +265,7 @@ def cmd_fs(a):
     def names():
         name = "файл с пробелом ✓ (1).txt"
         write(m(name), b"unicode")
-        expect(read(t(name)) == b"unicode", "unicode name not on target")
+        eventually(lambda: read(t(name)) == b"unicode", "unicode name not on target")
         # macOS's client lists names decomposed (NFD); compare them composed.
         listed = [unicodedata.normalize("NFC", n) for n in os.listdir(M)]
         expect(name in listed, "unicode name not listed")
@@ -296,7 +309,7 @@ def cmd_fs(a):
             th.join()
         expect(not errs, "; ".join(errs))
         for n, d in blobs.items():
-            expect(sha(t(n)) == hashlib.sha256(d).hexdigest(), f"{n} differs on target")
+            eventually(lambda: sha(t(n)) == hashlib.sha256(d).hexdigest(), f"{n} differs on target")
 
     c.run("parallel writes and reads", parallel)
 

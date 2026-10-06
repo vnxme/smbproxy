@@ -43,6 +43,10 @@ type upstream struct {
 	conn    upstreamConn // nil when not currently connected
 	refs    int          // open upstream file handles
 	lastUse time.Time    // updated on every operation and handle release
+
+	// Handles with data written behind; see syncWrites.
+	pendingMu sync.Mutex
+	pending   map[*proxyHandle]struct{}
 }
 
 // upstreamTimeouts bounds how long the proxy waits on a target. A zero value

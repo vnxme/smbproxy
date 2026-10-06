@@ -12,6 +12,9 @@ _gitignore
 *.test
 *.out
 
+# Python bytecode from the live-test helper
+__pycache__/
+
 # Local configuration and password files; they hold credentials
 smbproxy.yaml
 *.pass
