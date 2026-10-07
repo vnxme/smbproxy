@@ -88,6 +88,31 @@ go build
 On Windows, `build.ps1` builds binaries for several platforms at once; run
 `.\build.ps1 -List` for the platforms it knows.
 
+### Docker
+
+Images for Linux on 386, amd64, arm/v6, arm/v7, arm64, ppc64le, riscv64 and
+s390x are published as `vnxme/smbproxy` on Docker Hub and
+`ghcr.io/vnxme/smbproxy`. Tags: `latest` and `1.2.3` / `1.2` / `1` for
+releases, `main` for the latest commit, `weekly` for the weekly rebuild that
+picks up base image updates.
+
+The container reads `/etc/smbproxy/smbproxy.yaml`. Without your own, it runs
+[the example](smbproxy.example.yaml), whose users and targets are made up: its
+shares are listed but cannot be opened. Mount the directory that holds your
+configuration and any password files it names:
+
+```sh
+docker run -d --name smbproxy --restart unless-stopped \
+  -p 445:445 \
+  -v /etc/smbproxy:/etc/smbproxy:ro \
+  vnxme/smbproxy
+```
+
+Keep `server.listen` at `0.0.0.0:445` (or `[::]:445`) and map the host port with
+`-p`. smbproxy runs as root inside the container so it can read a config file
+kept at mode 600; to run it as another user, pass `--user` and make the files
+readable by that user.
+
 ## Running
 
 ```sh

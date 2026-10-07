@@ -1,0 +1,21 @@
+# Keep the build context to the sources. .git stays: go build stamps the
+# commit from it.
+
+# Editor and assistant settings
+.claude
+.idea
+.mcp.json
+
+# Build output
+_gitignore
+*.exe
+/smbproxy
+
+# Test binaries and coverage profiles
+*.test
+*.out
+__pycache__/
+
+# Local configuration and password files; they hold credentials
+smbproxy.yaml
+*.pass

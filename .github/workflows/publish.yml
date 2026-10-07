@@ -1,0 +1,103 @@
+name: Publish
+
+on:
+  push:
+    branches:
+      - "main"
+    tags:
+      - 'v*.*.*'
+  pull_request:
+    branches:
+      - "main"
+  schedule:
+    # Weekly rebuild to pick up updates of the base images and Alpine packages
+    - cron: "0 6 * * 1"
+
+env:
+  IMAGE_NAME: ${{ github.repository_owner }}/smbproxy
+
+concurrency:
+  group: publish-${{ github.ref }}
+  # Cancel outdated pull request builds, but let pushes to registries finish
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+        with:
+          # .git goes into the build context, so keep the token out of it
+          persist-credentials: false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        if: github.event_name != 'pull_request'
+        with:
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
+        with:
+          flavor: latest=auto
+          images: |
+            ${{ env.IMAGE_NAME }}
+            ghcr.io/${{ env.IMAGE_NAME }}
+          tags: |
+            type=schedule,pattern=weekly
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          # The checkout, not the git context: go build stamps the commit
+          # from .git, as for the release binaries
+          context: .
+          # A tag is stamped in as the version, as in ci.yml
+          build-args: |
+            VERSION=${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          platforms: |
+            linux/386
+            linux/amd64
+            linux/arm/v6
+            linux/arm/v7
+            linux/arm64
+            linux/ppc64le
+            linux/riscv64
+            linux/s390x
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Weekly rebuilds must not reuse cached layers, otherwise apk packages are not updated
+          no-cache: ${{ github.event_name == 'schedule' }}
